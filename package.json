@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "description": "BYOK, fully local agentic E2E testing: point five46 at a live URL and a goal, an LLM (your own key) drives a real local Playwright browser toward it, and writes a real, standalone, re-runnable Playwright spec.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sekharsdet/five46.git"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -25,7 +29,7 @@
     "byok",
     "qa"
   ],
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.1095.0"
   },
