@@ -1,0 +1,217 @@
+import type { ApiAction, ApiHistoryEntry, HttpMethod, SafetyMode } from './apiTypes'
+import { isMethodAllowed, isHostAllowed } from './apiTypes'
+import { extractPlaceholderNames } from './apiExecutor'
+
+const MAX_HISTORY = 10
+
+/** Shared with `apiFailureReport.ts` — one place describing what an
+ * `ApiAction` did, so the prompt's history rendering and the printed
+ * failure report can't drift into two slightly different descriptions of
+ * the same action. */
+export function describeApiAction(action: ApiAction): string {
+  switch (action.action) {
+    case 'request':
+      return `${action.method} ${action.url}${action.saveAs ? ` (save "${action.saveAs.path}" as {{${action.saveAs.name}}})` : ''}`
+    case 'assert_status':
+      return `assert status === ${action.expected}`
+    case 'assert_json_path_exists':
+      return `assert "${action.path}" exists in the last response`
+    case 'assert_json_path_equals':
+      return `assert "${action.path}" === "${action.expected}"`
+    case 'done':
+      return `done (${action.outcome})`
+  }
+}
+
+/** Same cap-and-disclose shape as `planner.ts`'s `serializeHistory` — each
+ * step's response excerpt already carries its own truncation marker (see
+ * `apiExecutor.ts`'s `RESPONSE_EXCERPT_LIMIT`), surfaced here as part of the
+ * step's own detail line. */
+export function serializeApiHistory(history: ApiHistoryEntry[]): string {
+  if (history.length === 0) return '(no steps taken yet)'
+  const recent = history.slice(-MAX_HISTORY)
+  const omitted = history.length - recent.length
+  const lines = recent.map((h, i) => {
+    const stepNum = history.length - recent.length + i + 1
+    return `${stepNum}. ${describeApiAction(h.action)} -> ${h.result}${h.detail ? `: ${h.detail}` : ''}`
+  })
+  if (omitted > 0) lines.unshift(`(${omitted} earlier step(s) omitted)`)
+  return lines.join('\n')
+}
+
+function describeSafetyMode(safety: SafetyMode): string {
+  const methods = ['GET', 'HEAD', 'OPTIONS']
+  if (safety.allowWrites) methods.push('POST', 'PUT', 'PATCH')
+  if (safety.allowDeletes) methods.push('DELETE')
+  const hosts = [safety.targetOrigin, ...safety.allowedHosts].join(', ')
+  return `Allowed methods this run: ${methods.join(', ')}. Allowed host(s): ${hosts}. Any other method or host will be rejected — don't attempt one.`
+}
+
+const ACTION_SCHEMA_EXAMPLE = `{"action":"request","method":"POST","url":"/users","headers":{"Content-Type":"application/json"},"body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user to test with"}`
+
+/** Builds the "what's the next single action" prompt for API testing —
+ * same single-shot-JSON-per-step shape as `planner.ts`'s
+ * `buildActionPrompt`, for the identical reason (`LlmProvider.complete()`
+ * has no tool-calling/JSON-mode hook). Tells the model the allowed
+ * methods/hosts and the currently-available `{{var}}` names up front,
+ * rather than only rejecting a disallowed attempt after the fact — more
+ * turn/token-efficient, matching how `buildActionPrompt` already discloses
+ * the confirmation-gating requirement up front instead of only after a
+ * rejection. */
+export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], validVarNames: ReadonlySet<string>, safety: SafetyMode): string {
+  const varsNote =
+    validVarNames.size > 0
+      ? [``, `Values saved so far, referenceable as {{name}} in a request's url/headers/body: ${[...validVarNames].join(', ')}`]
+      : []
+  return [
+    `You are an API testing agent driving real HTTP requests toward one goal, one request/check at a time.`,
+    ``,
+    `Goal: ${goal}`,
+    ``,
+    describeSafetyMode(safety),
+    ...varsNote,
+    ``,
+    `Steps taken so far:`,
+    serializeApiHistory(history),
+    ``,
+    `Respond with exactly one JSON object describing the next single action to take, one of:`,
+    `- {"action":"request","method":"<GET|HEAD|OPTIONS|POST|PUT|PATCH|DELETE>","url":"<url>","headers":{...},"body":"<text>","saveAs":{"name":"<var>","path":"<json.path>"},"reason":"<why>"} ("headers"/"body"/"saveAs" are all optional)`,
+    `- {"action":"assert_status","expected":<number>,"reason":"<why>"}`,
+    `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"}`,
+    `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"}`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"}`,
+    ``,
+    `Example: ${ACTION_SCHEMA_EXAMPLE}`,
+    ``,
+    `Respond with ONLY the JSON object — no markdown fence, no prose before or after it.`,
+  ].join('\n')
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0
+}
+
+const VALID_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'])
+
+function checkVarReferences(fields: (string | undefined)[], validVarNames: ReadonlySet<string>): string | undefined {
+  for (const field of fields) {
+    if (!field) continue
+    for (const name of extractPlaceholderNames(field)) {
+      if (!validVarNames.has(name)) return `references "{{${name}}}", which hasn't been saved yet this run`
+    }
+  }
+  return undefined
+}
+
+/** The result of parsing one raw LLM response. A failure is split into two
+ * kinds, mirroring the distinction the plan draws between "the model said
+ * something incoherent" and "the model asked for something real but
+ * disallowed":
+ * - `recoverable: false` — malformed JSON, an unrecognized action, or a
+ *   missing required field. Nothing usable was even said; the caller ends
+ *   the run as `unparseable-response`, same as `parseAgentAction`'s only
+ *   failure mode.
+ * - `recoverable: true` (with `attemptedAction` populated) — a
+ *   *structurally valid* `request` naming a disallowed method/host, or
+ *   referencing an unsaved `{{var}}`. This is the API equivalent of a
+ *   failed `click`/`fill`: a real, well-formed attempt that just didn't
+ *   succeed. The caller records it as a failed step and keeps going —
+ *   ending the whole run the first time the model tries a write in
+ *   read-only mode would make read-only mode nearly unusable. */
+export type ParseApiActionResult =
+  | { ok: true; action: ApiAction }
+  | { ok: false; error: string; raw: string; recoverable: false }
+  | { ok: false; error: string; raw: string; recoverable: true; attemptedAction: ApiAction }
+
+/** Strictly parses one raw LLM response into an `ApiAction`, or an honest
+ * failure — never a guessed fallback, mirroring `parseAgentAction` exactly.
+ * Also checks, at this same layer, whether a `request` names a disallowed
+ * method/host (`SafetyMode`) or references an unsaved `{{var}}` — the same
+ * "a hallucinated reference is a parse-level failure, never silently
+ * accepted" posture `parseAgentAction` already applies to an unrecognized
+ * `ref`, but marked `recoverable` (see `ParseApiActionResult`) so the caller
+ * can tell it apart from genuinely malformed output. */
+export function parseApiAction(raw: string, validVarNames: ReadonlySet<string>, safety: SafetyMode): ParseApiActionResult {
+  const stripped = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim()
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stripped)
+  } catch {
+    return { ok: false, error: 'response was not valid JSON', raw, recoverable: false }
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return { ok: false, error: 'response was not a JSON object', raw, recoverable: false }
+  }
+  const obj = parsed as Record<string, unknown>
+  const action = obj.action
+  const reason = isNonEmptyString(obj.reason) ? obj.reason : '(no reason given)'
+
+  switch (action) {
+    case 'request': {
+      const method = typeof obj.method === 'string' ? (obj.method.toUpperCase() as HttpMethod) : undefined
+      if (!method || !VALID_METHODS.has(method)) {
+        return { ok: false, error: `"method" must be one of ${[...VALID_METHODS].join(', ')}`, raw, recoverable: false }
+      }
+      if (!isNonEmptyString(obj.url)) return { ok: false, error: '"url" is missing', raw, recoverable: false }
+      const headers = obj.headers && typeof obj.headers === 'object' ? (obj.headers as Record<string, string>) : undefined
+      const body = typeof obj.body === 'string' ? obj.body : undefined
+      let saveAs: { name: string; path: string } | undefined
+      if (obj.saveAs && typeof obj.saveAs === 'object') {
+        const s = obj.saveAs as Record<string, unknown>
+        if (!isNonEmptyString(s.name) || !isNonEmptyString(s.path)) {
+          return { ok: false, error: '"saveAs" must have non-empty "name" and "path"', raw, recoverable: false }
+        }
+        saveAs = { name: s.name, path: s.path }
+      }
+      const attempted: ApiAction = { action: 'request', method, url: obj.url, headers, body, saveAs, reason }
+
+      if (!isMethodAllowed(method, safety)) {
+        return {
+          ok: false,
+          error: `method "${method}" is not allowed this run (see --allow-writes/--allow-deletes)`,
+          raw,
+          recoverable: true,
+          attemptedAction: attempted,
+        }
+      }
+      if (!isHostAllowed(obj.url, safety)) {
+        return {
+          ok: false,
+          error: `"${obj.url}" is not the target origin or an allowlisted host (see --allow-host)`,
+          raw,
+          recoverable: true,
+          attemptedAction: attempted,
+        }
+      }
+      const varError = checkVarReferences([obj.url, body, ...(headers ? Object.values(headers) : [])], validVarNames)
+      if (varError) return { ok: false, error: varError, raw, recoverable: true, attemptedAction: attempted }
+
+      return { ok: true, action: attempted }
+    }
+    case 'assert_status': {
+      if (typeof obj.expected !== 'number') return { ok: false, error: '"expected" must be a number for assert_status', raw, recoverable: false }
+      return { ok: true, action: { action: 'assert_status', expected: obj.expected, reason } }
+    }
+    case 'assert_json_path_exists': {
+      if (!isNonEmptyString(obj.path)) return { ok: false, error: '"path" is missing for assert_json_path_exists', raw, recoverable: false }
+      return { ok: true, action: { action: 'assert_json_path_exists', path: obj.path, reason } }
+    }
+    case 'assert_json_path_equals': {
+      if (!isNonEmptyString(obj.path)) return { ok: false, error: '"path" is missing for assert_json_path_equals', raw, recoverable: false }
+      if (!isNonEmptyString(obj.expected)) return { ok: false, error: '"expected" is missing for assert_json_path_equals', raw, recoverable: false }
+      return { ok: true, action: { action: 'assert_json_path_equals', path: obj.path, expected: obj.expected, reason } }
+    }
+    case 'done': {
+      const outcome = obj.outcome === 'goal-reached' || obj.outcome === 'goal-unreachable' ? obj.outcome : undefined
+      if (!outcome) return { ok: false, error: '"outcome" must be "goal-reached" or "goal-unreachable"', raw, recoverable: false }
+      return { ok: true, action: { action: 'done', outcome, reason } }
+    }
+    default:
+      return { ok: false, error: `unrecognized "action" value: ${JSON.stringify(action)}`, raw, recoverable: false }
+  }
+}

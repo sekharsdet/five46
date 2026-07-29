@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Five46 Agent Fixture</title></head>
+<body>
+  <h1>Simple Reveal</h1>
+  <button id="reveal-btn">Show secret message</button>
+  <p id="secret" role="status" hidden>The secret message is: agentic testing works.</p>
+
+  <label for="name-input">Your name</label>
+  <input id="name-input" type="text" placeholder="Enter your name" />
+  <button id="greet-btn">Greet me</button>
+  <p id="greeting" role="status"></p>
+
+  <div style="display:none"><button id="hidden-btn">Should never appear</button></div>
+
+  <button id="increment-btn">Increment counter</button>
+  <p id="counter" role="status">Count: 0</p>
+
+  <!-- Visible (so it appears in a snapshot, unlike hidden-btn above) but
+       permanently disabled — Playwright's own actionability check for
+       .click() requires an element be enabled, so a click here always
+       times out. Used to test that a genuinely, repeatedly *failing*
+       click still trips the stuck-repeating guard, distinct from a
+       repeated *succeeding* one. -->
+  <button id="disabled-btn" disabled>Disabled button</button>
+
+  <!-- Used by runner.test.ts to verify the browser engine's destructive-
+       action gating: a real, clickable button whose name matches
+       planner.ts's isDestructiveClickTarget, wired to visibly change page
+       state on click so a test can distinguish "blocked, never clicked"
+       from "clicked, nothing observable happened." -->
+  <button id="delete-account-btn">Delete Account</button>
+  <p id="delete-status" role="status">Account active</p>
+
+  <script>
+    document.getElementById('reveal-btn').addEventListener('click', () => {
+      document.getElementById('secret').hidden = false;
+    });
+    document.getElementById('greet-btn').addEventListener('click', () => {
+      const name = document.getElementById('name-input').value || 'stranger';
+      document.getElementById('greeting').textContent = 'Hello, ' + name + '!';
+    });
+    document.getElementById('increment-btn').addEventListener('click', () => {
+      const counter = document.getElementById('counter');
+      const current = Number(counter.textContent.replace('Count: ', ''));
+      counter.textContent = 'Count: ' + (current + 1);
+    });
+    document.getElementById('delete-account-btn').addEventListener('click', () => {
+      document.getElementById('delete-status').textContent = 'Account deleted';
+    });
+  </script>
+</body>
+</html>

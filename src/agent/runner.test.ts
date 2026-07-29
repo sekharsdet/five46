@@ -1,0 +1,606 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { runAgent } from './runner'
+import { launchAgentBrowser, USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
+import { startFixtureServer } from './testServer'
+import { startLoginFixtureServer, LOGIN_FIXTURE_USERNAME, LOGIN_FIXTURE_PASSWORD } from './loginTestServer'
+import type { LlmProvider } from '../llm/types'
+import type { StorageState } from './browser'
+
+/** Finds the ref to act on by matching the *real* prompt text the fake
+ * provider actually received, rather than hardcoding an assumed ref value
+ * — ref-assignment order isn't part of `snapshot()`'s public contract, so
+ * hardcoding "e1" here would silently couple this test to an
+ * implementation detail. This exercises the real `serializeOutline`/
+ * `buildActionPrompt` output, not just the fake's own assumptions. */
+function refFor(prompt: string, nameSubstring: string): string {
+  const match = prompt.match(new RegExp(`\\[(e\\d+)\\][^\\n]*${nameSubstring}`))
+  if (!match) throw new Error(`test setup: no outline element matching "${nameSubstring}" in prompt:\n${prompt}`)
+  return match[1]
+}
+
+async function playwrightAvailable(): Promise<boolean> {
+  try {
+    const browser = await launchAgentBrowser({ headless: true })
+    await browser.close()
+    return true
+  } catch {
+    return false
+  }
+}
+
+test('runAgent drives a real browser through a real multi-step flow scripted by a fake LlmProvider, and writes real successful steps', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(run.steps.length, 2)
+    assert.ok(run.steps.every((s) => s.ok))
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent stops with assertion-failed (a real finding) when a real assertion genuinely does not hold', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        // "Your name" (the fixture's real <label for="name-input">), not the
+        // placeholder text — real accessible-name computation prioritizes an
+        // associated label over a placeholder, and so does snapshot() now.
+        if (turn === 1) return JSON.stringify({ action: 'fill', ref: refFor(prompt, 'Your name'), value: 'Ada', reason: 'fill name' })
+        if (turn === 2) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Greet me'), reason: 'submit' })
+        // The real greeting will read "Hello, Ada!" — asserting a
+        // deliberately wrong expected text here must genuinely fail
+        // against the real rendered result, not just because the code
+        // says so.
+        return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'Hello'), expectedText: 'Goodbye, Ada!', reason: 'wrong on purpose' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'fill the name and check the greeting',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'assertion-failed')
+    assert.equal(run.steps.length, 3)
+    assert.equal(run.steps[0].ok, true)
+    assert.equal(run.steps[1].ok, true)
+    assert.equal(run.steps[2].ok, false)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent stops honestly with unparseable-response rather than guessing an action', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        return 'I will click the button now.'
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'anything',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'unparseable-response')
+    assert.equal(run.unparseableResponse, 'I will click the button now.')
+    assert.equal(run.steps.length, 0)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent rejects an unverified goal-reached claim on a confirmation-requiring goal, then accepts it once a real assertion actually succeeds', async (t) => {
+  // Regression test for a real, live finding (a Shopify demo store, goal:
+  // "...then confirm the cart shows an item"): the model clicked its way to
+  // a real, correct outcome, then declared goal-reached WITHOUT ever
+  // calling assert_visible/assert_text — the end state happened to be
+  // right, but nothing in the run actually verified it, despite the goal
+  // explicitly asking for confirmation. This mirrors that exact shape: the
+  // fake provider tries to finish early without asserting, gets rejected,
+  // then does the right thing.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        // Premature — no assertion has happened yet. Must be rejected, not
+        // accepted as a real finish.
+        if (turn === 2) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'I clicked it, must be done' })
+        if (turn === 3) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'actually confirm it now' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'now verified' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it becomes visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    // Only the click and the real assertion are real executed steps — the
+    // two rejected/accepted "done" turns never touch the page.
+    assert.equal(run.steps.length, 2)
+    assert.equal(run.steps[0].action.action, 'click')
+    assert.equal(run.steps[1].action.action, 'assert_visible')
+    assert.equal(run.steps[1].ok, true)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent stops with stuck-repeating if a confirmation-requiring goal keeps getting an unverified done, rather than looping forever', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        // Never asserts, just keeps insisting it's done.
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it becomes visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 20,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 20, 'must stop well before the step cap, not accept the unverified claim either')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent stops with stuck-repeating instead of burning the full step budget on a looping agent', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        // Always assert the same thing is visible when it demonstrably
+        // isn't — a real, plausible "stuck" agent, not a contrived input.
+        return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Show secret message'), reason: 'stuck' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'anything',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 20,
+      headless: true,
+      artifactDir,
+    })
+
+    // The button IS visible, so assert_visible on it should actually
+    // succeed every time — this exercises the repeat detector on a
+    // succeeding-but-identical action, proving it's keyed on the action
+    // itself, not on failure.
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 20, 'must stop well before the step cap once repetition is detected')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent allows a goal that legitimately requires the same successful click several times in a row, without tripping stuck-repeating', async (t) => {
+  // Regression test for a real bug found via a live run against
+  // the-internet.herokuapp.com/add_remove_elements/: a goal asking to
+  // click the same "Add Element" button three times in a row got aborted
+  // as stuck-repeating after only two clicks, even though each click
+  // genuinely succeeded and changed real page state (adding another
+  // element) — the repeat detector couldn't tell "confused agent
+  // repeating a no-op" apart from "goal legitimately needs this action
+  // several times," a very ordinary real-world pattern (add N items to a
+  // cart, paginate N times, delete every row). Fixed: a repeated click/fill
+  // that keeps succeeding no longer counts toward the stuck-repeating
+  // threshold at all — bounded only by the normal step cap — while a
+  // repeated *failing* click/fill, or a repeated assertion/`done` (see the
+  // two tests above), still trips it exactly as before.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn <= 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Increment counter'), reason: `click ${turn}` })
+        if (turn === 4) return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'Count:'), expectedText: 'Count: 3', reason: 'confirm' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'click the Increment counter button three times, then confirm the count shows Count: 3',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    const clickSteps = run.steps.filter((s) => s.action.action === 'click')
+    assert.equal(clickSteps.length, 3, `expected all 3 identical clicks to succeed, got: ${JSON.stringify(run.steps.map((s) => [s.action.action, s.ok]))}`)
+    assert.ok(clickSteps.every((s) => s.ok))
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent still stops with stuck-repeating if a click/fill repeats and keeps failing, not just succeeding', async (t) => {
+  // The other half of the fix above: only a repeated click/fill that keeps
+  // *succeeding* is exempted from the stuck-repeating guard. A repeated
+  // failure must still trip it — otherwise a genuinely broken selector
+  // that never resolves would burn the entire step budget for no reason.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      // Visible but permanently disabled — Playwright's own actionability
+      // check for .click() requires the element be enabled, so every
+      // attempt genuinely times out and fails, a real repeated failure.
+      async complete(prompt) {
+        return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Disabled button'), reason: 'keep trying' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'anything',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 20,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 20, 'must stop well before the step cap once repeated failures are detected')
+    assert.ok(run.steps.every((s) => !s.ok), 'every attempt on the disabled button must genuinely fail, not silently succeed')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent completes a real login through credential placeholders, never sending the real value to the LLM, and calls onGoalReached with a real changed session', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startLoginFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const promptsSeen: string[] = []
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        promptsSeen.push(prompt)
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'fill', ref: refFor(prompt, 'sername'), value: USERNAME_PLACEHOLDER, reason: 'fill username' })
+        if (turn === 2) return JSON.stringify({ action: 'fill', ref: refFor(prompt, 'assword'), value: PASSWORD_PLACEHOLDER, reason: 'fill password' })
+        if (turn === 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Log in'), reason: 'submit' })
+        if (turn === 4) return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'Welcome back'), expectedText: 'Welcome back', reason: 'confirm logged in' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'logged in' })
+      },
+    }
+
+    let onGoalReachedCalled = false
+    let seenBaseline: StorageState | undefined
+    let seenFinal: StorageState | undefined
+    const run = await runAgent({
+      url: server.url + '/login',
+      goal: 'log in and confirm the dashboard shows a welcome message',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      credentials: { username: LOGIN_FIXTURE_USERNAME, password: LOGIN_FIXTURE_PASSWORD },
+      forceConfirmation: true,
+      onGoalReached: async (context, baseline) => {
+        onGoalReachedCalled = true
+        seenBaseline = baseline
+        seenFinal = await context.storageState()
+      },
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(onGoalReachedCalled)
+    assert.notDeepEqual(seenBaseline, seenFinal, 'a real session cookie was set, so baseline and final state must differ')
+    assert.ok(seenFinal!.cookies.length > 0, 'expected the real session cookie to have been captured')
+
+    // The real secret must never appear in any prompt sent to the "LLM" —
+    // only the placeholder tokens.
+    const allPrompts = promptsSeen.join('\n')
+    assert.ok(!allPrompts.includes(LOGIN_FIXTURE_PASSWORD), 'the real password must never appear in any prompt')
+    assert.ok(allPrompts.includes(PASSWORD_PLACEHOLDER), 'the placeholder token should appear once it is used in history')
+
+    // The recorded action objects themselves must still show the
+    // placeholder, never the real value — the direct regression test for
+    // the mutation bug described in browser.ts's substitutePlaceholders.
+    const fillSteps = run.steps.filter((s) => s.action.action === 'fill')
+    assert.ok(fillSteps.length >= 2)
+    for (const step of fillSteps) {
+      const action = step.action as Extract<typeof step.action, { action: 'fill' }>
+      assert.ok(
+        action.value === USERNAME_PLACEHOLDER || action.value === PASSWORD_PLACEHOLDER,
+        `expected a placeholder token, got a possibly-real value: ${JSON.stringify(action.value)}`
+      )
+    }
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent keeps the original placeholder token in an assert_text failure detail, never the real substituted value', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startLoginFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        // Assert the username field's own name contains the *password*
+        // placeholder — deliberately wrong, so this genuinely fails, and
+        // the failure detail must reference the placeholder token, not the
+        // real configured password.
+        if (turn === 1) return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'sername'), expectedText: PASSWORD_PLACEHOLDER, reason: 'deliberately wrong' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-unreachable', reason: 'gave up' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url + '/login',
+      goal: 'anything',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      credentials: { username: LOGIN_FIXTURE_USERNAME, password: LOGIN_FIXTURE_PASSWORD },
+    })
+
+    const failedStep = run.steps.find((s) => !s.ok)
+    assert.ok(failedStep)
+    assert.ok(failedStep!.failureDetail!.includes(PASSWORD_PLACEHOLDER), 'the failure detail must reference the placeholder token')
+    assert.ok(!failedStep!.failureDetail!.includes(LOGIN_FIXTURE_PASSWORD), 'the real password must never appear in the failure detail')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent reports matching baseline/final storageState to onGoalReached when the confirming assertion was real but unrelated to any actual session change', async (t) => {
+  // The independent structural check this enables: if a model satisfies
+  // the confirmation gate with an assertion that's genuinely true but
+  // doesn't reflect any real server-side change (e.g. asserting a static
+  // element on the login page itself, without ever submitting the form),
+  // baseline and final storageState end up identical — strong evidence
+  // nothing really happened, regardless of what the model self-reported.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startLoginFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'sername'), reason: 'trivially true, no real login happened' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    let seenBaseline: StorageState | undefined
+    let seenFinal: StorageState | undefined
+    const run = await runAgent({
+      url: server.url + '/login',
+      goal: 'confirm the username field is present',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      forceConfirmation: true,
+      onGoalReached: async (context, baseline) => {
+        seenBaseline = baseline
+        seenFinal = await context.storageState()
+      },
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.deepEqual(seenBaseline, seenFinal, 'no real session change happened, so baseline and final state should be identical')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent blocks a real click on a destructive-looking button by default, never actually clicking it', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      // A real, live model retrying a blocked action is exactly the
+      // scenario this needs to survive honestly — never a false
+      // goal-reached, and never an uncaught crash.
+      async complete(prompt) {
+        return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Delete Account'), reason: 'delete the account' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'delete my account and confirm it is gone',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 3,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.notEqual(run.outcome, 'goal-reached')
+    assert.ok(run.steps.length > 0)
+    assert.ok(run.steps.every((s) => !s.ok), 'the blocked click must never be recorded as a successful step')
+    assert.ok(run.steps.every((s) => s.failureDetail?.includes('allow-deletes')))
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent performs a real destructive click when allowDeletes is true, and fires onDestructiveClick exactly once', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Delete Account'), reason: 'delete the account' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'deleted'), expectedText: 'Account deleted', reason: 'confirm deleted' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const destructiveClicks: { name: string; reason: string }[] = []
+    const run = await runAgent({
+      url: server.url,
+      goal: 'delete my account and confirm it is gone',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      allowDeletes: true,
+      onDestructiveClick: (name, reason) => destructiveClicks.push({ name, reason }),
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(destructiveClicks.length, 1)
+    assert.equal(destructiveClicks[0].name, 'Delete Account')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})

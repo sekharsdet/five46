@@ -1,0 +1,43 @@
+{
+  "name": "five46",
+  "version": "0.1.0",
+  "private": true,
+  "description": "BYOK, fully local agentic E2E testing: point five46 at a live URL and a goal, an LLM (your own key) drives a real local Playwright browser toward it, and writes a real, standalone, re-runnable Playwright spec.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "five46": "dist/cli.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node src/cli.ts",
+    "test": "npm run build && node --test 'dist/**/*.test.js'"
+  },
+  "keywords": [
+    "e2e",
+    "testing",
+    "playwright",
+    "agent",
+    "byok",
+    "qa"
+  ],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.1095.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  },
+  "optionalDependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@playwright/test": "^1.62.0",
+    "playwright": "^1.62.0",
+    "zod": "^4.4.3"
+  }
+}
