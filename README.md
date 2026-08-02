@@ -1,14 +1,21 @@
 # five46
 
-**BYOK, fully local, agentic E2E and API testing.**
+[![npm version](https://img.shields.io/npm/v/five46.svg)](https://www.npmjs.com/package/five46)
+[![npm downloads](https://img.shields.io/npm/dm/five46.svg)](https://www.npmjs.com/package/five46)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![node](https://img.shields.io/node/v/five46.svg)](https://www.npmjs.com/package/five46)
 
-Point five46 at a real running page (or API) and a goal. An LLM — using
-your own API key — drives a real local Playwright browser or real HTTP
-requests toward that goal, one action at a time, and writes a real,
-standalone, re-runnable test spec on success.
+**AI-powered, BYOK, fully local agentic E2E and API testing for Playwright — no cloud sandbox, no data leaving your machine except the LLM call itself.**
 
-> **Status:** early proof of concept, verified end-to-end against a real
-> live LLM.
+Point five46 at a real running page (or API) and a plain-English goal — "log in and confirm the dashboard loads," "create a user via POST, then confirm it via GET." An LLM — using your own OpenAI, Anthropic, Gemini, Groq, or AWS Bedrock key — drives a real local Playwright browser or real HTTP requests toward that goal, one action at a time, and writes a real, standalone, re-runnable Playwright (or `node:test`) spec on success. No five46, no LLM, and no network call back to us involved in re-running the generated test — it's just ordinary Playwright code you own outright.
+
+> **Status:** early proof of concept, verified end-to-end against real live LLM keys across dozens of real-world sites and APIs.
+
+## Why five46, and how it's different
+
+Most AI-driven test-generation tools run in a cloud sandbox: your app's traffic, screenshots, and DOM leave your machine and go through a third-party service you don't control. five46 is the opposite bet — **everything runs on your laptop**, using a key you already pay for, and the *only* thing that ever leaves your machine is the text sent to your chosen LLM provider on each step (always disclosed, never hidden). If your organization can't adopt a cloud-hosted AI testing platform for compliance or trust reasons, this is built for exactly that constraint.
+
+It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` file you can read, diff, commit to your repo, and run in CI with plain `npx playwright test` — no vendor lock-in, no proprietary runner.
 
 ## Features
 
@@ -42,6 +49,18 @@ standalone, re-runnable test spec on success.
 - **Structured planning** — `--structured-plan` plans the whole goal
   upfront with one extra LLM call, then executes most steps directly
   against the real page/response with no further live decision needed.
+
+## five46 vs. cloud AI testing platforms
+
+| | five46 | Typical cloud AI testing platform |
+|---|---|---|
+| Where it runs | Your machine, fully local | Their cloud sandbox |
+| What leaves your machine | Only the text sent to your LLM provider per step (disclosed) | Your app's traffic, screenshots, DOM, credentials |
+| Pricing model | BYOK — you pay your LLM provider directly, at cost | Usage-based platform subscription on top of their own LLM cost |
+| Output | A real, standalone `.spec.ts`/`.test.mjs` file you own, re-runnable with plain Playwright/`node:test` | Usually tied to their own runner/dashboard |
+| Best fit | Teams that can't send app data to a third party, or want to run tests entirely offline/on-prem | Teams that want a managed, zero-setup service and don't mind the tradeoff |
+
+Not a knock on cloud platforms — it's a genuinely different tradeoff (their infra vs. your own key and your own machine), and the right choice depends on what your organization is allowed to send off-machine.
 
 ## Installation
 
@@ -237,7 +256,8 @@ exposed via MCP.
 
 Not yet built: a multi-file/dependency-graph backend-test model, auto-
 refresh login (session expiry mid-run), MCP exposure for `five46 login`,
-scrolling to off-screen elements.
+concurrent `--repeat` execution, and a cheaper/faster model for per-step
+decisions with a stronger model reserved for planning.
 
 ## Development
 

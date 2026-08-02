@@ -1,17 +1,25 @@
 {
   "name": "five46",
   "version": "0.1.0",
-  "private": true,
-  "description": "BYOK, fully local agentic E2E testing: point five46 at a live URL and a goal, an LLM (your own key) drives a real local Playwright browser toward it, and writes a real, standalone, re-runnable Playwright spec.",
+  "description": "BYOK, fully local agentic E2E and API testing: point five46 at a live URL or API and a goal, an LLM (your own OpenAI/Anthropic/Gemini/Groq/Bedrock key) drives a real local Playwright browser or real HTTP requests toward it, and writes a real, standalone, re-runnable Playwright/node:test spec on success. No cloud sandbox, no tunneling.",
+  "homepage": "https://github.com/sekharsdet/five46#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sekharsdet/five46.git"
   },
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "bugs": {
+    "url": "https://github.com/sekharsdet/five46/issues"
+  },
+  "author": "sekharsdet",
   "bin": {
     "five46": "dist/cli.js"
   },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.d.ts"
+  ],
   "type": "commonjs",
   "engines": {
     "node": ">=18"
@@ -19,15 +27,38 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "ts-node src/cli.ts",
-    "test": "npm run build && node --test 'dist/**/*.test.js'"
+    "test": "npm run build && node --test 'dist/**/*.test.js'",
+    "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
     "e2e",
+    "e2e-testing",
+    "end-to-end-testing",
     "testing",
+    "test-automation",
+    "api-testing",
     "playwright",
-    "agent",
+    "playwright-tests",
+    "ai-agent",
+    "ai-testing",
+    "autonomous-testing",
+    "agentic",
+    "llm",
     "byok",
-    "qa"
+    "qa",
+    "qa-automation",
+    "cli",
+    "mcp",
+    "model-context-protocol",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "groq",
+    "bedrock",
+    "codegen",
+    "test-generation",
+    "self-healing-tests"
   ],
   "license": "MIT",
   "dependencies": {
