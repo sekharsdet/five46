@@ -11,6 +11,8 @@ Point five46 at a real running page (or API) and a plain-English goal — "log i
 
 > **Status:** early proof of concept, verified end-to-end against real live LLM keys across dozens of real-world sites and APIs.
 
+If five46 is useful to you, a ⭐ on [GitHub](https://github.com/sekharsdet/five46) helps other people find it — much appreciated!
+
 ## Why five46, and how it's different
 
 Most AI-driven test-generation tools run in a cloud sandbox: your app's traffic, screenshots, and DOM leave your machine and go through a third-party service you don't control. five46 is the opposite bet — **everything runs on your laptop**, using a key you already pay for, and the *only* thing that ever leaves your machine is the text sent to your chosen LLM provider on each step (always disclosed, never hidden). If your organization can't adopt a cloud-hosted AI testing platform for compliance or trust reasons, this is built for exactly that constraint.
