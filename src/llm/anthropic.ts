@@ -26,7 +26,16 @@ export const anthropicProvider: LlmProvider = {
       throw new LlmHttpError(await describeApiError('Anthropic', response), response.status)
     }
 
-    const body = (await response.json()) as { content?: { type: string; text?: string }[] }
-    return body.content?.find((block) => block.type === 'text')?.text ?? ''
+    const body = (await response.json()) as { content?: { type: string; text?: string }[]; stop_reason?: string }
+    const text = body.content?.find((block) => block.type === 'text')?.text
+    if (text) return text
+    // Same reasoning as gemini.ts's identical check — see its own doc
+    // comment. An empty completion already degrades correctly to
+    // unparseable-response; this only replaces a blank raw response with
+    // one that names why, when Anthropic's own response says so
+    // (stop_reason other than 'end_turn').
+    const stopReason = body.stop_reason
+    if (stopReason && stopReason !== 'end_turn') return `[anthropic returned no content — stop_reason: ${stopReason}]`
+    return ''
   },
 }

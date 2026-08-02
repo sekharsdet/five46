@@ -27,7 +27,16 @@ export const openAiProvider: LlmProvider = {
       throw new LlmHttpError(await describeApiError('OpenAI', response), response.status)
     }
 
-    const body = (await response.json()) as { choices?: { message?: { content?: string } }[] }
-    return body.choices?.[0]?.message?.content ?? ''
+    const body = (await response.json()) as { choices?: { message?: { content?: string }; finish_reason?: string }[] }
+    const content = body.choices?.[0]?.message?.content
+    if (content) return content
+    // Same reasoning as gemini.ts's identical check — see its own doc
+    // comment. An empty completion already degrades correctly to
+    // unparseable-response; this only replaces a blank raw response with
+    // one that names why, when OpenAI's own response says so
+    // (finish_reason: 'content_filter'/'length'/... instead of 'stop').
+    const finishReason = body.choices?.[0]?.finish_reason
+    if (finishReason && finishReason !== 'stop') return `[openai returned no content — finish_reason: ${finishReason}]`
+    return ''
   },
 }

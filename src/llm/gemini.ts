@@ -42,8 +42,24 @@ export const geminiProvider: LlmProvider = {
     }
 
     const body = (await response.json()) as {
-      candidates?: { content?: { parts?: { text?: string }[] } }[]
+      candidates?: { content?: { parts?: { text?: string }[] }; finishReason?: string }[]
+      promptFeedback?: { blockReason?: string }
     }
-    return body.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
+    const text = body.candidates?.[0]?.content?.parts?.[0]?.text
+    if (text) return text
+    // Found via a real, live run: an empty completion previously became a
+    // silent '' — degrading correctly to unparseable-response (no crash,
+    // no data loss), but with a blank raw response nobody could diagnose.
+    // Gemini's own response already names why when this happens; we were
+    // just discarding it. This string still correctly fails JSON.parse (no
+    // control-flow change), it just makes the disclosed raw response
+    // genuinely informative — most plausibly a safety-filter block, given
+    // the goal that first surfaced this sent PII-shaped text (a literal
+    // SSN) to the model every turn, per this tool's own disclosure banner.
+    const blockReason = body.promptFeedback?.blockReason
+    if (blockReason) return `[gemini blocked this prompt — blockReason: ${blockReason}]`
+    const finishReason = body.candidates?.[0]?.finishReason
+    if (finishReason && finishReason !== 'STOP') return `[gemini returned no content — finishReason: ${finishReason}]`
+    return ''
   },
 }

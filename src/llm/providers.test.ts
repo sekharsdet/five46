@@ -156,3 +156,103 @@ test('groqProvider throws LlmHttpError with the real status on a non-ok response
     global.fetch = originalFetch
   }
 })
+
+// Real, live-found gap: an empty completion previously became a silent ''
+// with zero diagnostic information — the run still correctly degraded to
+// unparseable-response (no crash), but a human had no way to tell why.
+// These prove each provider now names the reason when its own response
+// says so, and — just as importantly — stays unchanged (still plain '')
+// for a normal, cleanly-finished-but-empty completion, so this doesn't
+// invent a new failure mode for a case that was never actually broken.
+
+function fakeJsonResponse(body: unknown): Response {
+  return { ok: true, json: async () => body } as Response
+}
+
+test('geminiProvider surfaces a safety blockReason instead of a silent empty string', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ promptFeedback: { blockReason: 'SAFETY' } })) as typeof fetch
+  try {
+    const result = await geminiProvider.complete('x', 'gemini-test-key')
+    assert.match(result, /blockReason: SAFETY/)
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('geminiProvider surfaces a non-STOP finishReason instead of a silent empty string', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ candidates: [{ finishReason: 'RECITATION' }] })) as typeof fetch
+  try {
+    const result = await geminiProvider.complete('x', 'gemini-test-key')
+    assert.match(result, /finishReason: RECITATION/)
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('geminiProvider still returns a plain empty string for a normal, cleanly-finished-but-empty completion', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: '' }] } }] })) as typeof fetch
+  try {
+    const result = await geminiProvider.complete('x', 'gemini-test-key')
+    assert.equal(result, '')
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('openAiProvider surfaces a non-stop finish_reason instead of a silent empty string', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ choices: [{ finish_reason: 'content_filter' }] })) as typeof fetch
+  try {
+    const result = await openAiProvider.complete('x', 'sk-test')
+    assert.match(result, /finish_reason: content_filter/)
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('openAiProvider still returns a plain empty string when finish_reason is the normal "stop"', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ choices: [{ finish_reason: 'stop', message: { content: '' } }] })) as typeof fetch
+  try {
+    const result = await openAiProvider.complete('x', 'sk-test')
+    assert.equal(result, '')
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('groqProvider surfaces a non-stop finish_reason instead of a silent empty string', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ choices: [{ finish_reason: 'length' }] })) as typeof fetch
+  try {
+    const result = await groqProvider.complete('x', 'groq-test-key')
+    assert.match(result, /finish_reason: length/)
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('anthropicProvider surfaces a non-end_turn stop_reason instead of a silent empty string', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ stop_reason: 'max_tokens', content: [] })) as typeof fetch
+  try {
+    const result = await anthropicProvider.complete('x', 'anthropic-test-key')
+    assert.match(result, /stop_reason: max_tokens/)
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('anthropicProvider still returns a plain empty string when stop_reason is the normal "end_turn" but there is no text block', async () => {
+  const originalFetch = global.fetch
+  global.fetch = (async () => fakeJsonResponse({ stop_reason: 'end_turn', content: [] })) as typeof fetch
+  try {
+    const result = await anthropicProvider.complete('x', 'anthropic-test-key')
+    assert.equal(result, '')
+  } finally {
+    global.fetch = originalFetch
+  }
+})
