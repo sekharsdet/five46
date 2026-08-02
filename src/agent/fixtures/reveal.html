@@ -40,7 +40,35 @@
   <input id="subscribe-checkbox" type="checkbox" />
   <label for="subscribe-checkbox">Subscribe to updates</label>
 
+  <!-- Used by browser.test.ts/runner.test.ts to verify the `wait` action
+       and assert_visible/assert_text's auto-retry: a real, live-found bug
+       (the-internet.herokuapp.com's dynamic-loading demo) had content only
+       appear after an async client-side delay, which the agent had no tool
+       to wait out. 800ms — short enough to keep the suite fast while still
+       being definitively "not there yet" at the instant of a click. -->
+  <button id="delayed-reveal-btn">Load content</button>
+  <p id="delayed-secret" role="status" hidden>Delayed content loaded</p>
+
+  <!-- Used by browser.test.ts/runner.test.ts to verify assert_page_text: a
+       real, live-found gap distinct from (and deeper than) the wait-action
+       one above — content with no ARIA role and no interactive tag (a
+       plain heading, exactly like the-internet.herokuapp.com's own
+       `<h4>Hello World!</h4>`) never appears in snapshot()'s outline at
+       all (SELECTOR is 'button, a, input, select, textarea, [role]'), so
+       no amount of waiting makes it assertable via assert_visible/
+       assert_text — only a whole-page text search finds it. Same 800ms
+       async delay as delayed-secret above, combining both real gaps in
+       one fixture element. -->
+  <button id="delayed-heading-btn">Load heading</button>
+  <h4 id="delayed-heading" style="display:none">Hello World!</h4>
+
   <script>
+    document.getElementById('delayed-reveal-btn').addEventListener('click', () => {
+      setTimeout(() => { document.getElementById('delayed-secret').hidden = false }, 800);
+    });
+    document.getElementById('delayed-heading-btn').addEventListener('click', () => {
+      setTimeout(() => { document.getElementById('delayed-heading').style.display = 'block' }, 800);
+    });
     document.getElementById('reveal-btn').addEventListener('click', () => {
       document.getElementById('secret').hidden = false;
     });

@@ -52,6 +52,12 @@ export interface ParsedAgentArgs {
    * self-healing selectors), so it's parsed only by this shared parser,
    * never by `parseApiArgs`. */
   recordVideo?: boolean
+  /** `test`/`api` only — see `RunAgentOptions.useStructuredPlan`/
+   * `RunApiTestOptions.useStructuredPlan`. Not extended to `login` for the
+   * same reason `--repeat` isn't: login's deliverable is one durable
+   * session file, and its goal vocabulary is always "log in" — there's no
+   * multi-step ambiguity for an upfront plan to help resolve. */
+  structuredPlan?: boolean
 }
 
 export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
@@ -87,6 +93,8 @@ export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
       result.project = argv[++i]
     } else if (argv[i] === '--record-video') {
       result.recordVideo = true
+    } else if (argv[i] === '--structured-plan') {
+      result.structuredPlan = true
     } else if (!result.url) {
       result.url = argv[i]
     }
@@ -106,6 +114,7 @@ export interface ParsedApiArgs {
   noRootCause?: boolean
   repeat?: number
   project?: string
+  structuredPlan?: boolean
 }
 
 export function parseApiArgs(argv: string[]): ParsedApiArgs {
@@ -133,6 +142,8 @@ export function parseApiArgs(argv: string[]): ParsedApiArgs {
       if (Number.isFinite(n)) result.repeat = n
     } else if (argv[i] === '--project') {
       result.project = argv[++i]
+    } else if (argv[i] === '--structured-plan') {
+      result.structuredPlan = true
     } else if (!result.baseUrl) {
       result.baseUrl = argv[i]
     }
@@ -240,6 +251,7 @@ export async function performOneE2eRun(
   allowDeletes: boolean | undefined,
   noRootCause: boolean | undefined,
   recordVideo: boolean | undefined,
+  structuredPlan: boolean | undefined,
   provider: LlmProvider,
   llmApiKey: string,
   credentials: LoginCredentials,
@@ -260,6 +272,7 @@ export async function performOneE2eRun(
       credentials,
       allowDeletes,
       recordVideo,
+      useStructuredPlan: structuredPlan,
       onDestructiveClick: (name, reason) => console.log(`  -> clicking "${redactSecrets(name, secrets)}" (${redactSecrets(reason, secrets)})`),
     })
   } catch (err) {
@@ -322,6 +335,7 @@ async function runE2eTest(
   allowDeletes: boolean | undefined,
   noRootCause: boolean | undefined,
   recordVideo: boolean | undefined,
+  structuredPlan: boolean | undefined,
   projectName: string | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
@@ -363,6 +377,7 @@ async function runE2eTest(
   const runId = Date.now().toString(36)
   const artifactDir = join(process.cwd(), `five46-agent-${runId}`)
   if (recordVideo) console.log(`A full .webm video of this session will be recorded to ${artifactDir} once the run finishes.`)
+  if (structuredPlan) console.log('One extra LLM call will plan the whole goal upfront; most steps then execute without a further live decision.')
 
   const result = await performOneE2eRun(
     url,
@@ -375,6 +390,7 @@ async function runE2eTest(
     allowDeletes,
     noRootCause,
     recordVideo,
+    structuredPlan,
     provider,
     llmApiKey,
     credentials,
@@ -409,6 +425,7 @@ async function runRepeatedE2eTest(
   allowDeletes: boolean | undefined,
   noRootCause: boolean | undefined,
   recordVideo: boolean | undefined,
+  structuredPlan: boolean | undefined,
   repeat: number,
   projectName: string | undefined
 ): Promise<boolean> {
@@ -449,6 +466,7 @@ async function runRepeatedE2eTest(
   }
   console.log('Each repeat writes its own generated spec; the run-id header line is ignored when comparing them for flakiness.')
   if (recordVideo) console.log('A full .webm video of each repeat will be recorded to its own artifact directory once that repeat finishes.')
+  if (structuredPlan) console.log('Each repeat plans the whole goal upfront with one extra LLM call; most steps then execute without a further live decision.')
 
   const batchId = Date.now().toString(36)
   const results: RepeatIterationResult[] = []
@@ -467,6 +485,7 @@ async function runRepeatedE2eTest(
       allowDeletes,
       noRootCause,
       recordVideo,
+      structuredPlan,
       provider,
       llmApiKey,
       credentials,
@@ -515,6 +534,7 @@ export async function performOneApiRun(
   safety: SafetyMode,
   authHeaders: Record<string, string> | undefined,
   noRootCause: boolean | undefined,
+  structuredPlan: boolean | undefined,
   provider: LlmProvider,
   llmApiKey: string,
   secrets: (string | undefined)[],
@@ -531,6 +551,7 @@ export async function performOneApiRun(
       safety,
       authHeaders,
       storageState,
+      useStructuredPlan: structuredPlan,
       // Real-time write visibility — printed as it happens, so it must go
       // through the same redaction the final report gets. A resolved URL
       // can legitimately contain a chained saveAs value pulled from a
@@ -593,6 +614,7 @@ async function runApiTestCommand(
   allowDeletes: boolean,
   allowHosts: string[],
   noRootCause: boolean | undefined,
+  structuredPlan: boolean | undefined,
   projectName: string | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
@@ -626,8 +648,9 @@ async function runApiTestCommand(
   console.log(`Allowed methods this run: ${allowedMethods.join(', ')}. Allowed host(s): ${[targetOrigin, ...allowHosts].join(', ')}.`)
   if (storageState) console.log(`Starting already authenticated, using the session at ${storageStatePath}.`)
   if (authHeaders) console.log('An API auth header is configured — attached to every request, never sent to the LLM.')
+  if (structuredPlan) console.log('One extra LLM call will plan the whole goal upfront; most steps then execute without a further live decision.')
 
-  const result = await performOneApiRun(baseUrl, goal, maxSteps, outArg, storageState, safety, authHeaders, noRootCause, provider, llmApiKey, secrets, projectName)
+  const result = await performOneApiRun(baseUrl, goal, maxSteps, outArg, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName)
   return result !== 'errored' && result.outcome === 'goal-reached'
 }
 
@@ -647,6 +670,7 @@ async function runRepeatedApiTestCommand(
   allowDeletes: boolean,
   allowHosts: string[],
   noRootCause: boolean | undefined,
+  structuredPlan: boolean | undefined,
   repeat: number,
   projectName: string | undefined
 ): Promise<boolean> {
@@ -686,12 +710,13 @@ async function runRepeatedApiTestCommand(
   if (storageState) console.log(`Starting already authenticated, using the session at ${storageStatePath}.`)
   if (authHeaders) console.log('An API auth header is configured — attached to every request, never sent to the LLM.')
   console.log('Each repeat writes its own generated script; the run-id header line is ignored when comparing them for flakiness.')
+  if (structuredPlan) console.log('Each repeat plans the whole goal upfront with one extra LLM call; most steps then execute without a further live decision.')
 
   const results: RepeatIterationResult[] = []
   for (let i = 1; i <= effectiveRepeat; i++) {
     console.log(`\n=== Repeat ${i}/${effectiveRepeat} ===`)
     const iterationOut = outArg ? insertIterationSuffix(outArg, i) : undefined
-    const result = await performOneApiRun(baseUrl, goal, maxSteps, iterationOut, storageState, safety, authHeaders, noRootCause, provider, llmApiKey, secrets, projectName)
+    const result = await performOneApiRun(baseUrl, goal, maxSteps, iterationOut, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName)
     if (result === 'errored') {
       console.error(`\nRepeat ${i}/${effectiveRepeat} hit a tooling error — stopping early rather than running the rest.`)
       return false
@@ -1035,9 +1060,9 @@ function listGeneratedRuns(dir: string, projectFilter?: string): boolean {
 }
 
 const USAGE = [
-  'Usage: five46 test <url> --goal "text" [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--project name] [--record-video]',
+  'Usage: five46 test <url> --goal "text" [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--project name] [--record-video] [--structured-plan]',
   '       five46 login <url> --goal "text" --out <path> [--max-steps N] [--headed] [--record-video]',
-  '       five46 api <base-url> --goal "text" [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--project name]',
+  '       five46 api <base-url> --goal "text" [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--project name] [--structured-plan]',
   '       five46 mcp   (starts an MCP server on stdio, exposing five46_test/five46_api to an IDE-embedded AI assistant)',
   '       five46 list [dir] [--project name]   (lists previously generated runs, default: current directory)',
   '       five46 diff <fileA> <fileB>   (line diff between two generated run files, ignoring the run-id header line)',
@@ -1148,7 +1173,7 @@ async function main() {
   }
 
   if (argv[0] === 'api') {
-    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project } = resolveProjectForApi(
+    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project, structuredPlan } = resolveProjectForApi(
       parseApiArgs(argv.slice(1))
     )
     if (!baseUrl || !goal) {
@@ -1163,8 +1188,8 @@ async function main() {
       // repeated/flaky-detection path.
       const succeeded =
         repeat !== undefined && repeat >= 2
-          ? await runRepeatedApiTestCommand(baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project)
-          : await runApiTestCommand(baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, project)
+          ? await runRepeatedApiTestCommand(baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, repeat, project)
+          : await runApiTestCommand(baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, project)
       if (!succeeded) process.exit(1)
     } catch (err) {
       console.error(`\nfive46 api failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -1178,7 +1203,7 @@ async function main() {
     process.exit(1)
   }
 
-  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo } = resolveProjectForTest(
+  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, structuredPlan } = resolveProjectForTest(
     parseAgentArgs(argv.slice(1))
   )
   if (!url || !goal) {
@@ -1191,8 +1216,8 @@ async function main() {
   try {
     const succeeded =
       repeat !== undefined && repeat >= 2
-        ? await runRepeatedE2eTest(url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, repeat, project)
-        : await runE2eTest(url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, project)
+        ? await runRepeatedE2eTest(url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, repeat, project)
+        : await runE2eTest(url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, project)
     if (!succeeded) process.exit(1)
   } catch (err) {
     console.error(`\nfive46 test failed: ${err instanceof Error ? err.message : String(err)}`)

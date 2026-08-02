@@ -97,6 +97,17 @@ export interface ExecutedApiStep {
   failureDetail?: string
 }
 
+/** An upfront plan is just `ApiAction[]` — unlike the browser engine's
+ * `PlannedStep` (which needs a `target` prediction in place of a `ref`,
+ * since a DOM element can't be referenced before its page has even
+ * loaded), an API `request`'s `url`/`method` has no structural-matching
+ * ambiguity at all: a planned request is already the exact same shape as a
+ * live one, `{{var}}` placeholders and all. Genuinely simpler here than
+ * the browser engine, not just described that way. */
+export interface ApiPlan {
+  steps: ApiAction[]
+}
+
 export interface ApiTestRun {
   runId: string
   baseUrl: string
@@ -104,4 +115,6 @@ export interface ApiTestRun {
   steps: ExecutedApiStep[]
   outcome: RunOutcome
   unparseableResponse?: string
+  /** Same shape/meaning as `TestRun.planStats` — see its own doc comment. */
+  planStats?: { plannedSteps: number; fastPathedSteps: number }
 }

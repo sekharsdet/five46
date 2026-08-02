@@ -50,6 +50,26 @@ test('generateAgentSpec renders an upward scroll with a negated delta', () => {
   assert.ok(spec.includes("window.scrollBy({ top: -window.innerHeight, left: 0, behavior: 'instant' })"))
 })
 
+test('generateAgentSpec renders a wait step as a real page.waitForTimeout call, using the same duration the live run actually paused for', () => {
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'wait', reason: 'content may still be loading' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true },
+    { step: 2, action: { action: 'click', ref: 'e1', reason: 'click it' }, outline: outlineWith('e1', '#bottom-btn'), ok: true },
+  ]
+  const run: TestRun = { runId: 'abc123', url: 'http://localhost:1234', goal: 'wait then click', steps, outcome: 'goal-reached' }
+
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('await page.waitForTimeout(3000)'))
+  assert.ok(spec.includes('await page.locator("#bottom-btn").click()'), 'the step after the wait must still render too')
+})
+
+test('generateAgentSpec renders assert_page_text as a real body-wide toContainText assertion, needing no selector', () => {
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm it appeared' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true }]
+  const run: TestRun = { runId: 'abc123', url: 'http://localhost:1234', goal: 'confirm text appears', steps, outcome: 'goal-reached' }
+
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes(`await expect(page.locator('body')).toContainText("Hello World!")`))
+})
+
 test('generateAgentSpec still writes the steps that succeeded before a failure, with an honest note about the outcome', () => {
   const steps: ExecutedStep[] = [
     { step: 1, action: { action: 'click', ref: 'e1', reason: 'open' }, outline: outlineWith('e1', '#reveal-btn'), ok: true },

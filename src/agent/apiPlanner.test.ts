@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildApiActionPrompt, parseApiAction } from './apiPlanner'
+import { buildApiActionPrompt, parseApiAction, buildApiPlanPrompt, parseApiPlan, checkVarReferences } from './apiPlanner'
 import type { SafetyMode } from './apiTypes'
 
 const READ_ONLY: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set() }
@@ -117,4 +117,75 @@ test('parseApiAction rejects an unrecognized method string outright', () => {
   const raw = JSON.stringify({ action: 'request', method: 'TRACE', url: 'http://localhost:1/x', reason: 'x' })
   const result = parseApiAction(raw, new Set(), WRITES_AND_DELETES)
   assert.equal(result.ok, false)
+})
+
+test('buildApiPlanPrompt includes the goal, the safety disclosure, and the plan JSON schema', () => {
+  const prompt = buildApiPlanPrompt('goal', READ_ONLY)
+  assert.ok(prompt.includes('goal'))
+  assert.ok(prompt.includes('Allowed methods this run:'))
+  assert.ok(prompt.includes('"steps"'))
+  assert.ok(prompt.includes('saveAs'))
+})
+
+test('parseApiPlan strictly parses a real, well-formed plan response, including a forward {{var}} reference', () => {
+  // A later step referencing a value an EARLIER step in the same plan will
+  // save is legitimate at plan-parse time — only unresolved at the point a
+  // step actually executes (see apiRunner.ts's fast path), never here.
+  const raw = JSON.stringify({
+    steps: [
+      { action: 'request', method: 'post', url: '/users', body: '{}', saveAs: { name: 'userId', path: 'id' }, reason: 'create' },
+      { action: 'request', method: 'GET', url: '/users/{{userId}}', reason: 'fetch it back' },
+      { action: 'assert_status', expected: 200, reason: 'ok' },
+      { action: 'assert_json_path_exists', path: 'name', reason: 'has a name' },
+      { action: 'assert_json_path_equals', path: 'name', expected: 'Ada', reason: 'name matches' },
+      { action: 'done', outcome: 'goal-reached', reason: 'confirmed' },
+    ],
+  })
+  const result = parseApiPlan(raw)
+  assert.equal(result.ok, true)
+  if (!result.ok) throw new Error('unreachable')
+  assert.equal(result.plan.steps.length, 6)
+  assert.equal(result.plan.steps[0].action, 'request')
+  if (result.plan.steps[0].action === 'request') {
+    assert.equal(result.plan.steps[0].method, 'POST', 'method should be normalized to uppercase, same as parseApiAction')
+  }
+  assert.equal(result.plan.steps[5].action, 'done')
+})
+
+test('parseApiPlan strips a markdown json fence, the same accommodation parseApiAction already makes', () => {
+  const raw = '```json\n' + JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-reached', reason: 'r' }] }) + '\n```'
+  assert.equal(parseApiPlan(raw).ok, true)
+})
+
+test('parseApiPlan fails honestly, never guessing, on invalid JSON', () => {
+  assert.equal(parseApiPlan('not json').ok, false)
+})
+
+test('parseApiPlan fails honestly when the response is not a {"steps": [...]} object', () => {
+  assert.equal(parseApiPlan(JSON.stringify({ notSteps: [] })).ok, false)
+})
+
+test('parseApiPlan fails honestly on an empty steps array', () => {
+  assert.equal(parseApiPlan(JSON.stringify({ steps: [] })).ok, false)
+})
+
+test('parseApiPlan fails honestly when any single step is malformed', () => {
+  const raw = JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-reached', reason: 'r' }, { action: 'request', reason: 'missing method/url' }] })
+  assert.equal(parseApiPlan(raw).ok, false)
+})
+
+test('parseApiPlan does NOT reject a disallowed method or an unresolved {{var}} — those are execution-time concerns, not parse-time ones', () => {
+  // Deliberately different from parseApiAction: a plan step's safety/var
+  // validity can only be judged once it's actually about to execute (see
+  // apiRunner.ts's fast path), not at plan-parse time.
+  const raw = JSON.stringify({
+    steps: [{ action: 'request', method: 'DELETE', url: '/items/{{neverSaved}}', reason: 'r' }],
+  })
+  const result = parseApiPlan(raw)
+  assert.equal(result.ok, true)
+})
+
+test('checkVarReferences is exported and usable independently, for apiRunner.ts\'s fast path to reuse', () => {
+  assert.equal(checkVarReferences(['/items/{{itemId}}'], new Set(['itemId'])), undefined)
+  assert.match(checkVarReferences(['/items/{{missing}}'], new Set())!, /missing.*hasn't been saved/)
 })

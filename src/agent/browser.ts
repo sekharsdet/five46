@@ -421,6 +421,33 @@ function resolve(outline: PageOutline, ref: string): OutlineElement | undefined 
   return outline.elements.find((el) => el.ref === ref)
 }
 
+/** Fixed, not model-controlled — see `AgentAction`'s `wait` case doc comment
+ * for why. `page.waitForTimeout()` is normally a Playwright anti-pattern
+ * (condition-based waits are almost always better), but it's the right tool
+ * here specifically because there IS no better condition to wait on: the
+ * real page that motivated this (`the-internet.herokuapp.com`'s dynamic-
+ * loading demo) delays via a client-side `setTimeout`, not a network
+ * request, so `page.waitForLoadState('networkidle')` would resolve
+ * immediately without helping at all. 3s: two consecutive `wait` actions
+ * (allowed — see `runner.ts`'s repeat-guard, a third identical one trips
+ * `stuck-repeating`) cover a good real-world 5-6s spinner without the model
+ * needing to guess a duration itself. Exported so `generateSpec.ts` can
+ * render the identical duration into the generated `.spec.ts`'s
+ * `page.waitForTimeout()` call, rather than a second, independently-drifting
+ * hardcoded number. */
+export const WAIT_ACTION_MS = 3000
+
+/** How long `assert_visible`/`assert_text` poll before giving up — matches
+ * Playwright's own `expect().toBeVisible()` default timeout, which is
+ * exactly what the generated `.spec.ts` for a successful assertion calls
+ * (see `generateSpec.ts`). Before this, a live-run assertion was a single
+ * instantaneous check with no retry at all — strictly weaker than the
+ * generated spec's own semantics for the identical assertion, so a real
+ * assertion racing content that was about to appear a moment later would
+ * spuriously fail during the live run even though the spec it produces
+ * would have passed. */
+const ASSERT_WAIT_MS = 5000
+
 /** Executes one already-parsed, already-ref-validated action against the
  * real page. Any Playwright-level failure (element detached, navigation
  * mid-action, timeout) is caught here and turned into an honest `ok: false`
@@ -461,6 +488,34 @@ export async function executeAction(
 
   if (action.action === 'done') return { ok: true }
 
+  if (action.action === 'wait') {
+    await page.waitForTimeout(WAIT_ACTION_MS)
+    return { ok: true }
+  }
+
+  if (action.action === 'assert_page_text') {
+    // Same bounded-poll shape as assert_text below, against `body` instead
+    // of a specific outline-derived selector — this is the whole point:
+    // no `ref`, no outline element required at all.
+    const expected = substitutePlaceholders(action.expectedText, credentials)
+    const deadline = Date.now() + ASSERT_WAIT_MS
+    const body = page.locator('body')
+    let lastText = ''
+    while (true) {
+      const remaining = deadline - Date.now()
+      try {
+        lastText = (await body.innerText({ timeout: Math.max(remaining, 1) })) ?? ''
+        if (lastText.includes(expected)) return { ok: true }
+      } catch {
+        // Body not settled yet, or this iteration's own timeout elapsed —
+        // keep polling until the outer deadline.
+      }
+      if (Date.now() >= deadline) break
+      await page.waitForTimeout(150)
+    }
+    return await fail(`expected the page to contain text "${action.expectedText}", but it never appeared`)
+  }
+
   if (action.action === 'scroll') {
     try {
       // String-evaluated (like SNAPSHOT_SCRIPT above), not an inline TS
@@ -493,26 +548,51 @@ export async function executeAction(
   const locator = page.locator(el.selector).first()
 
   if (action.action === 'assert_visible') {
-    const visible = await locator.isVisible()
-    return visible ? { ok: true } : await fail(`element "${el.name}" (ref ${el.ref}) is not visible`)
+    // Polls, rather than a single instantaneous check — matches
+    // `expect(locator).toBeVisible()`'s own default auto-retry behavior,
+    // which is exactly what the generated spec calls for this same
+    // assertion (see `generateSpec.ts`). Without this, a live-run assertion
+    // was strictly weaker than the spec it produces: content that was a
+    // moment away from appearing would spuriously fail the live run even
+    // though the recorded spec, re-run later, would pass.
+    try {
+      await locator.waitFor({ state: 'visible', timeout: ASSERT_WAIT_MS })
+      return { ok: true }
+    } catch {
+      return await fail(`element "${el.name}" (ref ${el.ref}) is not visible`)
+    }
   }
 
   if (action.action === 'assert_text') {
-    try {
-      // Same rule as `fill`: the comparison uses the substituted local
-      // value, but `fail()`'s message below always references the
-      // original `action.expectedText` (the placeholder token, if that's
-      // what it was) — never the substituted one, or a real credential
-      // would leak into the failure detail, which flows into `history`
-      // (the next prompt) and the printed report.
-      const expected = substitutePlaceholders(action.expectedText, credentials)
-      const text = (await locator.textContent()) ?? ''
-      return text.includes(expected)
-        ? { ok: true }
-        : await fail(`expected text containing "${action.expectedText}", got "${text.trim()}"`)
-    } catch (err) {
-      return fail(err instanceof Error ? err.message.split('\n')[0] : String(err))
+    // Same reasoning as assert_visible above — Playwright has no locator-
+    // level "wait for text" outside test-runner `expect()`, so this polls
+    // by hand at the same cadence/timeout instead of a single instant read.
+    // Each individual `.textContent()` call is given its own short timeout
+    // (not left to Playwright's own 30s default) — otherwise a single
+    // stalled/never-attached call could block well past `ASSERT_WAIT_MS`
+    // before this loop ever got a chance to retry, defeating the whole
+    // point of a bounded poll.
+    const expected = substitutePlaceholders(action.expectedText, credentials)
+    const deadline = Date.now() + ASSERT_WAIT_MS
+    let lastText = ''
+    while (true) {
+      const remaining = deadline - Date.now()
+      try {
+        lastText = (await locator.textContent({ timeout: Math.max(remaining, 1) })) ?? ''
+        if (lastText.includes(expected)) return { ok: true }
+      } catch {
+        // Not attached yet, or this iteration's own timeout elapsed — keep
+        // polling until the outer deadline rather than failing on one miss.
+      }
+      if (Date.now() >= deadline) break
+      await page.waitForTimeout(150)
     }
+    // Same rule as `fill`: `fail()`'s message always references the
+    // original `action.expectedText` (the placeholder token, if that's
+    // what it was) — never the substituted one, or a real credential would
+    // leak into the failure detail, which flows into `history` (the next
+    // prompt) and the printed report.
+    return await fail(`expected text containing "${action.expectedText}", got "${lastText.trim()}"`)
   }
 
   // click / fill from here on — the only two action types eligible for

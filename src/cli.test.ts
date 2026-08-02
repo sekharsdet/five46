@@ -58,6 +58,12 @@ test('parseAgentArgs recognizes --record-video, leaving it undefined when not pa
   assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).recordVideo, undefined)
 })
 
+test('parseAgentArgs recognizes --structured-plan, leaving it undefined when not passed', () => {
+  const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--structured-plan'])
+  assert.equal(result.structuredPlan, true)
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).structuredPlan, undefined)
+})
+
 test('parseListArgs takes a positional dir and a --project filter, in either order', () => {
   assert.deepEqual(parseListArgs(['./tests', '--project', 'checkout']), { dir: './tests', project: 'checkout' })
   assert.deepEqual(parseListArgs(['--project', 'checkout', './tests']), { dir: './tests', project: 'checkout' })
@@ -115,6 +121,12 @@ test('parseApiArgs recognizes --repeat, leaving it undefined when not passed', (
   const result = parseApiArgs(['http://localhost:3000', '--goal', 'g', '--repeat', '3'])
   assert.equal(result.repeat, 3)
   assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).repeat, undefined)
+})
+
+test('parseApiArgs recognizes --structured-plan, leaving it undefined when not passed', () => {
+  const result = parseApiArgs(['http://localhost:3000', '--goal', 'g', '--structured-plan'])
+  assert.equal(result.structuredPlan, true)
+  assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).structuredPlan, undefined)
 })
 
 test('parseApiArgs sets allowWrites/allowDeletes independently', () => {
@@ -195,6 +207,18 @@ test('CLI "api" subcommand with --repeat still fails at the same missing-API-key
 
 test('CLI "test" subcommand with --record-video still fails at the same missing-API-key preflight check, without launching anything', () => {
   const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--record-video'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "test" subcommand with --structured-plan still fails at the same missing-API-key preflight check, without launching anything', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--structured-plan'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "api" subcommand with --structured-plan still fails at the same missing-API-key preflight check, without launching anything', () => {
+  const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g', '--structured-plan'])
   assert.notEqual(status, 0)
   assert.ok(stderr.includes('requires an LLM API key'))
 })

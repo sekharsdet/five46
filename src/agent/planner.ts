@@ -1,7 +1,23 @@
-import type { AgentAction, CredentialAvailability, HistoryEntry, PageOutline } from './types'
+import type { AgentAction, AgentPlan, CredentialAvailability, HistoryEntry, OutlineElement, PageOutline, PlannedStep, PlannedStepTarget } from './types'
 import { USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
 
 const MAX_HISTORY = 10
+
+/** Resolves a planned step's *prediction* against a fresh, real outline —
+ * exact role match plus a case-insensitive `name` substring match.
+ * Deliberately requires both, not name-only: a `target` was decided before
+ * the page it applies to had even loaded, so it's inherently less certain
+ * than self-healing's own re-match (which re-verifies something already
+ * observed) — `role` is a genuinely strong discriminator (see `browser.ts`'s
+ * `roleOf()`), and settling for less would make the fast path this exists
+ * to support too weak to trust. Returns every candidate rather than
+ * deciding anything itself — the caller (`runner.ts`) is responsible for
+ * "exactly one or refuse," matching self-healing's own "never guess on
+ * ambiguity" rule exactly. */
+export function resolvePlannedTarget(outline: PageOutline, target: PlannedStepTarget): OutlineElement[] {
+  const nameContainsLower = target.nameContains.toLowerCase()
+  return outline.elements.filter((el) => el.role === target.role && el.name.toLowerCase().includes(nameContainsLower))
+}
 
 /** One line per element: `[ref] role "name"`. Kept deliberately terse — this
  * text goes into every single prompt of the run, so its size directly
@@ -45,8 +61,12 @@ function describeAction(action: AgentAction): string {
       return `assert ${action.ref} is visible`
     case 'assert_text':
       return `assert ${action.ref} contains "${action.expectedText}"`
+    case 'assert_page_text':
+      return `assert the page contains "${action.expectedText}"`
     case 'scroll':
       return `scroll ${action.direction}`
+    case 'wait':
+      return `wait`
     case 'done':
       return `done (${action.outcome})`
   }
@@ -116,19 +136,57 @@ export function isDestructiveClickTarget(name: string): boolean {
  * picks a `ref` from *this turn's* outline, which the runner resolves back
  * to a real, already-computed Playwright selector — the model can't
  * fabricate a locator that was never actually on the page. */
+/** Describes one planned step in the same terse voice `describeAction`
+ * already uses for an executed one — reused both for the live-fallback
+ * prompt note below and for disclosure in the printed report. */
+export function describePlannedStep(step: PlannedStep): string {
+  switch (step.action) {
+    case 'click':
+      return `click a ${step.target.role} matching "${step.target.nameContains}"`
+    case 'fill':
+      return `fill a ${step.target.role} matching "${step.target.nameContains}" with "${step.value}"${step.submit ? ' then press Enter' : ''}`
+    case 'assert_visible':
+      return `assert a ${step.target.role} matching "${step.target.nameContains}" is visible`
+    case 'assert_text':
+      return `assert a ${step.target.role} matching "${step.target.nameContains}" contains "${step.expectedText}"`
+    case 'assert_page_text':
+      return `assert the page contains "${step.expectedText}"`
+    case 'scroll':
+      return `scroll ${step.direction}`
+    case 'wait':
+      return `wait`
+    case 'done':
+      return `done (${step.outcome})`
+  }
+}
+
 export function buildActionPrompt(
   goal: string,
   history: HistoryEntry[],
   outline: PageOutline,
   credentialsAvailable?: CredentialAvailability,
-  allowDeletes?: boolean
+  allowDeletes?: boolean,
+  /** Non-empty only when `runner.ts`'s structured-plan fast path fell back
+   * to a live decision for this step — describes where the plan expected
+   * to be, so the model has that context without being forced to follow
+   * it: the plan is a scaffold, not a rigid contract (see `runner.ts`'s
+   * "plan exhaustion degrades to the ordinary loop" reasoning). */
+  planStepNote?: { index: number; total: number; step: PlannedStep }
 ): string {
+  const planNote = planStepNote
+    ? [
+        ``,
+        `You are following an upfront plan (step ${planStepNote.index + 1} of ${planStepNote.total}): ${describePlannedStep(planStepNote.step)} — reason: ${planStepNote.step.reason}.`,
+        `The plan's prediction for this step didn't resolve cleanly against the real page, so decide the actual next action yourself from the real elements below — you are not required to follow the plan exactly.`,
+      ]
+    : []
   const confirmationNote = requiresConfirmation(goal)
     ? [
         ``,
         `This goal asks you to confirm/verify something — you must perform at least one`,
-        `successful assert_visible or assert_text action before you're allowed to declare`,
-        `"done" with outcome "goal-reached". Declaring done without one will be rejected.`,
+        `successful assert_visible, assert_text, or assert_page_text action before you're`,
+        `allowed to declare "done" with outcome "goal-reached". Declaring done without one`,
+        `will be rejected.`,
       ]
     : []
   // Disclosed up front, same reasoning as apiPlanner.ts's describeSafetyMode:
@@ -159,6 +217,7 @@ export function buildActionPrompt(
     ...confirmationNote,
     ...deleteNote,
     ...credentialNote,
+    ...planNote,
     ``,
     `Steps taken so far:`,
     serializeHistory(history),
@@ -169,10 +228,12 @@ export function buildActionPrompt(
     `Respond with exactly one JSON object describing the next single action to take, one of:`,
     `- {"action":"click","ref":"<ref>","reason":"<why>"}`,
     `- {"action":"fill","ref":"<ref>","value":"<text>","submit":<true|false>,"reason":"<why>"}`,
-    `- {"action":"assert_visible","ref":"<ref>","reason":"<why>"}`,
+    `- {"action":"assert_visible","ref":"<ref>","reason":"<why>"} (never assert visibility of the exact element you just clicked or filled — it was already visible in order to be interactable, so this proves nothing changed; assert something that actually reflects the outcome instead)`,
     `- {"action":"assert_text","ref":"<ref>","expectedText":"<text>","reason":"<why>"}`,
+    `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"} (checks the WHOLE page's visible text, not just one ref — use this when the text you need to confirm isn't in the elements list above at all, e.g. a plain heading or message with no interactive role; this is the only assertion that doesn't need a ref)`,
     `- {"action":"scroll","direction":"up"|"down","reason":"<why>"} (scrolls the whole page by one viewport height — use this if what you need isn't in the list above)`,
-    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely is not in the elements list above, scrolling will not reveal it, and no unopened menu/dropdown/tab/accordion visible on the page is likely to reveal it either — try clicking one such element first if one plausibly exists; never guess by acting on or asserting against the closest-looking element instead)`,
+    `- {"action":"wait","reason":"<why>"} (pauses briefly, then re-reads the page — use this if the page looks like it's still loading: a spinner, a skeleton, a "loading..." message, or right after an action that plausibly triggers something async. Do not use it more than twice in a row without trying something else in between; if the content still hasn't appeared after that, it's more likely genuinely not there)`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely is not in the elements list above, an assert_page_text check for it hasn't found it anywhere on the page either, scrolling will not reveal it, waiting for it to load hasn't revealed it either, and no unopened menu/dropdown/tab/accordion visible on the page is likely to reveal it either — try clicking one such element first if one plausibly exists; never guess by acting on or asserting against the closest-looking element instead)`,
     ``,
     `Example: ${ACTION_SCHEMA_EXAMPLE}`,
     ``,
@@ -182,6 +243,125 @@ export function buildActionPrompt(
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0
+}
+
+const PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"click","target":{"role":"link","nameContains":"Rooms"},"reason":"open the room listing"},{"action":"assert_visible","target":{"role":"status","nameContains":"price"},"reason":"confirm the price is shown"},{"action":"done","outcome":"goal-reached","reason":"price confirmed"}]}`
+
+/** Builds the upfront "plan the whole goal" prompt — a separate, one-time
+ * call before the main per-step loop, only made when `RunAgentOptions.
+ * useStructuredPlan` is set (see `runner.ts`). Unlike `buildActionPrompt`,
+ * this only ever sees the *first* page's outline — later steps will very
+ * likely land on pages that don't exist yet, so a step's `target` is
+ * explicitly framed as a prediction to verify at execution time, never a
+ * `ref` (which only exists within the single snapshot it came from — see
+ * `PageOutline`'s own doc comment). This is still just a second,
+ * independent `LlmProvider.complete()` call, the same pattern
+ * `rootCause.ts` already uses for a different reason — the interface
+ * itself doesn't need to grow for this. */
+export function buildPlanPrompt(goal: string, initialOutline: PageOutline): string {
+  return [
+    `You are a web testing agent. Before taking any actions, plan out the whole sequence of steps needed to accomplish this goal on a real browser.`,
+    ``,
+    `Goal: ${goal}`,
+    ``,
+    `Elements currently visible on the page (the very first page only — later steps will likely land on pages you cannot see yet, so predict each one's likely role/name rather than requiring it to be in this list):`,
+    serializeOutline(initialOutline),
+    ``,
+    `Respond with exactly one JSON object: {"steps": [...]}, where each step is one of:`,
+    `- {"action":"click","target":{"role":"<expected ARIA role, e.g. link/button/checkbox>","nameContains":"<expected substring of its accessible name>"},"reason":"<why>"}`,
+    `- {"action":"fill","target":{...},"value":"<text>","submit":<true|false>,"reason":"<why>"}`,
+    `- {"action":"assert_visible","target":{...},"reason":"<why>"}`,
+    `- {"action":"assert_text","target":{...},"expectedText":"<text>","reason":"<why>"}`,
+    `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"} (checks the whole page's visible text, no target needed — use for plain text/headings with no interactive role)`,
+    `- {"action":"scroll","direction":"up"|"down","reason":"<why>"}`,
+    `- {"action":"wait","reason":"<why>"} (pauses briefly for content that loads asynchronously — a spinner, a skeleton, a delayed page)`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"}`,
+    ``,
+    `"target" is your best prediction, not something you've already verified exists — a later step resolves it against the real page, or falls back and asks you again if nothing matches clearly. Keep the plan as short as the goal genuinely requires, and end it with a "done" step.`,
+    ``,
+    `Example: ${PLAN_SCHEMA_EXAMPLE}`,
+    ``,
+    `Respond with ONLY the JSON object — no markdown fence, no prose before or after it.`,
+  ].join('\n')
+}
+
+function isValidTarget(v: unknown): v is PlannedStepTarget {
+  return typeof v === 'object' && v !== null && isNonEmptyString((v as Record<string, unknown>).role) && isNonEmptyString((v as Record<string, unknown>).nameContains)
+}
+
+function parsePlannedStep(raw: unknown): PlannedStep | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const obj = raw as Record<string, unknown>
+  const reason = isNonEmptyString(obj.reason) ? obj.reason : '(no reason given)'
+
+  switch (obj.action) {
+    case 'click':
+      return isValidTarget(obj.target) ? { action: 'click', target: obj.target, reason } : undefined
+    case 'fill':
+      if (!isValidTarget(obj.target) || typeof obj.value !== 'string') return undefined
+      return { action: 'fill', target: obj.target, value: obj.value, submit: obj.submit === true, reason }
+    case 'assert_visible':
+      return isValidTarget(obj.target) ? { action: 'assert_visible', target: obj.target, reason } : undefined
+    case 'assert_text':
+      if (!isValidTarget(obj.target) || !isNonEmptyString(obj.expectedText)) return undefined
+      return { action: 'assert_text', target: obj.target, expectedText: obj.expectedText, reason }
+    case 'assert_page_text':
+      return isNonEmptyString(obj.expectedText) ? { action: 'assert_page_text', expectedText: obj.expectedText, reason } : undefined
+    case 'scroll': {
+      const direction = obj.direction === 'up' || obj.direction === 'down' ? obj.direction : undefined
+      return direction ? { action: 'scroll', direction, reason } : undefined
+    }
+    case 'wait':
+      return { action: 'wait', reason }
+    case 'done': {
+      const outcome = obj.outcome === 'goal-reached' || obj.outcome === 'goal-unreachable' ? obj.outcome : undefined
+      return outcome ? { action: 'done', outcome, reason } : undefined
+    }
+    default:
+      return undefined
+  }
+}
+
+export type ParsePlanResult = { ok: true; plan: AgentPlan } | { ok: false; error: string; raw: string }
+
+/** Strictly parses a plan response, or an honest failure — mirroring
+ * `parseAgentAction`'s "never guess a fallback" posture exactly. Unlike a
+ * malformed single-action response (a fatal, run-ending
+ * `unparseable-response`), a malformed *plan* response is deliberately
+ * **not** fatal: `runner.ts` treats it as "skip structured planning for
+ * this run" and falls through to the ordinary, fully-adaptive loop for the
+ * entire step budget — a caller who opted into `useStructuredPlan` for
+ * efficiency must never end up with a strictly worse worst case (a run
+ * that would have succeeded via the ordinary path failing outright) just
+ * because the one extra planning call happened to get truncated or
+ * malformed. A plan's expected response size scales with step count,
+ * unlike every other prompt in this codebase — the one place output-length
+ * truncation is a real, live concern. */
+export function parsePlan(raw: string): ParsePlanResult {
+  const stripped = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim()
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stripped)
+  } catch {
+    return { ok: false, error: 'plan response was not valid JSON', raw }
+  }
+  if (typeof parsed !== 'object' || parsed === null || !Array.isArray((parsed as Record<string, unknown>).steps)) {
+    return { ok: false, error: 'plan response was not a JSON object with a "steps" array', raw }
+  }
+
+  const steps: PlannedStep[] = []
+  for (const rawStep of (parsed as { steps: unknown[] }).steps) {
+    const step = parsePlannedStep(rawStep)
+    if (!step) return { ok: false, error: 'plan contained a malformed or unrecognized step', raw }
+    steps.push(step)
+  }
+  if (steps.length === 0) return { ok: false, error: 'plan contained no steps', raw }
+  return { ok: true, plan: { steps } }
 }
 
 /** The result of parsing one raw LLM response — mirrors
@@ -209,8 +389,29 @@ export type ParseAgentActionResult =
  * below — the browser engine's only analog to `apiPlanner.ts`'s
  * `isMethodAllowed` check, done at this same parse layer for the same
  * reason: a hallucinated/disallowed action is a parse-level concern, never
- * silently accepted or silently executed. */
-export function parseAgentAction(raw: string, outline: PageOutline, allowDeletes: boolean): ParseAgentActionResult {
+ * silently accepted or silently executed.
+ *
+ * `recentlyInteracted`, when given, is the (role, name) of whatever the
+ * *immediately preceding* successful `click`/`fill` targeted — used to
+ * block an `assert_visible` on that exact same element. Found via real
+ * live testing (demoblaze.com): asked to confirm a validation error was
+ * shown after an empty checkout submission, the model clicked "Purchase"
+ * twice, then "verified" its own claim by asserting the Purchase button
+ * itself was still visible — trivially true regardless of whether
+ * anything actually happened, since the button had to already be visible
+ * to have been clickable in the first place. The run reported
+ * `goal-reached` having proven nothing. Deliberately scoped to
+ * `assert_visible` only, never `assert_text` — re-asserting an element's
+ * *text* after interacting with it can be genuinely informative (a
+ * counter button whose own label changes), so only the visibility check,
+ * which can't distinguish "nothing happened" from "the goal was actually
+ * verified," is blocked. */
+export function parseAgentAction(
+  raw: string,
+  outline: PageOutline,
+  allowDeletes: boolean,
+  recentlyInteracted?: { role: string; name: string }
+): ParseAgentActionResult {
   const stripped = raw
     .trim()
     .replace(/^```(?:json)?\s*/i, '')
@@ -268,6 +469,17 @@ export function parseAgentAction(raw: string, outline: PageOutline, allowDeletes
     case 'assert_visible': {
       const ref = checkRef()
       if (!ref) return { ok: false, error: `"ref" is missing or not one of this turn's valid refs`, raw }
+      const target = outline.elements.find((el) => el.ref === ref)
+      if (recentlyInteracted && target && target.role === recentlyInteracted.role && target.name === recentlyInteracted.name) {
+        const attempted: AgentAction = { action: 'assert_visible', ref, reason }
+        return {
+          ok: false,
+          error: `asserting "${target.name}" is visible right after clicking/filling it proves nothing changed — it was already known to be there to be interactable. Assert something that actually reflects the outcome instead (a message, a new/removed element, changed text).`,
+          raw,
+          recoverable: true,
+          attemptedAction: attempted,
+        }
+      }
       return { ok: true, action: { action: 'assert_visible', ref, reason } }
     }
     case 'assert_text': {
@@ -278,11 +490,19 @@ export function parseAgentAction(raw: string, outline: PageOutline, allowDeletes
       }
       return { ok: true, action: { action: 'assert_text', ref, expectedText: obj.expectedText, reason } }
     }
+    case 'assert_page_text': {
+      if (!isNonEmptyString(obj.expectedText)) {
+        return { ok: false, error: '"expectedText" is missing for an assert_page_text action', raw }
+      }
+      return { ok: true, action: { action: 'assert_page_text', expectedText: obj.expectedText, reason } }
+    }
     case 'scroll': {
       const direction = obj.direction === 'up' || obj.direction === 'down' ? obj.direction : undefined
       if (!direction) return { ok: false, error: '"direction" must be "up" or "down"', raw }
       return { ok: true, action: { action: 'scroll', direction, reason } }
     }
+    case 'wait':
+      return { ok: true, action: { action: 'wait', reason } }
     case 'done': {
       const outcome = obj.outcome === 'goal-reached' || obj.outcome === 'goal-unreachable' ? obj.outcome : undefined
       if (!outcome) return { ok: false, error: '"outcome" must be "goal-reached" or "goal-unreachable"', raw }

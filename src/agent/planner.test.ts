@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { serializeOutline, buildActionPrompt, parseAgentAction, requiresConfirmation, isDestructiveClickTarget } from './planner'
+import { serializeOutline, buildActionPrompt, parseAgentAction, requiresConfirmation, isDestructiveClickTarget, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
 import { USERNAME_PLACEHOLDER } from './browser'
 import type { PageOutline } from './types'
 
@@ -120,6 +120,27 @@ test('parseAgentAction rejects a scroll direction that is not "up" or "down"', (
   if (!result.ok) assert.match(result.error, /"up" or "down"/)
 })
 
+test('parseAgentAction accepts a valid wait action, needing no ref', () => {
+  const raw = JSON.stringify({ action: 'wait', reason: 'the page looks like it is still loading' })
+  const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'wait', reason: 'the page looks like it is still loading' })
+})
+
+test('parseAgentAction accepts a valid assert_page_text action, needing no ref', () => {
+  const raw = JSON.stringify({ action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm it appeared' })
+  const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm it appeared' })
+})
+
+test('parseAgentAction fails honestly when assert_page_text is missing expectedText', () => {
+  const raw = JSON.stringify({ action: 'assert_page_text', reason: 'r' })
+  const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /expectedText/)
+})
+
 test('isDestructiveClickTarget matches account/data-destruction phrases, not generic delete/remove verbs', () => {
   assert.equal(isDestructiveClickTarget('Delete Account'), true)
   assert.equal(isDestructiveClickTarget('Deactivate my account'), true)
@@ -149,6 +170,51 @@ test('parseAgentAction never blocks a click on a non-destructive-looking target,
   const raw = JSON.stringify({ action: 'click', ref: 'e2', reason: 'remove the item' })
   const result = parseAgentAction(raw, DELETE_OUTLINE, false)
   assert.ok(result.ok)
+})
+
+test('parseAgentAction blocks asserting visibility of the exact element just clicked/filled — it proves nothing changed', () => {
+  // Regression test: found via real live testing (demoblaze.com) — asked
+  // to confirm a validation error was shown, the model clicked "Purchase"
+  // twice then "verified" its own claim by asserting the Purchase button
+  // itself was still visible, trivially true regardless of outcome.
+  const raw = JSON.stringify({ action: 'assert_visible', ref: 'e1', reason: 'confirm it worked' })
+  const recentlyInteracted = { role: 'button', name: 'Show secret message' }
+
+  const blocked = parseAgentAction(raw, OUTLINE, false, recentlyInteracted)
+  assert.equal(blocked.ok, false)
+  if (!blocked.ok) {
+    assert.equal(blocked.recoverable, true)
+    if (blocked.recoverable) assert.deepEqual(blocked.attemptedAction, { action: 'assert_visible', ref: 'e1', reason: 'confirm it worked' })
+    assert.match(blocked.error, /proves nothing changed/)
+  }
+})
+
+test('parseAgentAction allows asserting visibility of a DIFFERENT element than the one just clicked/filled', () => {
+  const raw = JSON.stringify({ action: 'assert_visible', ref: 'e2', reason: 'confirm the name field appeared' })
+  const recentlyInteracted = { role: 'button', name: 'Show secret message' }
+  const result = parseAgentAction(raw, OUTLINE, false, recentlyInteracted)
+  assert.ok(result.ok)
+})
+
+test('parseAgentAction allows asserting visibility of the same-ref element when nothing was recently interacted with', () => {
+  const raw = JSON.stringify({ action: 'assert_visible', ref: 'e1', reason: 'first check of the run' })
+  const result = parseAgentAction(raw, OUTLINE, false, undefined)
+  assert.ok(result.ok)
+})
+
+test('parseAgentAction never blocks assert_text on the exact element just clicked/filled — re-checking its own text can be genuinely informative', () => {
+  // Deliberately narrower than assert_visible: a counter button whose own
+  // label changes ("Count: 0" -> "Count: 1") is a real, legitimate reason
+  // to assert_text the same element right after clicking it.
+  const raw = JSON.stringify({ action: 'assert_text', ref: 'e1', expectedText: 'Count: 1', reason: 'confirm the counter incremented' })
+  const recentlyInteracted = { role: 'button', name: 'Show secret message' }
+  const result = parseAgentAction(raw, OUTLINE, false, recentlyInteracted)
+  assert.ok(result.ok)
+})
+
+test('buildActionPrompt discloses the tautological-assertion rule unconditionally in the assert_visible schema line', () => {
+  const prompt = buildActionPrompt('goal', [], OUTLINE)
+  assert.ok(prompt.includes('never assert visibility of the exact element you just clicked or filled'))
 })
 
 test('buildActionPrompt discloses the delete-gating up front when allowDeletes is falsy, and omits it when true', () => {
@@ -181,7 +247,7 @@ test('requiresConfirmation does not flag a goal with no verification language', 
 test('buildActionPrompt tells the model upfront when a goal requires verification, not just after rejecting it', () => {
   const prompt = buildActionPrompt('reveal the secret and confirm it is visible', [], OUTLINE)
   assert.ok(prompt.includes('must perform at least one'))
-  assert.ok(prompt.includes('assert_visible or assert_text'))
+  assert.ok(prompt.includes('assert_visible, assert_text, or assert_page_text'))
 
   const plainPrompt = buildActionPrompt('reveal the secret', [], OUTLINE)
   assert.ok(!plainPrompt.includes('must perform at least one'))
@@ -209,4 +275,114 @@ test('buildActionPrompt structurally cannot leak an actual credential, since its
   // guarantee here is enforced by the TypeScript signature itself.
   const prompt = buildActionPrompt('log in', [], OUTLINE, { username: true, password: true })
   assert.ok(prompt.includes(USERNAME_PLACEHOLDER))
+})
+
+test('buildPlanPrompt includes the goal, the initial outline, and the plan JSON schema', () => {
+  const prompt = buildPlanPrompt('reveal the secret message', OUTLINE)
+  assert.ok(prompt.includes('reveal the secret message'))
+  assert.ok(prompt.includes('[e1] button "Show secret message"'))
+  assert.ok(prompt.includes('"steps"'))
+  assert.ok(prompt.includes('"nameContains"'))
+  assert.ok(prompt.includes('prediction'))
+})
+
+test('parsePlan strictly parses a real, well-formed plan response', () => {
+  const raw = JSON.stringify({
+    steps: [
+      { action: 'click', target: { role: 'link', nameContains: 'Rooms' }, reason: 'open the listing' },
+      { action: 'fill', target: { role: 'textbox', nameContains: 'name' }, value: 'Ada', submit: true, reason: 'fill the name' },
+      { action: 'assert_visible', target: { role: 'status', nameContains: 'price' }, reason: 'confirm price shown' },
+      { action: 'assert_text', target: { role: 'status', nameContains: 'price' }, expectedText: '$100', reason: 'confirm exact price' },
+      { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm text appears anywhere on the page' },
+      { action: 'scroll', direction: 'down', reason: 'reveal more content' },
+      { action: 'wait', reason: 'content may still be loading' },
+      { action: 'done', outcome: 'goal-reached', reason: 'all confirmed' },
+    ],
+  })
+  const result = parsePlan(raw)
+  assert.equal(result.ok, true)
+  if (!result.ok) throw new Error('unreachable')
+  assert.equal(result.plan.steps.length, 8)
+  assert.deepEqual(result.plan.steps[0], { action: 'click', target: { role: 'link', nameContains: 'Rooms' }, reason: 'open the listing' })
+  assert.deepEqual(result.plan.steps[4], { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm text appears anywhere on the page' })
+  assert.deepEqual(result.plan.steps[6], { action: 'wait', reason: 'content may still be loading' })
+  assert.equal(result.plan.steps[7].action, 'done')
+})
+
+test('parsePlan strips a markdown json fence, the same accommodation parseAgentAction already makes', () => {
+  const raw = '```json\n' + JSON.stringify({ steps: [{ action: 'scroll', direction: 'down', reason: 'r' }] }) + '\n```'
+  const result = parsePlan(raw)
+  assert.equal(result.ok, true)
+})
+
+test('parsePlan fails honestly, never guessing, on invalid JSON', () => {
+  const result = parsePlan('not json at all')
+  assert.equal(result.ok, false)
+})
+
+test('parsePlan fails honestly when the response is not a {"steps": [...]} object', () => {
+  assert.equal(parsePlan(JSON.stringify({ notSteps: [] })).ok, false)
+  assert.equal(parsePlan(JSON.stringify([])).ok, false)
+})
+
+test('parsePlan fails honestly on an empty steps array — a plan must actually plan something', () => {
+  assert.equal(parsePlan(JSON.stringify({ steps: [] })).ok, false)
+})
+
+test('parsePlan fails honestly when any single step is malformed, rather than silently dropping it', () => {
+  const raw = JSON.stringify({
+    steps: [
+      { action: 'scroll', direction: 'down', reason: 'ok' },
+      { action: 'click', reason: 'missing target entirely' },
+    ],
+  })
+  assert.equal(parsePlan(raw).ok, false)
+})
+
+test('parsePlan rejects a click/fill/assert step whose target is missing role or nameContains', () => {
+  assert.equal(parsePlan(JSON.stringify({ steps: [{ action: 'click', target: { nameContains: 'Rooms' }, reason: 'r' }] })).ok, false)
+  assert.equal(parsePlan(JSON.stringify({ steps: [{ action: 'click', target: { role: 'link' }, reason: 'r' }] })).ok, false)
+})
+
+test('resolvePlannedTarget matches by exact role and case-insensitive name substring, requiring both', () => {
+  const matches = resolvePlannedTarget(OUTLINE, { role: 'button', nameContains: 'secret' })
+  assert.equal(matches.length, 1)
+  assert.equal(matches[0].ref, 'e1')
+
+  // Wrong role, name would otherwise match — must not match.
+  assert.equal(resolvePlannedTarget(OUTLINE, { role: 'link', nameContains: 'secret' }).length, 0)
+})
+
+test('resolvePlannedTarget returns every candidate on ambiguity — never picks one, leaves refusal to the caller', () => {
+  const ambiguous: PageOutline = {
+    elements: [
+      { ref: 'e1', tag: 'button', role: 'button', name: 'Delete', selector: '#a' },
+      { ref: 'e2', tag: 'button', role: 'button', name: 'Delete', selector: '#b' },
+    ],
+    truncated: false,
+    totalFound: 2,
+  }
+  assert.equal(resolvePlannedTarget(ambiguous, { role: 'button', nameContains: 'Delete' }).length, 2)
+})
+
+test('resolvePlannedTarget returns no candidates when nothing matches, rather than guessing the closest one', () => {
+  assert.equal(resolvePlannedTarget(OUTLINE, { role: 'button', nameContains: 'Nonexistent Target' }).length, 0)
+})
+
+test('buildActionPrompt injects plan context only when a live fallback actually happens, telling the model it is not required to follow the plan', () => {
+  const plannedStep = { action: 'click' as const, target: { role: 'link', nameContains: 'Rooms' }, reason: 'open the listing' }
+  const withPlan = buildActionPrompt('goal', [], OUTLINE, undefined, undefined, { index: 1, total: 3, step: plannedStep })
+  assert.ok(withPlan.includes('step 2 of 3'))
+  assert.ok(withPlan.includes('not required to follow the plan exactly'))
+
+  const withoutPlan = buildActionPrompt('goal', [], OUTLINE)
+  assert.ok(!withoutPlan.includes('upfront plan'))
+})
+
+test('describePlannedStep renders each planned action type in a short, human-readable phrase', () => {
+  assert.equal(describePlannedStep({ action: 'click', target: { role: 'link', nameContains: 'Rooms' }, reason: 'r' }), 'click a link matching "Rooms"')
+  assert.equal(describePlannedStep({ action: 'scroll', direction: 'down', reason: 'r' }), 'scroll down')
+  assert.equal(describePlannedStep({ action: 'wait', reason: 'r' }), 'wait')
+  assert.equal(describePlannedStep({ action: 'assert_page_text', expectedText: 'Hello World!', reason: 'r' }), 'assert the page contains "Hello World!"')
+  assert.equal(describePlannedStep({ action: 'done', outcome: 'goal-reached', reason: 'r' }), 'done (goal-reached)')
 })

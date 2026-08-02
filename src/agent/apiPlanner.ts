@@ -1,4 +1,4 @@
-import type { ApiAction, ApiHistoryEntry, HttpMethod, SafetyMode } from './apiTypes'
+import type { ApiAction, ApiHistoryEntry, ApiPlan, HttpMethod, SafetyMode } from './apiTypes'
 import { isMethodAllowed, isHostAllowed } from './apiTypes'
 import { extractPlaceholderNames } from './apiExecutor'
 
@@ -93,7 +93,120 @@ function isNonEmptyString(v: unknown): v is string {
 
 const VALID_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'])
 
-function checkVarReferences(fields: (string | undefined)[], validVarNames: ReadonlySet<string>): string | undefined {
+const API_PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"request","method":"POST","url":"/users","body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user"},{"action":"request","method":"GET","url":"/users/{{userId}}","reason":"fetch it back"},{"action":"assert_json_path_equals","path":"name","expected":"Ada","reason":"confirm the name matches"},{"action":"done","outcome":"goal-reached","reason":"confirmed"}]}`
+
+/** Builds the upfront "plan the whole goal" prompt for the API engine —
+ * the same second-`complete()`-call pattern `planner.ts`'s `buildPlanPrompt`
+ * uses for the browser engine, made once before the main loop, only when
+ * `RunApiTestOptions.useStructuredPlan` is set (see `apiRunner.ts`). No
+ * `PageOutline`-equivalent input is needed: unlike a DOM element, a planned
+ * request's `url`/`method` has no structural ambiguity to predict around. */
+export function buildApiPlanPrompt(goal: string, safety: SafetyMode): string {
+  return [
+    `You are an API testing agent. Before making any requests, plan out the whole sequence of steps needed to accomplish this goal.`,
+    ``,
+    `Goal: ${goal}`,
+    ``,
+    describeSafetyMode(safety),
+    ``,
+    `Respond with exactly one JSON object: {"steps": [...]}, where each step is one of:`,
+    `- {"action":"request","method":"<GET|HEAD|OPTIONS|POST|PUT|PATCH|DELETE>","url":"<url>","headers":{...},"body":"<text>","saveAs":{"name":"<var>","path":"<json.path>"},"reason":"<why>"}`,
+    `- {"action":"assert_status","expected":<number>,"reason":"<why>"}`,
+    `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"}`,
+    `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"}`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"}`,
+    ``,
+    `A later step can reference a value an earlier step saved via "saveAs" as {{name}} in its own url/headers/body — plan the chain in order. Keep the plan as short as the goal genuinely requires, and end it with a "done" step.`,
+    ``,
+    `Example: ${API_PLAN_SCHEMA_EXAMPLE}`,
+    ``,
+    `Respond with ONLY the JSON object — no markdown fence, no prose before or after it.`,
+  ].join('\n')
+}
+
+/** Structural-only parsing for one planned step — deliberately narrower
+ * than `parseApiAction`'s `case 'request'` branch: no `isMethodAllowed`/
+ * `isHostAllowed`/`checkVarReferences` check here. Those are execution-time
+ * concerns (see `apiRunner.ts`'s fast path, which re-runs them explicitly
+ * right before a fast-pathed request executes — the fix for this whole
+ * feature's top risk, same as the browser engine's destructive-click gate).
+ * Validating them at *plan*-parse time would also be actively wrong: a
+ * step may legitimately reference a `{{var}}` a *later* step in the same
+ * plan hasn't saved yet, which is only unresolved at parse time, not at
+ * the time this step will actually execute. */
+function parsePlannedApiStep(raw: unknown): ApiAction | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const obj = raw as Record<string, unknown>
+  const reason = isNonEmptyString(obj.reason) ? obj.reason : '(no reason given)'
+
+  switch (obj.action) {
+    case 'request': {
+      const method = typeof obj.method === 'string' ? (obj.method.toUpperCase() as HttpMethod) : undefined
+      if (!method || !VALID_METHODS.has(method) || !isNonEmptyString(obj.url)) return undefined
+      const headers = obj.headers && typeof obj.headers === 'object' ? (obj.headers as Record<string, string>) : undefined
+      const body = typeof obj.body === 'string' ? obj.body : undefined
+      let saveAs: { name: string; path: string } | undefined
+      if (obj.saveAs && typeof obj.saveAs === 'object') {
+        const s = obj.saveAs as Record<string, unknown>
+        if (!isNonEmptyString(s.name) || !isNonEmptyString(s.path)) return undefined
+        saveAs = { name: s.name, path: s.path }
+      }
+      return { action: 'request', method, url: obj.url, headers, body, saveAs, reason }
+    }
+    case 'assert_status':
+      return typeof obj.expected === 'number' ? { action: 'assert_status', expected: obj.expected, reason } : undefined
+    case 'assert_json_path_exists':
+      return isNonEmptyString(obj.path) ? { action: 'assert_json_path_exists', path: obj.path, reason } : undefined
+    case 'assert_json_path_equals':
+      return isNonEmptyString(obj.path) && isNonEmptyString(obj.expected) ? { action: 'assert_json_path_equals', path: obj.path, expected: obj.expected, reason } : undefined
+    case 'done': {
+      const outcome = obj.outcome === 'goal-reached' || obj.outcome === 'goal-unreachable' ? obj.outcome : undefined
+      return outcome ? { action: 'done', outcome, reason } : undefined
+    }
+    default:
+      return undefined
+  }
+}
+
+export type ParseApiPlanResult = { ok: true; plan: ApiPlan } | { ok: false; error: string; raw: string }
+
+/** Strictly parses a plan response, or an honest failure — mirroring
+ * `planner.ts`'s `parsePlan` exactly, including its "never fatal" posture:
+ * `apiRunner.ts` treats a malformed plan response as "skip structured
+ * planning for this run," not as a run-ending `unparseable-response`. See
+ * `parsePlan`'s own doc comment for the full reasoning. */
+export function parseApiPlan(raw: string): ParseApiPlanResult {
+  const stripped = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim()
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stripped)
+  } catch {
+    return { ok: false, error: 'plan response was not valid JSON', raw }
+  }
+  if (typeof parsed !== 'object' || parsed === null || !Array.isArray((parsed as Record<string, unknown>).steps)) {
+    return { ok: false, error: 'plan response was not a JSON object with a "steps" array', raw }
+  }
+
+  const steps: ApiAction[] = []
+  for (const rawStep of (parsed as { steps: unknown[] }).steps) {
+    const step = parsePlannedApiStep(rawStep)
+    if (!step) return { ok: false, error: 'plan contained a malformed or unrecognized step', raw }
+    steps.push(step)
+  }
+  if (steps.length === 0) return { ok: false, error: 'plan contained no steps', raw }
+  return { ok: true, plan: { steps } }
+}
+
+/** Exported so `apiRunner.ts`'s fast path can run the identical check right
+ * before executing a fast-pathed `request` step — the same "one source of
+ * truth, called from both the parser and the fast path" pattern already
+ * used for `isMethodAllowed`/`isHostAllowed`. */
+export function checkVarReferences(fields: (string | undefined)[], validVarNames: ReadonlySet<string>): string | undefined {
   for (const field of fields) {
     if (!field) continue
     for (const name of extractPlaceholderNames(field)) {

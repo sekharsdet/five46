@@ -39,6 +39,9 @@ standalone, re-runnable test spec on success.
   reusable, named target defaults (url, session, safety flags).
 - **Video replay** — `--record-video` records the whole session as a
   `.webm`.
+- **Structured planning** — `--structured-plan` plans the whole goal
+  upfront with one extra LLM call, then executes most steps directly
+  against the real page/response with no further live decision needed.
 
 ## Installation
 
@@ -83,7 +86,9 @@ elements, e.g. "Delete Account"), `--no-root-cause` (skip the extra LLM
 call that analyzes a failed assertion), `--repeat N` (run the goal N times
 and report whether it's flaky — see below), `--record-video` (save a
 `.webm` of the whole session), `--project name` (pull defaults from
-`five46.config.json` — see below).
+`five46.config.json` — see below), `--structured-plan` (plan the whole
+goal upfront, executing most steps with no further live LLM decision —
+see below).
 
 A successful run writes a real, human-readable Playwright `.spec.ts` file
 containing every confirmed-working step — re-runnable any time via
@@ -199,6 +204,20 @@ node dist/cli.js test http://localhost:3000 --goal "..." --record-video
 Records the whole session as a real `.webm` (also available on
 `five46 login`). No special "replay" command — open the file in any video
 player.
+
+## Structured planning
+
+```bash
+node dist/cli.js test http://localhost:3000 --goal "..." --structured-plan
+```
+
+One extra LLM call plans the whole goal upfront; most steps then execute
+directly against the real page/response with no further live decision —
+falling back to a normal live decision only when a step's prediction
+doesn't resolve cleanly. Same safety guarantees as an ordinary run
+(destructive-click gating, method/host allowlisting) are enforced
+independently at the fast path too, not skipped. Off by default; works on
+`five46 api` too.
 
 ## MCP server (IDE-embedded use)
 

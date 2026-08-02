@@ -9,6 +9,15 @@ export function findFailedApiStep(run: ApiTestRun): ApiTestRun['steps'][number] 
   return [...run.steps].reverse().find((s) => !s.ok)
 }
 
+/** Mirrors `failureReport.ts`'s `planNote` exactly — see its own doc
+ * comment. Printed on every run when `--structured-plan` was used and a
+ * plan was actually adopted. */
+function planNote(run: ApiTestRun): string[] {
+  if (!run.planStats) return []
+  const { plannedSteps, fastPathedSteps } = run.planStats
+  return [`Structured plan: ${plannedSteps} step(s) planned upfront, ${fastPathedSteps} executed without a live LLM decision.`]
+}
+
 /** Formats an `ApiTestRun`'s outcome for the console — the API-testing
  * counterpart to `failureReport.ts`'s `formatFailureReport`, same posture:
  * an `'assertion-failed'` outcome is a real finding about the API under
@@ -24,7 +33,7 @@ export function formatApiFailureReport(run: ApiTestRun, rootCauseHypothesis?: st
   const successCount = run.steps.filter((s) => s.ok).length
 
   if (run.outcome === 'goal-reached') {
-    lines.push(`--- Run ${run.runId} succeeded: goal reached in ${successCount} step(s) ---`)
+    lines.push(`--- Run ${run.runId} succeeded: goal reached in ${successCount} step(s) ---`, ...planNote(run))
     return lines.join('\n')
   }
 
@@ -32,7 +41,7 @@ export function formatApiFailureReport(run: ApiTestRun, rootCauseHypothesis?: st
     lines.push(`--- Run ${run.runId}: the agent concluded the goal isn't reachable against this API ---`)
     const last = run.steps[run.steps.length - 1]
     if (last) lines.push(`Last completed step: ${describeApiAction(last.action)} (${last.ok ? 'ok' : 'failed'})`)
-    lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`)
+    lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`, ...planNote(run))
     return lines.join('\n')
   }
 
@@ -48,7 +57,8 @@ export function formatApiFailureReport(run: ApiTestRun, rootCauseHypothesis?: st
       rootCauseHypothesis
         ? `Possible root cause — an LLM-generated hypothesis, not a confirmed diagnosis:\n${rootCauseHypothesis}`
         : `No root-cause hypothesis or suggested fix in this version — that's a real,\ndeferred capability, not silently omitted.`,
-      `${successCount} step(s) before this succeeded and were written as real, runnable code.`
+      `${successCount} step(s) before this succeeded and were written as real, runnable code.`,
+      ...planNote(run)
     )
     return lines.join('\n')
   }
@@ -62,6 +72,6 @@ export function formatApiFailureReport(run: ApiTestRun, rootCauseHypothesis?: st
   } else if (run.outcome === 'stopped-by-cap') {
     lines.push(`--- Run ${run.runId} stopped: reached the step limit before finishing (tooling issue, not a finding about the API) ---`)
   }
-  lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`)
+  lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`, ...planNote(run))
   return lines.join('\n')
 }

@@ -11,8 +11,12 @@ export function describeAction(step: TestRun['steps'][number]): string {
       return `assert visible`
     case 'assert_text':
       return `assert text contains ${JSON.stringify(a.expectedText)}`
+    case 'assert_page_text':
+      return `assert page contains ${JSON.stringify(a.expectedText)}`
     case 'scroll':
       return `scroll ${a.direction}`
+    case 'wait':
+      return `wait`
     case 'done':
       return `done`
   }
@@ -65,12 +69,25 @@ function videoNote(run: TestRun): string[] {
   return run.videoPath ? [`Video: ${run.videoPath}`] : []
 }
 
+/** Printed on every run when `--structured-plan` was used and a plan was
+ * actually generated — the efficiency this feature buys (fewer live LLM
+ * decisions) is otherwise invisible in the report, since a fast-pathed
+ * step produces the exact same `ExecutedStep` shape as a live-decided one.
+ * Absent entirely if the planning call itself failed to parse (silently
+ * degrades to the ordinary adaptive loop — see `runner.ts`), same
+ * always-on-disclosure mechanism as `healedStepsNote`/`videoNote`. */
+function planNote(run: TestRun): string[] {
+  if (!run.planStats) return []
+  const { plannedSteps, fastPathedSteps } = run.planStats
+  return [`Structured plan: ${plannedSteps} step(s) planned upfront, ${fastPathedSteps} executed without a live LLM decision.`]
+}
+
 export function formatFailureReport(run: TestRun, rootCauseHypothesis?: string): string {
   const lines: string[] = []
   const successCount = run.steps.filter((s) => s.ok).length
 
   if (run.outcome === 'goal-reached') {
-    lines.push(`--- Run ${run.runId} succeeded: goal reached in ${successCount} step(s) ---`, ...healedStepsNote(run), ...videoNote(run))
+    lines.push(`--- Run ${run.runId} succeeded: goal reached in ${successCount} step(s) ---`, ...healedStepsNote(run), ...videoNote(run), ...planNote(run))
     return lines.join('\n')
   }
 
@@ -78,7 +95,7 @@ export function formatFailureReport(run: TestRun, rootCauseHypothesis?: string):
     lines.push(`--- Run ${run.runId}: the agent concluded the goal isn't reachable on this page ---`)
     const last = run.steps[run.steps.length - 1]
     if (last) lines.push(`Last completed step: ${describeAction(last)} (${last.ok ? 'ok' : 'failed'})`)
-    lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`, ...healedStepsNote(run), ...videoNote(run))
+    lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`, ...healedStepsNote(run), ...videoNote(run), ...planNote(run))
     return lines.join('\n')
   }
 
@@ -98,7 +115,7 @@ export function formatFailureReport(run: TestRun, rootCauseHypothesis?: string):
         : `No root-cause hypothesis or suggested fix in this version — that's a real,\ndeferred capability, not silently omitted.`,
       `${successCount} step(s) before this succeeded and were written as real, runnable code.`,
       ...healedStepsNote(run),
-      ...videoNote(run)
+      ...videoNote(run), ...planNote(run)
     )
     return lines.join('\n')
   }
@@ -112,6 +129,6 @@ export function formatFailureReport(run: TestRun, rootCauseHypothesis?: string):
   } else if (run.outcome === 'stopped-by-cap') {
     lines.push(`--- Run ${run.runId} stopped: reached the step limit before finishing (tooling issue, not a finding about the app) ---`)
   }
-  lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`, ...healedStepsNote(run), ...videoNote(run))
+  lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`, ...healedStepsNote(run), ...videoNote(run), ...planNote(run))
   return lines.join('\n')
 }

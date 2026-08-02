@@ -184,6 +184,136 @@ test('executeAction clicking a real ref actually clicks the real element in the 
   }
 })
 
+test('executeAction wait pauses for a real, bounded duration and reports ok', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    const before = Date.now()
+    const result = await executeAction(browser.page, { action: 'wait', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+    const elapsed = Date.now() - before
+    assert.equal(result.ok, true)
+    // Bounded both ways — a real pause happened (not a no-op), and it's not
+    // unboundedly long (WAIT_ACTION_MS, not something open-ended).
+    assert.ok(elapsed >= 2500 && elapsed <= 6000, `expected ~3000ms, got ${elapsed}ms`)
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+test('executeAction assert_visible succeeds against content that only appears after a real async delay, instead of failing instantly', async (t) => {
+  // The real, live-found bug this fixes: a page whose target content
+  // appears only after an async delay (a client-side setTimeout, not a
+  // network request) used to fail an assert_visible on the very first
+  // instantaneous check. This proves the new poll-based check actually
+  // waits it out, matching what `expect(locator).toBeVisible()` would do
+  // in the generated spec for the identical assertion.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    const revealRef = outline.elements.find((el) => el.name === 'Load content')!.ref
+    const clickResult = await executeAction(browser.page, { action: 'click', ref: revealRef, reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+    assert.equal(clickResult.ok, true)
+
+    // The secret paragraph isn't a real snapshot-eligible interactive
+    // element, so a hand-built single-element outline stands in for what a
+    // real snapshot would report if it were — same pattern the failing-
+    // assertion test below uses.
+    const secretRef = 'e1'
+    const delayedOutline = { elements: [{ ref: secretRef, tag: 'p', role: 'text', name: 'delayed-secret', selector: '#delayed-secret' }], truncated: false, totalFound: 1 }
+    // Immediately after the click — the fixture's 800ms delay hasn't
+    // elapsed yet, so this genuinely races the async reveal.
+    const result = await executeAction(browser.page, { action: 'assert_visible', ref: secretRef, reason: 'test' }, delayedOutline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 2)
+    assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+test('executeAction assert_text succeeds against text that only appears after a real async delay, instead of failing instantly', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    const revealRef = outline.elements.find((el) => el.name === 'Load content')!.ref
+    await executeAction(browser.page, { action: 'click', ref: revealRef, reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+
+    const secretRef = 'e1'
+    const delayedOutline = { elements: [{ ref: secretRef, tag: 'p', role: 'text', name: 'delayed-secret', selector: '#delayed-secret' }], truncated: false, totalFound: 1 }
+    const result = await executeAction(
+      browser.page,
+      { action: 'assert_text', ref: secretRef, expectedText: 'Delayed content loaded', reason: 'test' },
+      delayedOutline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      2
+    )
+    assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+test('executeAction assert_page_text finds real page text that was never in the interactive-elements outline at all', async (t) => {
+  // The real, deeper gap this fixes: snapshot()'s SELECTOR
+  // ('button, a, input, select, textarea, [role]') never includes a plain
+  // heading with no ARIA role — confirmed live against
+  // the-internet.herokuapp.com's own `<h4>Hello World!</h4>`, no `role`
+  // attribute at all. No amount of waiting makes such text assertable via
+  // assert_visible/assert_text, since there's never a `ref` for it. This
+  // fixture's own `<h1>Simple Reveal</h1>` is the same shape (no `role`).
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    assert.ok(!outline.elements.some((el) => el.name.includes('Simple Reveal')), 'test setup: the heading must NOT be in the outline for this to prove anything')
+
+    const result = await executeAction(browser.page, { action: 'assert_page_text', expectedText: 'Simple Reveal', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+    assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+test('executeAction assert_page_text succeeds against text with no ARIA role that only appears after a real async delay', async (t) => {
+  // Combines both real, live-found gaps in one scenario: an element with no
+  // role (so assert_visible/assert_text could never target it even
+  // instantly) whose content also only appears after an async delay (so
+  // even a whole-page instant text check would have missed it without the
+  // poll-based retry in assert_page_text's own implementation).
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    const btnRef = outline.elements.find((el) => el.name === 'Load heading')!.ref
+    const clickResult = await executeAction(browser.page, { action: 'click', ref: btnRef, reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+    assert.equal(clickResult.ok, true)
+
+    // Immediately after the click — the fixture's 800ms delay hasn't
+    // elapsed yet, so this genuinely races the async reveal, same as the
+    // assert_visible/assert_text poll tests above.
+    const result = await executeAction(browser.page, { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 2)
+    assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
 test('executeAction on a failing assertion captures a real screenshot and DOM snapshot as evidence', async (t) => {
   const browser = await withRealBrowser(t)
   if (!browser) return
@@ -460,13 +590,11 @@ test('executeAction never heals an assert_visible/assert_text, even when an unam
   // The action-type boundary is the feature's single most important
   // safety property: assertions are the run's actual verdict, and healing
   // them would risk converting a genuine app regression into a false pass.
-  // The assert_text half of this test genuinely takes ~30s: `executeAction`
-  // never set an explicit timeout on `.textContent()` (real, pre-existing
-  // behavior this feature deliberately leaves untouched — assertions are
-  // out of scope for healing entirely, see DEVELOPMENT.md), so a stale
-  // locator waits out Playwright's full default timeout. Left as real,
-  // accurate behavior rather than sped up in a way that would stop testing
-  // what production code actually does.
+  // Both halves of this test now take ~ASSERT_WAIT_MS (5s) each, not an
+  // instant fail: `assert_visible`/`assert_text` poll for that long before
+  // giving up (see `ASSERT_WAIT_MS`'s own doc comment) — assertions are
+  // still never healed (out of scope entirely, see DEVELOPMENT.md), they
+  // just no longer give up on the very first instantaneous check either.
   const browser = await withRealBrowser(t)
   if (!browser) return
   try {

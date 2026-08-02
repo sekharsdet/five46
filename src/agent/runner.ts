@@ -1,8 +1,8 @@
 import type { LlmProvider } from '../llm/types'
 import { launchAgentBrowser, snapshot, executeAction } from './browser'
 import type { LoginCredentials, StorageState } from './browser'
-import { buildActionPrompt, parseAgentAction, requiresConfirmation, isDestructiveClickTarget } from './planner'
-import type { AgentAction, ExecutedStep, HistoryEntry, TestRun } from './types'
+import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, requiresConfirmation, isDestructiveClickTarget, resolvePlannedTarget } from './planner'
+import type { AgentAction, AgentPlan, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId } from './runLoop'
 
 export interface RunAgentOptions {
@@ -61,6 +61,13 @@ export interface RunAgentOptions {
    * "no analog, and that's correct, not a gap" precedent already
    * established for self-healing selectors. */
   recordVideo?: boolean
+  /** Default false. When set: one extra upfront `provider.complete()` call
+   * plans the whole goal (see `planner.ts`'s `buildPlanPrompt`), and most
+   * planned steps then execute directly against a fresh page snapshot with
+   * no further LLM call at all — see the dedicated fast-path section in
+   * this file. Off by default; the ordinary fully-adaptive loop (every
+   * existing behavior/test) is completely unchanged unless this is set. */
+  useStructuredPlan?: boolean
 }
 
 function actionSignature(action: AgentAction): string {
@@ -72,12 +79,20 @@ function actionSignature(action: AgentAction): string {
       return `${action.action}:${action.ref}:${action.value}`
     case 'assert_text':
       return `${action.action}:${action.ref}:${action.expectedText}`
+    case 'assert_page_text':
+      return `assert_page_text:${action.expectedText}`
     case 'scroll':
       // Up/down must be distinct repeat-buckets, matching how fill/
       // assert_text already key off their value, not just the action
       // type — otherwise two consecutive scrolls in opposite directions
       // would be treated as the same repeated action.
       return `scroll:${action.direction}`
+    case 'wait':
+      // Same signature every time, deliberately — two consecutive waits are
+      // allowed (see `browser.ts`'s `WAIT_ACTION_MS` doc comment), but a
+      // third identical one in a row should trip the same stuck-repeating
+      // guard an endlessly-clicking model would hit.
+      return `wait`
     case 'done':
       return `done`
   }
@@ -129,13 +144,42 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
   // below goes through this `done()` wrapper instead of a bare object
   // literal, purely so the `finally` block has something to mutate.
   let result: TestRun | undefined
+  // Structured-plan state, declared here (not inside `try`) so `done()`'s
+  // closure captures the same mutable bindings the loop below updates —
+  // by the time any `return done(...)` actually runs, these hold their
+  // real, current values, the same "finally-block mutation" trick already
+  // used for `videoPath`.
+  let plan: AgentPlan | undefined
+  let fastPathedSteps = 0
   const done = (run: TestRun): TestRun => {
+    if (plan) run.planStats = { plannedSteps: plan.steps.length, fastPathedSteps }
     result = run
     return run
   }
   try {
     await browser.page.goto(options.url)
     const baselineState = await browser.context.storageState()
+
+    // One extra, independent LLM call — the same second-`complete()`-call
+    // pattern `rootCause.ts` already uses, not a change to `LlmProvider`
+    // itself. A malformed/truncated plan response, or a thrown error making
+    // this call at all, is deliberately never fatal to the run: silently
+    // skip structured planning and fall through to the ordinary,
+    // fully-adaptive loop for the entire step budget below — a caller who
+    // opted into `useStructuredPlan` for efficiency must never end up with
+    // a strictly worse worst case than not opting in at all. See
+    // `parsePlan`'s own doc comment for the full reasoning.
+    if (options.useStructuredPlan) {
+      try {
+        const initialOutline = await snapshot(browser.page, undefined, true)
+        const planRaw = await options.provider.complete(buildPlanPrompt(options.goal, initialOutline), options.apiKey)
+        const parsedPlan = parsePlan(planRaw)
+        if (parsedPlan.ok) plan = parsedPlan.plan
+      } catch {
+        // Network failure, provider error, etc. — same "not fatal" posture.
+      }
+    }
+    let planStepIndex = 0
 
     const history: HistoryEntry[] = []
     const steps: ExecutedStep[] = []
@@ -171,31 +215,132 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     // something, not purely re-asserting.
     let repeatedAssertionRef: string | undefined
     let repeatedAssertionCount = 0
+    // The (role, name) of whatever the most recent *actually-executed*
+    // click/fill targeted — used by parseAgentAction to block a
+    // tautological assert_visible on that exact same element (see its own
+    // doc comment). Deliberately loop state, not derived from `steps` each
+    // turn: a *blocked* attempt (this same tautology check, or a blocked
+    // destructive click) never reaches execution at all, so it must leave
+    // this unchanged — re-deriving from `steps[steps.length - 1]` would
+    // instead see the blocked attempt itself as "the last step" and
+    // silently forget what was really last interacted with, letting a
+    // second, identical attempt through unblocked. Cleared on any other
+    // *executed* action (scroll, any assertion, successful or not) — the
+    // "just interacted with X" context is stale once something else
+    // genuinely happened.
+    let lastInteractedElement: { role: string; name: string } | undefined
 
     for (let stepNumber = 1; stepNumber <= maxSteps; stepNumber++) {
-      // prioritizeViewport: true here (and only here) — self-healing's own
-      // re-snapshot call in browser.ts deliberately leaves this off. See
-      // snapshot()'s doc comment for why the two must not share this.
-      const outline = await snapshot(browser.page, undefined, true)
-      const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes)
-      const raw = await options.provider.complete(prompt, options.apiKey)
-      const parsed = parseAgentAction(raw, outline, options.allowDeletes ?? false)
+      // A pending planned step (if any) for this iteration — consumed
+      // (index advanced) regardless of whether it actually fast-paths, so a
+      // step whose prediction doesn't resolve cleanly gets exactly one live
+      // decision, not repeated forever. Once the plan runs out, every
+      // remaining iteration falls straight through to the unmodified live
+      // flow below, for the rest of the step budget — a deliberate v1 scope
+      // decision (see the plan doc): the plan is a fast-path scaffold, not
+      // a hard contract, so exhaustion degrades gracefully instead of
+      // triggering explicit re-planning.
+      const plannedStep: PlannedStep | undefined = plan && planStepIndex < plan.steps.length ? plan.steps[planStepIndex] : undefined
+      if (plannedStep) planStepIndex++
 
-      if (!parsed.ok) {
-        if (parsed.recoverable) {
-          // A structurally valid click a destructive-target check blocked —
-          // the browser equivalent of a failed click/fill: record it and
-          // keep going, mirroring apiRunner.ts's identical handling of a
-          // disallowed method/host, rather than ending the whole run the
-          // first time the model tries a delete-looking click.
-          steps.push({ step: stepNumber, action: parsed.attemptedAction, outline, ok: false, failureDetail: parsed.error })
-          history.push({ action: parsed.attemptedAction, result: 'failed', detail: parsed.error })
-          continue
+      let action: AgentAction | undefined
+      let outline: PageOutline | undefined
+
+      if (plannedStep && (plannedStep.action === 'scroll' || plannedStep.action === 'wait' || plannedStep.action === 'done')) {
+        // Fully deterministic — no target to resolve, no ambiguity
+        // possible, no LLM call needed at all. `outline` is a placeholder;
+        // executeAction() never reads it for any of these three actions
+        // (scroll acts on `window`, wait just pauses, done returns
+        // immediately), and generateSpec.ts's selectorFor() never looks any
+        // of them up by ref.
+        action = plannedStep
+        outline = { elements: [], truncated: false, totalFound: 0 }
+        fastPathedSteps++
+      } else if (plannedStep && (plannedStep.action === 'click' || plannedStep.action === 'fill' || plannedStep.action === 'assert_visible' || plannedStep.action === 'assert_text')) {
+        // assert_visible/assert_text never fast-path, full stop — matches
+        // self-healing's own explicit, permanent exclusion of assertions
+        // exactly, for the identical reason: those are the run's actual
+        // verdict, and a structurally-matched-but-wrong target could
+        // convert a genuine app regression into a false pass. Only
+        // click/fill are attempted below. A planned `assert_page_text` step
+        // isn't listed in either branch condition above, so it falls
+        // through to the live decision below by construction — the same
+        // permanent exclusion, for the same reason.
+        if (plannedStep.action === 'click' || plannedStep.action === 'fill') {
+          // prioritizeViewport: false — matches self-healing's own
+          // re-match call, not the live loop's per-turn one just below.
+          // Both this fast path and self-healing are "resolve-and-refuse-
+          // on-ambiguity against a fresh snapshot"; viewport-prioritized
+          // capping would make an "ambiguous, refuse" case
+          // scroll-position-dependently flip to "one match, proceed" —
+          // self-healing already opted out of exactly this bug class once.
+          const freshOutline = await snapshot(browser.page, undefined, false)
+          const candidates = resolvePlannedTarget(freshOutline, plannedStep.target)
+
+          if (candidates.length === 1) {
+            const candidate = candidates[0]
+            if (plannedStep.action === 'click' && !options.allowDeletes && isDestructiveClickTarget(candidate.name)) {
+              // The fast-path's own copy of parseAgentAction's identical
+              // click-branch gate (planner.ts) — this check lives inside
+              // that parser today, which the fast path deliberately never
+              // calls, so it must be reproduced here explicitly. This is
+              // the fix for the single most important risk in this whole
+              // feature: without it, a plan step that happened to resolve
+              // to a destructive-looking button would execute with zero
+              // gating even at default safety settings.
+              const attempted: AgentAction = { action: 'click', ref: candidate.ref, reason: plannedStep.reason }
+              steps.push({
+                step: stepNumber,
+                action: attempted,
+                outline: freshOutline,
+                ok: false,
+                failureDetail: `clicking "${candidate.name}" looks like it deletes/deactivates/closes an account or permanently erases data — blocked this run (see --allow-deletes)`,
+              })
+              history.push({ action: attempted, result: 'failed', detail: 'blocked: destructive-looking click' })
+              continue
+            }
+            action =
+              plannedStep.action === 'click'
+                ? { action: 'click', ref: candidate.ref, reason: plannedStep.reason }
+                : { action: 'fill', ref: candidate.ref, value: plannedStep.value, submit: plannedStep.submit, reason: plannedStep.reason }
+            outline = freshOutline
+            fastPathedSteps++
+          }
+          // Zero or multiple candidates: refuse to guess, same as
+          // self-healing — falls through to the live decision below.
         }
-        return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'unparseable-response', unparseableResponse: parsed.raw })
       }
 
-      const { action } = parsed
+      if (!action || !outline) {
+        // Reached when there's no plan, the plan is exhausted, this step
+        // was an assertion (always live), or a click/fill target didn't
+        // resolve to exactly one candidate — the exact, unmodified live
+        // flow that exists regardless of `useStructuredPlan`.
+        //
+        // prioritizeViewport: true here (and only here) — self-healing's
+        // own re-snapshot call in browser.ts deliberately leaves this off.
+        // See snapshot()'s doc comment for why the two must not share this.
+        outline = await snapshot(browser.page, undefined, true)
+        const planStepNote = plannedStep && plan ? { index: planStepIndex - 1, total: plan.steps.length, step: plannedStep } : undefined
+        const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes, planStepNote)
+        const raw = await options.provider.complete(prompt, options.apiKey)
+        const parsed = parseAgentAction(raw, outline, options.allowDeletes ?? false, lastInteractedElement)
+
+        if (!parsed.ok) {
+          if (parsed.recoverable) {
+            // A structurally valid click a destructive-target check blocked —
+            // the browser equivalent of a failed click/fill: record it and
+            // keep going, mirroring apiRunner.ts's identical handling of a
+            // disallowed method/host, rather than ending the whole run the
+            // first time the model tries a delete-looking click.
+            steps.push({ step: stepNumber, action: parsed.attemptedAction, outline, ok: false, failureDetail: parsed.error })
+            history.push({ action: parsed.attemptedAction, result: 'failed', detail: parsed.error })
+            continue
+          }
+          return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'unparseable-response', unparseableResponse: parsed.raw })
+        }
+        action = parsed.action
+      }
 
       const signature = actionSignature(action)
       if (signature === lastSignature && lastActionMadeProgress) {
@@ -210,17 +355,22 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       }
       lastSignature = signature
 
-      if (action.action === 'assert_visible' || action.action === 'assert_text') {
-        if (action.ref === repeatedAssertionRef) {
+      if (action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text') {
+        // assert_page_text has no `ref` (that's the whole point — see its
+        // own doc comment), so it's tracked by `expectedText` instead,
+        // reusing the same "current assertion target" slot rather than a
+        // second parallel counter.
+        const key = action.action === 'assert_page_text' ? `page-text:${action.expectedText}` : action.ref
+        if (key === repeatedAssertionRef) {
           repeatedAssertionCount++
           if (repeatedAssertionCount >= 3) {
             return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'stuck-repeating' })
           }
         } else {
-          repeatedAssertionRef = action.ref
+          repeatedAssertionRef = key
           repeatedAssertionCount = 1
         }
-      } else if (action.action === 'click' || action.action === 'fill' || action.action === 'scroll') {
+      } else if (action.action === 'click' || action.action === 'fill' || action.action === 'scroll' || action.action === 'wait') {
         repeatedAssertionRef = undefined
         repeatedAssertionCount = 0
       }
@@ -267,6 +417,10 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       // would never trip the guard.
       const isProgressableClickOrFill = (action.action === 'click' && !isToggleControlClick) || action.action === 'fill'
       lastActionMadeProgress = (isProgressableClickOrFill && result.ok) || (action.action === 'scroll' && result.scrolled === true)
+      lastInteractedElement =
+        (action.action === 'click' || action.action === 'fill') && result.ok
+          ? outline.elements.find((el) => el.ref === action.ref)
+          : undefined
       steps.push({
         step: stepNumber,
         action,
@@ -290,7 +444,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         detail: result.ok ? (result.healed ? 'succeeded after healing a stale selector' : '') : (result.failureDetail ?? 'failed'),
       })
 
-      const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text'
+      const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text'
       if (isAssertion && result.ok) hasSucceededAssertion = true
       if (!result.ok && isAssertion) {
         return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'assertion-failed' })

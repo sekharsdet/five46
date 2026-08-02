@@ -44,12 +44,72 @@ export type AgentAction =
   | { action: 'fill'; ref: string; value: string; submit?: boolean; reason: string }
   | { action: 'assert_visible'; ref: string; reason: string }
   | { action: 'assert_text'; ref: string; expectedText: string; reason: string }
+  /** Checks the *whole rendered page*'s visible text for a substring — no
+   * `ref`, unlike every other assertion. Added alongside `wait` after the
+   * same real, live gap: `snapshot()`'s outline only ever includes
+   * `button, a, input, select, textarea, [role]` (see `browser.ts`), so a
+   * plain `<h4>`/`<div>`/`<p>` success message with no ARIA role — a
+   * genuinely common real-world pattern, confirmed on
+   * `the-internet.herokuapp.com`'s own dynamic-loading demo (`<h4>Hello
+   * World!</h4>`, no `role` attribute at all) — can never appear as an
+   * assertable `ref`, no matter how long the model waits for it. This is
+   * the fallback for exactly that case: it searches rendered page text
+   * directly, the same thing `page.getByText()`/`toContainText()` on
+   * `body` does in idiomatic Playwright, rather than requiring the target
+   * to be one of the interactive elements the outline was built to list
+   * for *acting on*, not for *reading*. */
+  | { action: 'assert_page_text'; expectedText: string; reason: string }
   /** Scrolls the whole page (`window`) by one viewport height — never a
    * specific nested scroll container (a modal's internal `overflow:auto`
    * region, say). No `ref`: unlike every other action, this doesn't target
    * a specific element, only a direction. */
   | { action: 'scroll'; direction: 'up' | 'down'; reason: string }
+  /** Pauses for a fixed, server-controlled duration (`browser.ts`'s
+   * `WAIT_ACTION_MS`) — never a model-supplied number, matching this
+   * codebase's "never trust the model with a raw magic number when a fixed
+   * default suffices" posture (the same reasoning behind the hardcoded 5s
+   * click/fill timeouts). Added after a real, live gap: a page whose target
+   * content only appears after an async delay (a loading spinner with no
+   * XHR — `page.waitForLoadState('networkidle')` would resolve immediately
+   * and not actually help) left the model with no tool to use except
+   * scrolling, which doesn't advance time; it scrolled twice, found nothing
+   * new, and gave up declaring the goal unreachable. No `ref`, same as
+   * `scroll` — this doesn't target an element either. */
+  | { action: 'wait'; reason: string }
   | { action: 'done'; outcome: 'goal-reached' | 'goal-unreachable' | 'stuck-repeating'; reason: string }
+
+/** A prediction, not a verified reference — the planning call (see
+ * `planner.ts`'s `buildPlanPrompt`) sees only the *first* page's outline,
+ * so a step targeting a later page can only describe what it *expects* to
+ * find there. `role` is required (not optional) whenever a target is
+ * needed: role is a genuinely strong discriminator (see `browser.ts`'s
+ * `roleOf()`), and a target is inherently uncertain already — allowing
+ * name-only matching would make the fast-path resolution below too weak
+ * to trust. Execution resolves this against a *fresh* snapshot taken right
+ * before the step runs (see `runner.ts`), exactly one candidate or it
+ * falls back to a live decision — never a guess. */
+export interface PlannedStepTarget {
+  role: string
+  nameContains: string
+}
+
+/** One step of an upfront plan (`buildPlanPrompt`/`parsePlan`) — mirrors
+ * `AgentAction`'s shape but with `target` (a prediction) in place of `ref`
+ * (a verified, this-turn-only reference), since a plan step decided before
+ * any of its own page state existed cannot possibly hold a real ref. */
+export type PlannedStep =
+  | { action: 'click'; target: PlannedStepTarget; reason: string }
+  | { action: 'fill'; target: PlannedStepTarget; value: string; submit?: boolean; reason: string }
+  | { action: 'assert_visible'; target: PlannedStepTarget; reason: string }
+  | { action: 'assert_text'; target: PlannedStepTarget; expectedText: string; reason: string }
+  | { action: 'assert_page_text'; expectedText: string; reason: string }
+  | { action: 'scroll'; direction: 'up' | 'down'; reason: string }
+  | { action: 'wait'; reason: string }
+  | { action: 'done'; outcome: 'goal-reached' | 'goal-unreachable'; reason: string }
+
+export interface AgentPlan {
+  steps: PlannedStep[]
+}
 
 /** Whether login credentials are configured — *presence only*, never the
  * actual values. Passed to `planner.ts`'s `buildActionPrompt` specifically
@@ -114,4 +174,12 @@ export interface TestRun {
    * `AgentBrowser.close()`. `ApiTestRun` has no equivalent field: no
    * browser, structurally impossible to record a video of. */
   videoPath?: string
+  /** Populated when `RunAgentOptions.useStructuredPlan` was set and a plan
+   * was actually generated (absent if the planning call itself failed to
+   * parse — that degrades silently to the ordinary adaptive loop for the
+   * whole run, see `runner.ts`). `plannedSteps` is the plan's own length;
+   * `fastPathedSteps` is how many of `steps` executed without a live LLM
+   * decision — the efficiency this feature actually buys, disclosed rather
+   * than left for a reader to infer from step count alone. */
+  planStats?: { plannedSteps: number; fastPathedSteps: number }
 }

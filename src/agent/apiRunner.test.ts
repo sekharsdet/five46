@@ -399,3 +399,195 @@ test('runApiTest allows exactly two checks of the same path (exists, then equals
     await server.close()
   }
 })
+
+test('runApiTest with useStructuredPlan fast-paths a whole well-formed plan, making zero live per-step calls', async () => {
+  const server = await startApiTestServer()
+  try {
+    let calls = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        calls++
+        // The one upfront planning call — a request whose method/host are
+        // both allowed, followed by an assert_status that only fast-paths
+        // because it immediately follows a real successful request, then a
+        // deterministic done. None of these three should need a live call.
+        return JSON.stringify({
+          steps: [
+            { action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' },
+            { action: 'assert_status', expected: 200, reason: 'confirm ok' },
+            { action: 'done', outcome: 'goal-reached', reason: 'confirmed' },
+          ],
+        })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items and confirm the request succeeded',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(run.steps.length, 2)
+    assert.equal(run.planStats?.plannedSteps, 3)
+    assert.equal(run.planStats?.fastPathedSteps, 3, 'request, assertion (after a successful request), and done should all fast-path')
+    assert.equal(calls, 1, 'only the upfront planning call — zero live per-step decisions')
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest with useStructuredPlan still blocks a fast-pathed DELETE by default, never executing it for real', async () => {
+  // The single most important regression test in this whole feature's
+  // API-engine half: the fast path deliberately skips parseApiAction
+  // entirely (that's the efficiency win), which is exactly the function
+  // that normally enforces isMethodAllowed/isHostAllowed (SafetyMode)
+  // gating — without an explicit, independent copy of that same check at
+  // the fast path's own execution site, a planned DELETE could fire for
+  // real with zero gating even at default (read-only) safety settings.
+  const server = await startApiTestServer()
+  try {
+    const create = await fetch(server.url + '/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'widget' }),
+    })
+    const { id } = (await create.json()) as { id: string }
+
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        return JSON.stringify({ steps: [{ action: 'request', method: 'DELETE', url: `${server.url}/items/${id}`, reason: 'delete it' }] })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'delete the item',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url), // default: no writes, no deletes
+      useStructuredPlan: true,
+      maxSteps: 2,
+    })
+
+    assert.notEqual(run.outcome, 'goal-reached')
+    assert.ok(run.steps.length > 0)
+    assert.ok(run.steps.every((s) => !s.ok), 'a fast-pathed disallowed DELETE must never be recorded as a successful step')
+    assert.ok(run.steps.every((s) => s.failureDetail?.includes('not allowed this run')))
+
+    // Prove it was never actually sent — the item must still exist.
+    const check = await fetch(`${server.url}/items/${id}`)
+    assert.equal(check.status, 200, 'the item must still exist — the blocked DELETE must never have reached the real server')
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest with useStructuredPlan does not fast-path an assertion immediately after a failed planned request', async () => {
+  const server = await startApiTestServer()
+  try {
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        turn++
+        if (turn === 1) {
+          // A write blocked by default safety, immediately followed by a
+          // planned assertion — the assertion must NOT fast-path against
+          // whatever lastResponse happened to hold before: it must go live.
+          return JSON.stringify({
+            steps: [
+              { action: 'request', method: 'POST', url: server.url + '/items', body: '{}', reason: 'blocked write' },
+              { action: 'assert_status', expected: 201, reason: 'would be wrong to fast-path this' },
+              { action: 'done', outcome: 'goal-unreachable', reason: 'could not write' },
+            ],
+          })
+        }
+        // The live decision for the assertion step.
+        return JSON.stringify({ action: 'done', outcome: 'goal-unreachable', reason: 'could not write' })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'create an item',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.planStats?.fastPathedSteps, 0, 'the blocked request is not a fast-path execution, and the assertion after it must not fast-path either')
+    assert.equal(turn, 2, 'plan + one live decision for the step after the blocked request')
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest with useStructuredPlan falls back to a live decision when a planned request references an unresolved {{var}}', async () => {
+  const server = await startApiTestServer()
+  try {
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        turn++
+        if (turn === 1) {
+          return JSON.stringify({
+            steps: [{ action: 'request', method: 'GET', url: server.url + '/items/{{neverSaved}}', reason: 'references a var nothing saved' }],
+          })
+        }
+        return JSON.stringify({ action: 'done', outcome: 'goal-unreachable', reason: 'gave up' })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'fetch a nonexistent saved item',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.planStats?.fastPathedSteps, 0)
+    assert.equal(turn, 2, 'plan + live fallback for the unresolvable step')
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest with useStructuredPlan degrades silently to the full adaptive loop when the plan response itself is malformed', async () => {
+  const server = await startApiTestServer()
+  try {
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        turn++
+        if (turn === 1) return 'not valid json at all'
+        if (turn === 2) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(run.planStats, undefined, 'no plan was ever actually adopted, so there is nothing to disclose')
+  } finally {
+    await server.close()
+  }
+})

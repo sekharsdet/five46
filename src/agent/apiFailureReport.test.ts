@@ -37,3 +37,11 @@ test('formatApiFailureReport labels a tooling outcome as such, not a finding abo
   const run: ApiTestRun = { runId: 'r2', baseUrl: 'http://x', goal: 'g', outcome: 'stopped-by-cap', steps: [] }
   assert.ok(formatApiFailureReport(run).includes('tooling issue'))
 })
+
+test('formatApiFailureReport discloses structured-plan stats when a plan was used, and omits the line entirely when it was not', () => {
+  const withPlan: ApiTestRun = { runId: 'r3', baseUrl: 'http://x', goal: 'g', outcome: 'goal-reached', steps: [], planStats: { plannedSteps: 4, fastPathedSteps: 3 } }
+  assert.ok(formatApiFailureReport(withPlan).includes('Structured plan: 4 step(s) planned upfront, 3 executed without a live LLM decision.'))
+
+  const withoutPlan: ApiTestRun = { ...withPlan, runId: 'r4', planStats: undefined }
+  assert.ok(!formatApiFailureReport(withoutPlan).includes('Structured plan:'))
+})

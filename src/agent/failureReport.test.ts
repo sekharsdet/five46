@@ -112,6 +112,21 @@ test('formatFailureReport discloses a recorded video path on an assertion-failed
   assert.ok(report.includes('Video: /tmp/five46-agent-r7/video.webm'))
 })
 
+test('formatFailureReport discloses structured-plan stats when a plan was used, and omits the line entirely when it was not', () => {
+  const withPlan: TestRun = {
+    runId: 'r9',
+    url: 'http://x',
+    goal: 'g',
+    outcome: 'goal-reached',
+    steps: [{ step: 1, action: { action: 'click', ref: 'e1', reason: 'r' }, outline: OUTLINE, ok: true }],
+    planStats: { plannedSteps: 3, fastPathedSteps: 2 },
+  }
+  assert.ok(formatFailureReport(withPlan).includes('Structured plan: 3 step(s) planned upfront, 2 executed without a live LLM decision.'))
+
+  const withoutPlan: TestRun = { ...withPlan, runId: 'r10', planStats: undefined }
+  assert.ok(!formatFailureReport(withoutPlan).includes('Structured plan:'))
+})
+
 test('formatFailureReport omits the video line entirely when no video was recorded', () => {
   const run: TestRun = {
     runId: 'r8',

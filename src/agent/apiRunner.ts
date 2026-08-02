@@ -2,9 +2,10 @@ import type { LlmProvider } from '../llm/types'
 import type { StorageState } from './browser'
 import { CookieJar, executeApiAction, resolvePlaceholders } from './apiExecutor'
 import type { LastResponse, ApiExecutionContext } from './apiExecutor'
-import { buildApiActionPrompt, parseApiAction } from './apiPlanner'
+import { buildApiActionPrompt, buildApiPlanPrompt, checkVarReferences, parseApiAction, parseApiPlan } from './apiPlanner'
 import { requiresConfirmation } from './planner'
-import type { ApiAction, ApiHistoryEntry, ApiTestRun, ExecutedApiStep, HttpMethod, SafetyMode } from './apiTypes'
+import { isHostAllowed, isMethodAllowed } from './apiTypes'
+import type { ApiAction, ApiHistoryEntry, ApiPlan, ApiTestRun, ExecutedApiStep, HttpMethod, SafetyMode } from './apiTypes'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId } from './runLoop'
 
 export interface RunApiTestOptions {
@@ -36,6 +37,10 @@ export interface RunApiTestOptions {
    * stays free of I/O, matching `runAgent`'s own precedent of zero direct
    * console output. */
   onWrite?: (method: HttpMethod, url: string, reason: string) => void
+  /** Same meaning as `RunAgentOptions.useStructuredPlan` — see its own doc
+   * comment. Default false; the ordinary fully-adaptive loop is completely
+   * unchanged unless this is set. */
+  useStructuredPlan?: boolean
 }
 
 const SAFE_METHODS = new Set<HttpMethod>(['GET', 'HEAD', 'OPTIONS'])
@@ -134,26 +139,117 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   let repeatedCheckKey: string | undefined
   let repeatedCheckCount = 0
 
-  for (let stepNumber = 1; stepNumber <= maxSteps; stepNumber++) {
-    const validVarNames = new Set(vars.keys())
-    const prompt = buildApiActionPrompt(options.goal, history, validVarNames, options.safety)
-    const raw = await options.provider.complete(prompt, options.apiKey)
-    const parsed = parseApiAction(raw, validVarNames, options.safety)
+  // One extra, independent LLM call — same pattern as `runner.ts`'s
+  // identical block, see its own doc comment for the full reasoning
+  // (never fatal to the run; a malformed/truncated response just skips
+  // structured planning for this run entirely).
+  let plan: ApiPlan | undefined
+  let planStepIndex = 0
+  let fastPathedSteps = 0
+  if (options.useStructuredPlan) {
+    try {
+      const planRaw = await options.provider.complete(buildApiPlanPrompt(options.goal, options.safety), options.apiKey)
+      const parsedPlan = parseApiPlan(planRaw)
+      if (parsedPlan.ok) plan = parsedPlan.plan
+    } catch {
+      // Network failure, provider error, etc. — same "not fatal" posture.
+    }
+  }
+  const withPlanStats = (run: ApiTestRun): ApiTestRun => {
+    if (plan) run.planStats = { plannedSteps: plan.steps.length, fastPathedSteps }
+    return run
+  }
+  // True only when the immediately-preceding *actually-executed* step (not
+  // the planned one) was a successful `request` — the fast path's own gate
+  // for assertions, narrower than the browser engine's blanket exclusion.
+  // Reasoning: `lastResponse` (below) only updates on a successful request;
+  // if the preceding *planned* request instead failed for any of its
+  // already-handled, non-fatal reasons (a blocked host, a timeout, an
+  // unexpected 4xx — all "recoverable, keep going" already) and the loop
+  // moved on, `lastResponse` would silently still hold an earlier,
+  // unrelated response. A fast-pathed assertion right after would evaluate
+  // against that stale state — a plausible-looking but wrong verdict. This
+  // is the API-engine equivalent of "matched the wrong DOM element" the
+  // browser engine's assertion exclusion exists to prevent — matched the
+  // wrong *response*, via mutable sequencing state, not structural
+  // ambiguity, so the fix is narrower than a blanket ban.
+  let precedingWasSuccessfulRequest = false
 
-    if (!parsed.ok) {
-      if (parsed.recoverable) {
-        // A structurally valid request the safety mode or {{var}} check
-        // blocked — the API equivalent of a failed click/fill: record it
-        // and keep going, rather than ending the whole run the first time
-        // the model tries a disallowed write.
-        steps.push({ step: stepNumber, action: parsed.attemptedAction, ok: false, failureDetail: parsed.error })
-        history.push({ action: parsed.attemptedAction, result: 'failed', detail: parsed.error })
-        continue
+  for (let stepNumber = 1; stepNumber <= maxSteps; stepNumber++) {
+    const plannedStep = plan && planStepIndex < plan.steps.length ? plan.steps[planStepIndex] : undefined
+    if (plannedStep) planStepIndex++
+
+    let action: ApiAction | undefined
+
+    if (plannedStep && plannedStep.action === 'done') {
+      // Fully deterministic, no live call needed — safe because the
+      // unverified-success gate below (`unverifiedSuccess`) lives in the
+      // shared loop body, applying identically regardless of provenance.
+      action = plannedStep
+      fastPathedSteps++
+    } else if (plannedStep && plannedStep.action === 'request') {
+      const validVarNamesNow = new Set(vars.keys())
+      const varError = checkVarReferences([plannedStep.url, plannedStep.body, ...(plannedStep.headers ? Object.values(plannedStep.headers) : [])], validVarNamesNow)
+      if (varError) {
+        // Unresolved {{var}} — the plan itself doesn't make sense yet at
+        // this point in the run; fall back to a live decision so the model
+        // judges what actually makes sense given the real history, rather
+        // than record a confusing failure for something never really
+        // attempted.
+      } else {
+        const resolvedUrl = resolvePlaceholders(plannedStep.url, vars)
+        // The fast path's own copy of parseApiAction's identical checks —
+        // this codebase's `SafetyMode` gating lives inside that parser
+        // today, which the fast path deliberately never calls, so it must
+        // be reproduced here explicitly. This is the fix for the single
+        // most important risk in this whole feature: without it, a
+        // fast-pathed request could fire for real with zero method/host
+        // gating even at default safety settings.
+        if (!isMethodAllowed(plannedStep.method, options.safety)) {
+          const attempted: ApiAction = plannedStep
+          steps.push({ step: stepNumber, action: attempted, ok: false, failureDetail: `method "${plannedStep.method}" is not allowed this run (see --allow-writes/--allow-deletes)` })
+          history.push({ action: attempted, result: 'failed', detail: 'blocked: disallowed method' })
+          precedingWasSuccessfulRequest = false
+          continue
+        }
+        if (!isHostAllowed(resolvedUrl, options.safety)) {
+          const attempted: ApiAction = plannedStep
+          steps.push({ step: stepNumber, action: attempted, ok: false, failureDetail: `"${resolvedUrl}" is not the target origin or an allowlisted host (see --allow-host)` })
+          history.push({ action: attempted, result: 'failed', detail: 'blocked: disallowed host' })
+          precedingWasSuccessfulRequest = false
+          continue
+        }
+        action = plannedStep
+        fastPathedSteps++
       }
-      return { runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'unparseable-response', unparseableResponse: parsed.raw }
+    } else if (plannedStep && precedingWasSuccessfulRequest) {
+      // assert_status/assert_json_path_exists/assert_json_path_equals,
+      // only when the gate above holds — see its own doc comment.
+      action = plannedStep
+      fastPathedSteps++
     }
 
-    const { action } = parsed
+    if (!action) {
+      const validVarNames = new Set(vars.keys())
+      const prompt = buildApiActionPrompt(options.goal, history, validVarNames, options.safety)
+      const raw = await options.provider.complete(prompt, options.apiKey)
+      const parsed = parseApiAction(raw, validVarNames, options.safety)
+
+      if (!parsed.ok) {
+        if (parsed.recoverable) {
+          // A structurally valid request the safety mode or {{var}} check
+          // blocked — the API equivalent of a failed click/fill: record it
+          // and keep going, rather than ending the whole run the first time
+          // the model tries a disallowed write.
+          steps.push({ step: stepNumber, action: parsed.attemptedAction, ok: false, failureDetail: parsed.error })
+          history.push({ action: parsed.attemptedAction, result: 'failed', detail: parsed.error })
+          precedingWasSuccessfulRequest = false
+          continue
+        }
+        return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'unparseable-response', unparseableResponse: parsed.raw })
+      }
+      action = parsed.action
+    }
 
     const signature = actionSignature(action)
     if (signature === lastSignature && lastActionMadeProgress) {
@@ -161,7 +257,7 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
     } else if (signature === lastSignature) {
       repeatCount++
       if (repeatCount >= 2) {
-        return { runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stuck-repeating' }
+        return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stuck-repeating' })
       }
     } else {
       repeatCount = 0
@@ -173,7 +269,7 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
       if (checkKey === repeatedCheckKey) {
         repeatedCheckCount++
         if (repeatedCheckCount >= 3) {
-          return { runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stuck-repeating' }
+          return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stuck-repeating' })
         }
       } else {
         repeatedCheckKey = checkKey
@@ -194,9 +290,10 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
           detail:
             'rejected: this goal asks to confirm/verify something, but no assert_status/assert_json_path_exists/assert_json_path_equals has succeeded yet — perform one before declaring done',
         })
+        precedingWasSuccessfulRequest = false
         continue
       }
-      return { runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: action.outcome }
+      return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: action.outcome })
     }
 
     if (action.action === 'request' && !SAFE_METHODS.has(action.method)) {
@@ -224,13 +321,17 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
 
     if (result.ok && result.response) lastResponse = result.response
     if (result.ok && result.savedVar) vars.set(result.savedVar.name, result.savedVar.value)
+    // Tracks the fast path's own assertion-eligibility gate (see its doc
+    // comment above) — updated for every actually-executed step, fast-
+    // pathed or live-decided alike, exactly like `lastResponse` itself.
+    precedingWasSuccessfulRequest = action.action === 'request' && result.ok
 
     const isAssertion = action.action === 'assert_status' || action.action === 'assert_json_path_exists' || action.action === 'assert_json_path_equals'
     if (isAssertion && result.ok) hasSucceededAssertion = true
     if (!result.ok && isAssertion) {
-      return { runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'assertion-failed' }
+      return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'assertion-failed' })
     }
   }
 
-  return { runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stopped-by-cap' }
+  return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stopped-by-cap' })
 }
