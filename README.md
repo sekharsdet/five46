@@ -65,21 +65,37 @@ Not a knock on cloud platforms — it's a genuinely different tradeoff (their in
 ## Installation
 
 ```bash
+npm install -g five46
+
+npm install --save-dev playwright @playwright/test   # one-time, if your project doesn't already have it
+npx playwright install chromium                       # one-time, downloads the browser
+```
+
+Or run it without installing globally:
+
+```bash
+npx five46 test http://localhost:3000 --goal "log in and confirm the dashboard loads"
+```
+
+<details>
+<summary>Building from source instead (for contributing to five46 itself)</summary>
+
+```bash
 git clone https://github.com/sekharsdet/five46.git
 cd five46
 npm install
 npm run build
-
-npm install --save-dev playwright @playwright/test   # one-time
-npx playwright install chromium                       # one-time, downloads the browser
+node dist/cli.js test http://localhost:3000 --goal "..."
 ```
+
+</details>
 
 ## Configuration
 
 One-time setup (same shape as `gh auth login`/`aws configure`):
 
 ```bash
-node dist/cli.js config
+five46 config
 ```
 
 This prompts for an LLM provider + key, masking secret input, and saves it
@@ -95,7 +111,7 @@ export FIVE46_LLM_API_KEY=sk-...    # for bedrock, use your AWS region instead
 ## Quick start
 
 ```bash
-node dist/cli.js test http://localhost:3000 --goal "log in and confirm the dashboard loads"
+five46 test http://localhost:3000 --goal "log in and confirm the dashboard loads"
 ```
 
 `--goal` is required. Useful flags: `--max-steps` (default 15),
@@ -134,8 +150,8 @@ Capture a session once, reuse it across runs:
 export FIVE46_LOGIN_USERNAME=...
 export FIVE46_LOGIN_PASSWORD=...
 
-node dist/cli.js login https://your-app.example.com/login --goal "log in" --out session.json
-node dist/cli.js test https://your-app.example.com/dashboard --goal "..." --storage-state session.json
+five46 login https://your-app.example.com/login --goal "log in" --out session.json
+five46 test https://your-app.example.com/dashboard --goal "..." --storage-state session.json
 ```
 
 Your username/password are never sent to the LLM — the model only ever
@@ -152,7 +168,7 @@ toward a goal instead, and writes a real, standalone `node:test` script
 needed):
 
 ```bash
-node dist/cli.js api https://api.your-app.example.com --goal "create a user, then fetch it back and confirm the name matches"
+five46 api https://api.your-app.example.com --goal "create a user, then fetch it back and confirm the name matches"
 ```
 
 Read-only (`GET`/`HEAD`/`OPTIONS`) by default. Add `--allow-writes` to
@@ -163,9 +179,9 @@ name another one via repeatable `--allow-host <host>`.
 ## Listing past runs
 
 ```bash
-node dist/cli.js list          # current directory
-node dist/cli.js list ./tests  # or any other directory
-node dist/cli.js list --project checkout   # only runs tagged with this project
+five46 list          # current directory
+five46 list ./tests  # or any other directory
+five46 list --project checkout   # only runs tagged with this project
 ```
 
 Lists previously generated `five46-agent-*.spec.ts`/`five46-api-*.test.mjs`
@@ -176,7 +192,7 @@ command — every generated file already is a real, standalone Playwright/
 ## Diffing two runs
 
 ```bash
-node dist/cli.js diff five46-agent-abc123.spec.ts five46-agent-def456.spec.ts
+five46 diff five46-agent-abc123.spec.ts five46-agent-def456.spec.ts
 ```
 
 A plain line diff between any two generated (or other text) files, with
@@ -186,7 +202,7 @@ still compared). Exits 0 if identical, 1 if they differ.
 ## Flaky-test detection
 
 ```bash
-node dist/cli.js test http://localhost:3000 --goal "..." --repeat 5
+five46 test http://localhost:3000 --goal "..." --repeat 5
 ```
 
 Runs the same goal N times (sequentially — capped at 10) and reports
@@ -207,7 +223,7 @@ same way on `five46 api`.
 ```
 
 ```bash
-node dist/cli.js test --goal "..." --project checkout
+five46 test --goal "..." --project checkout
 ```
 
 A CLI flag always wins over a project default; a project only fills in
@@ -217,7 +233,7 @@ key is never sourced from this file — only a provider label can be.
 ## Video replay
 
 ```bash
-node dist/cli.js test http://localhost:3000 --goal "..." --record-video
+five46 test http://localhost:3000 --goal "..." --record-video
 ```
 
 Records the whole session as a real `.webm` (also available on
@@ -227,7 +243,7 @@ player.
 ## Structured planning
 
 ```bash
-node dist/cli.js test http://localhost:3000 --goal "..." --structured-plan
+five46 test http://localhost:3000 --goal "..." --structured-plan
 ```
 
 One extra LLM call plans the whole goal upfront; most steps then execute
@@ -242,7 +258,7 @@ independently at the fast path too, not skipped. Off by default; works on
 
 ```bash
 npm install --save-dev @modelcontextprotocol/sdk zod   # one-time
-node dist/cli.js mcp
+five46 mcp
 ```
 
 Exposes `five46_test`/`five46_api` as MCP tools an IDE-embedded AI
