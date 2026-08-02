@@ -361,6 +361,27 @@ export function parsePlan(raw: string): ParsePlanResult {
     steps.push(step)
   }
   if (steps.length === 0) return { ok: false, error: 'plan contained no steps', raw }
+  // Found via a real, live-repeated failure: a CRUD goal against a
+  // well-known fake API (jsonplaceholder.typicode.com) produced a 1-step
+  // plan — an immediate {"action":"done","outcome":"goal-unreachable"} —
+  // twice, with zero real requests ever attempted. Explicit prompt
+  // guidance against declaring "unreachable" from assumption alone
+  // (buildPlanPrompt) was live-retested and did NOT change this: the model
+  // applies what it believes is verified training-data knowledge, not
+  // something it perceives as guessing, so wording alone can't reliably
+  // stop it. Rejecting the plan itself forces the exact same fallback an
+  // empty steps array already takes — the full, live, per-step adaptive
+  // loop for the whole run — which this session's own live testing already
+  // proved handles this correctly (the adaptive loop, framed as "take one
+  // concrete action now" rather than "judge the whole flow upfront," made
+  // real progress on the identical goal before reaching its own honest
+  // conclusion). Applies to both outcomes, not just goal-unreachable: an
+  // immediate goal-reached with zero real actions is the same category of
+  // ungrounded claim the live loop's own requiresConfirmation/
+  // hasSucceededAssertion check already refuses to accept.
+  if (steps.every((s) => s.action === 'done')) {
+    return { ok: false, error: 'plan consists only of an immediate "done" step, with no real action ever attempted — falling back to a live decision so the model has to gather real evidence first', raw }
+  }
   return { ok: true, plan: { steps } }
 }
 

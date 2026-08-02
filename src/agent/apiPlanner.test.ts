@@ -167,7 +167,10 @@ test('parseApiPlan strictly parses a real, well-formed plan response, including 
 })
 
 test('parseApiPlan strips a markdown json fence, the same accommodation parseApiAction already makes', () => {
-  const raw = '```json\n' + JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-reached', reason: 'r' }] }) + '\n```'
+  const raw =
+    '```json\n' +
+    JSON.stringify({ steps: [{ action: 'request', method: 'GET', url: 'https://example.com/items', reason: 'list' }, { action: 'done', outcome: 'goal-reached', reason: 'r' }] }) +
+    '\n```'
   assert.equal(parseApiPlan(raw).ok, true)
 })
 
@@ -181,6 +184,29 @@ test('parseApiPlan fails honestly when the response is not a {"steps": [...]} ob
 
 test('parseApiPlan fails honestly on an empty steps array', () => {
   assert.equal(parseApiPlan(JSON.stringify({ steps: [] })).ok, false)
+})
+
+test('parseApiPlan rejects a plan whose only step is an immediate "done", for either outcome, since no real request was ever attempted', () => {
+  // Real, live-repeated failure this fixes — see this function's own doc
+  // comment and planner.ts's parsePlan (mirrored exactly).
+  const unreachable = parseApiPlan(JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-unreachable', reason: 'assumed this API does not persist writes' }] }))
+  assert.equal(unreachable.ok, false)
+  if (!unreachable.ok) assert.match(unreachable.error, /no real action ever attempted/)
+
+  const reached = parseApiPlan(JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-reached', reason: 'assumed already satisfied' }] }))
+  assert.equal(reached.ok, false)
+})
+
+test('parseApiPlan accepts a plan with a real request before its trailing "done" step — unaffected by the immediate-done rejection', () => {
+  const raw = JSON.stringify({
+    steps: [
+      { action: 'request', method: 'GET', url: 'https://example.com/items', reason: 'list items' },
+      { action: 'done', outcome: 'goal-reached', reason: 'confirmed' },
+    ],
+  })
+  const result = parseApiPlan(raw)
+  assert.equal(result.ok, true)
+  if (result.ok) assert.equal(result.plan.steps.length, 2)
 })
 
 test('parseApiPlan fails honestly when any single step is malformed', () => {

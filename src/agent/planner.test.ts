@@ -341,6 +341,32 @@ test('parsePlan fails honestly on an empty steps array — a plan must actually 
   assert.equal(parsePlan(JSON.stringify({ steps: [] })).ok, false)
 })
 
+test('parsePlan rejects a plan whose only step is an immediate "done", for either outcome, since no real action was ever attempted', () => {
+  // Real, live-repeated failure: a CRUD goal against a well-known fake API
+  // produced exactly this shape twice, giving up in under 13s with zero
+  // real requests ever attempted — see this function's own doc comment.
+  const unreachable = parsePlan(JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-unreachable', reason: 'assumed this API does not support it' }] }))
+  assert.equal(unreachable.ok, false)
+  if (!unreachable.ok) assert.match(unreachable.error, /no real action ever attempted/)
+
+  // Symmetric case: an immediate goal-reached with zero real actions is the
+  // same category of ungrounded claim.
+  const reached = parsePlan(JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-reached', reason: 'assumed already satisfied' }] }))
+  assert.equal(reached.ok, false)
+})
+
+test('parsePlan accepts a plan with a real action before its trailing "done" step — unaffected by the immediate-done rejection', () => {
+  const raw = JSON.stringify({
+    steps: [
+      { action: 'click', target: { role: 'button', nameContains: 'Start' }, reason: 'begin' },
+      { action: 'done', outcome: 'goal-reached', reason: 'confirmed' },
+    ],
+  })
+  const result = parsePlan(raw)
+  assert.equal(result.ok, true)
+  if (result.ok) assert.equal(result.plan.steps.length, 2)
+})
+
 test('parsePlan fails honestly when any single step is malformed, rather than silently dropping it', () => {
   const raw = JSON.stringify({
     steps: [

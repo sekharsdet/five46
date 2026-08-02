@@ -592,6 +592,43 @@ test('runApiTest with useStructuredPlan degrades silently to the full adaptive l
   }
 })
 
+test('runApiTest with useStructuredPlan degrades to the full adaptive loop when the plan gives up immediately, letting the model actually try instead of assuming', async () => {
+  // Real, live-repeated failure this fixes: a CRUD goal against a
+  // well-known fake API produced a plan whose only step was an immediate
+  // {"action":"done","outcome":"goal-unreachable"} — zero real requests
+  // ever attempted. See parseApiPlan's own doc comment.
+  const server = await startApiTestServer()
+  try {
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        turn++
+        if (turn === 1) return JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-unreachable', reason: 'assumed this API does not support it' }] })
+        if (turn === 2) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+      useStructuredPlan: true,
+    })
+
+    // The real point of this fix: a real request was actually attempted,
+    // rather than the run ending on the plan's own premature claim.
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(run.planStats, undefined, 'the degenerate plan was rejected, so nothing was ever adopted to disclose')
+    assert.equal(run.steps.length, 1)
+  } finally {
+    await server.close()
+  }
+})
+
 test('runApiTest returns a real, honest outcome with prior steps preserved when the LLM provider itself throws mid-run, instead of the run silently vanishing', async () => {
   // Mirrors runner.ts's identical fix — see its own test's doc comment for
   // the real, live-found gap this closes (a sustained Gemini 503 patch

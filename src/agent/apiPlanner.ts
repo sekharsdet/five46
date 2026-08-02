@@ -199,6 +199,14 @@ export function parseApiPlan(raw: string): ParseApiPlanResult {
     steps.push(step)
   }
   if (steps.length === 0) return { ok: false, error: 'plan contained no steps', raw }
+  // Mirrors `planner.ts`'s `parsePlan` exactly — see its own doc comment
+  // for the full reasoning (a real, live-repeated failure: a CRUD goal
+  // against jsonplaceholder.typicode.com produced a 1-step immediate-done
+  // plan twice, with zero real requests attempted, and prompt-only
+  // guidance against this was live-retested and did not fix it).
+  if (steps.every((s) => s.action === 'done')) {
+    return { ok: false, error: 'plan consists only of an immediate "done" step, with no real action ever attempted — falling back to a live decision so the model has to gather real evidence first', raw }
+  }
   return { ok: true, plan: { steps } }
 }
 

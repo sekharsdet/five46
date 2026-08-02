@@ -1303,6 +1303,53 @@ test('runAgent with useStructuredPlan degrades silently to the full adaptive loo
   }
 })
 
+test('runAgent with useStructuredPlan degrades to the full adaptive loop when the plan gives up immediately, letting the model actually try instead of assuming', async (t) => {
+  // Real, live-repeated failure this fixes: a plan whose only step is an
+  // immediate {"action":"done","outcome":"goal-unreachable"} — see
+  // parsePlan's own doc comment. This reuses the exact same fallback path
+  // as the malformed-JSON test above; the only difference is *why* the
+  // plan is rejected.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-unreachable', reason: 'assumed this cannot work' }] })
+        if (turn === 2) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 3) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+    })
+
+    // The real point of this fix: the model actually clicked and asserted
+    // for real, rather than the run ending on the plan's own premature
+    // "unreachable" claim with zero real actions attempted.
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(run.planStats, undefined, 'the degenerate plan was rejected, so nothing was ever adopted to disclose')
+    assert.equal(run.steps.length, 2)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
 test('runAgent returns a real, honest outcome with prior steps preserved when the LLM provider itself throws mid-run, instead of the run silently vanishing', async (t) => {
   // Real, live-found gap: a sustained Gemini 503 patch made a live per-step
   // provider.complete() call throw after llm/retry.ts's own retry budget
