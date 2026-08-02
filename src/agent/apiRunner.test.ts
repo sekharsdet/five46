@@ -42,6 +42,12 @@ test('runApiTest drives a full create -> saveAs -> read -> delete chain against 
       JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items/{{itemId}}', reason: 'read it back' }),
       JSON.stringify({ action: 'assert_json_path_equals', path: 'name', expected: 'widget', reason: 'confirm it is the same item' }),
       JSON.stringify({ action: 'request', method: 'DELETE', url: server.url + '/items/{{itemId}}', reason: 'clean up' }),
+      // A real assertion after the delete, not just the delete itself —
+      // the delete is a write that happens after the last succeeded
+      // assertion (the read-back one above), so it must be freshly
+      // verified before a "confirm..." goal is allowed to declare done.
+      // See runner.ts/apiRunner.ts's hasSucceededAssertion reset.
+      JSON.stringify({ action: 'assert_status', expected: 204, reason: 'confirm the delete actually succeeded' }),
       JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'confirmed create/read/delete works' }),
     ])
 
@@ -54,11 +60,56 @@ test('runApiTest drives a full create -> saveAs -> read -> delete chain against 
     })
 
     assert.equal(run.outcome, 'goal-reached')
-    assert.equal(run.steps.length, 5)
+    assert.equal(run.steps.length, 6)
     assert.equal(run.steps[0].responseStatus, 201)
     assert.equal(run.steps[2].responseStatus, 200)
     assert.equal(run.steps[4].responseStatus, 204)
     assert.ok(run.steps.every((s) => s.ok))
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest rejects a done claim once a further write has happened since the last succeeded assertion, then accepts it once freshly re-verified', async () => {
+  // Mirrors runner.ts's identical test — see its own doc comment for the
+  // real, live-found bug this closes.
+  const server = await startApiTestServer()
+  try {
+    const create = await fetch(server.url + '/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'widget' }),
+    })
+    const { id } = (await create.json()) as { id: number }
+
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'request', method: 'GET', url: `${server.url}/items/${id}`, reason: 'read it' }),
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm it exists' }),
+      // A further write after the assertion above — the reset must fire
+      // here, before the next turn's done attempt.
+      JSON.stringify({ action: 'request', method: 'PUT', url: `${server.url}/items/${id}`, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'renamed' }), reason: 'update it' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, it existed earlier' }),
+      // Only reached if the done attempt above was correctly rejected.
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 're-confirm after the update' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'freshly re-verified' }),
+    ])
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'read the item, confirm it exists, then rename it',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url, { allowWrites: true }),
+      maxSteps: 10,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    // done itself is never pushed to `steps` (accepted or rejected) — only
+    // real request/assertion actions are. If the first done attempt had
+    // been wrongly accepted, the run would have ended after only 3 steps
+    // (GET, assert, PUT); reaching 4 proves the rejection forced a real
+    // extra re-assertion before a second done was accepted.
+    assert.equal(run.steps.length, 4)
   } finally {
     await server.close()
   }

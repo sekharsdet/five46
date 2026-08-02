@@ -416,6 +416,58 @@ test('runAgent stops with stuck-repeating if a confirmation-requiring goal keeps
   }
 })
 
+test('runAgent rejects a done claim once a further click has happened since the last succeeded assertion, then accepts it once freshly re-verified', async (t) => {
+  // Real, live-found gap: a multi-part goal ("add a record, confirm it
+  // appears, edit it, confirm the update") had its first confirm-clause
+  // succeed, permanently satisfying hasSucceededAssertion, then never
+  // attempted the second clause at all — yet still declared goal-reached.
+  // This reproduces the same shape directly: an assertion succeeds, then a
+  // real state-changing click happens, and a done claim right after that
+  // (with no fresh assertion) must be rejected, not silently accepted on
+  // the strength of the now-stale earlier evidence.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        // A real, further state-changing click after the assertion above —
+        // the reset must fire here, before this next turn's done attempt.
+        if (turn === 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Increment counter'), reason: 'increment it' })
+        if (turn === 4) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, it was visible earlier' })
+        // Only reached if turn 4 was correctly rejected: a fresh
+        // re-verification, then done should finally be accepted.
+        if (turn === 5) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 're-confirm after the click' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'freshly re-verified' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message, confirm it is visible, then increment the counter',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 6, 'the turn-4 done attempt must have been rejected (forcing a real turn 5 and 6), not accepted immediately')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
 test('runAgent stops with stuck-repeating instead of burning the full step budget on a looping agent', async (t) => {
   if (!(await playwrightAvailable())) {
     t.skip('playwright unavailable in this environment')

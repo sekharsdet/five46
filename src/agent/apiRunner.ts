@@ -352,6 +352,12 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
 
     const isAssertion = action.action === 'assert_status' || action.action === 'assert_json_path_exists' || action.action === 'assert_json_path_equals'
     if (isAssertion && result.ok) hasSucceededAssertion = true
+    // Mirrors runner.ts's identical fix — see its own doc comment for the
+    // full reasoning and the real, live-found bug this closes. A successful
+    // write (POST/PUT/PATCH/DELETE) after the last succeeded assertion means
+    // that evidence may no longer reflect the current state; a read (GET/
+    // HEAD/OPTIONS) doesn't change state, so it doesn't invalidate it.
+    else if (action.action === 'request' && result.ok && !SAFE_METHODS.has(action.method)) hasSucceededAssertion = false
     if (!result.ok && isAssertion) {
       return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'assertion-failed' })
     }

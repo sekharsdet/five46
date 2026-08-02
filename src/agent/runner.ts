@@ -468,6 +468,19 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
 
       const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text'
       if (isAssertion && result.ok) hasSucceededAssertion = true
+      // A click/fill after the last succeeded assertion means the page may
+      // have changed since — that assertion no longer necessarily reflects
+      // the *current* state, so it can't keep justifying a later done claim.
+      // Found via a real, live run: a multi-part goal ("add a record,
+      // confirm it appears, edit it, confirm the update") had its first
+      // confirm-clause succeed, permanently satisfying this flag, then
+      // silently never attempted the second clause — the run still declared
+      // goal-reached, since this flag had no way to express "that evidence
+      // is now stale." Same condition already used to update
+      // lastInteractedElement above — click/fill are the only real
+      // state-mutating actions in this engine's vocabulary; scroll/wait
+      // don't change app state and must not reset this.
+      else if ((action.action === 'click' || action.action === 'fill') && result.ok) hasSucceededAssertion = false
       if (!result.ok && isAssertion) {
         return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'assertion-failed' })
       }
