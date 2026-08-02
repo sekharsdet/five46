@@ -1,6 +1,6 @@
 {
   "name": "five46",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Autonomous AI testing agent that verifies your app or API actually works while you're still building it. Give it a plain-English goal, your own LLM key (OpenAI/Anthropic/Gemini/Groq/Bedrock) drives the real thing locally, and a real standalone Playwright/node:test spec is captured as a permanent regression test afterward. Fully local, BYOK, no cloud sandbox.",
   "homepage": "https://github.com/sekharsdet/five46#readme",
   "repository": {
