@@ -115,6 +115,9 @@ export interface ApiTestRun {
   steps: ExecutedApiStep[]
   outcome: RunOutcome
   unparseableResponse?: string
+  /** Same meaning as `TestRun.providerError` — see its own doc comment and
+   * `RunOutcome`'s. */
+  providerError?: string
   /** Same shape/meaning as `TestRun.planStats` — see its own doc comment. */
   planStats?: { plannedSteps: number; fastPathedSteps: number }
 }

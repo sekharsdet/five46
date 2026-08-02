@@ -127,6 +127,20 @@ test('buildApiPlanPrompt includes the goal, the safety disclosure, and the plan 
   assert.ok(prompt.includes('saveAs'))
 })
 
+test('buildApiPlanPrompt warns against declaring goal-unreachable from assumption alone, since a plan is made before any real request has been sent', () => {
+  // Real, live-found gap: rerunning the same CRUD goal against
+  // jsonplaceholder produced a 1-step plan (an immediate "goal-unreachable"
+  // done, never a single real request attempted) in 8.8s, while the live
+  // per-step adaptive loop for the identical goal made real progress (a
+  // real POST + GET) before reaching the same eventual conclusion. The
+  // model had strong training-data priors about this well-known fake API
+  // and short-circuited on them instead of trying — this guidance is the
+  // fix, grounding "unreachable" in "no response exists yet," not opinion.
+  const prompt = buildApiPlanPrompt('goal', READ_ONLY)
+  assert.ok(prompt.includes('no real response yet'))
+  assert.ok(prompt.includes('a guess made now'))
+})
+
 test('parseApiPlan strictly parses a real, well-formed plan response, including a forward {{var}} reference', () => {
   // A later step referencing a value an EARLIER step in the same plan will
   // save is legitimate at plan-parse time — only unresolved at the point a

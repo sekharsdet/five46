@@ -30,6 +30,21 @@ test('formatFailureReport labels an assertion failure as a real finding about th
   assert.ok(report.includes('No root-cause hypothesis'), 'must disclose the missing capability rather than silently omit it')
 })
 
+test('formatFailureReport labels provider-unavailable as a tooling issue, not a finding about the app, and prints the captured error', () => {
+  const run: TestRun = {
+    runId: 'r1d',
+    url: 'http://x',
+    goal: 'g',
+    outcome: 'provider-unavailable',
+    steps: [{ step: 1, action: { action: 'click', ref: 'e1', reason: 'r' }, outline: OUTLINE, ok: true }],
+    providerError: 'Gemini API request failed: 503 Service Unavailable',
+  }
+  const report = formatFailureReport(run)
+  assert.ok(report.includes('not a finding about the app'))
+  assert.ok(report.includes('Gemini API request failed: 503 Service Unavailable'))
+  assert.ok(report.includes('1 step(s) succeeded'), 'the one real step completed before the throw must still be counted')
+})
+
 test('formatFailureReport prints the visible-text artifact path when present, for a human to open directly', () => {
   const run: TestRun = {
     runId: 'r1c',

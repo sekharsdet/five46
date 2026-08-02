@@ -114,7 +114,7 @@ export function buildApiPlanPrompt(goal: string, safety: SafetyMode): string {
     `- {"action":"assert_status","expected":<number>,"reason":"<why>"}`,
     `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"}`,
     `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"}`,
-    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"}`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (a plan is made BEFORE any request has actually been sent — you have no real response yet to judge "unreachable" against, only your own assumptions about how this API probably behaves. Only plan a "goal-unreachable" done step here if the goal itself is genuinely impossible to express as a sequence of requests (e.g. it asks for an operation no reasonable API of this kind would expose at all). If you are just unsure whether the API will actually behave as expected — including a well-known public API you assume you already know — plan the real requests anyway; a live decision later, made against real responses, is what should determine reachability, not a guess made now)`,
     ``,
     `A later step can reference a value an earlier step saved via "saveAs" as {{name}} in its own url/headers/body — plan the chain in order. Keep the plan as short as the goal genuinely requires, and end it with a "done" step.`,
     ``,

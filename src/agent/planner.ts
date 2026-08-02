@@ -275,7 +275,7 @@ export function buildPlanPrompt(goal: string, initialOutline: PageOutline): stri
     `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"} (checks the whole page's visible text, no target needed — use for plain text/headings with no interactive role)`,
     `- {"action":"scroll","direction":"up"|"down","reason":"<why>"}`,
     `- {"action":"wait","reason":"<why>"} (pauses briefly for content that loads asynchronously — a spinner, a skeleton, a delayed page)`,
-    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"}`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (a plan is made BEFORE most of the page has even been seen — you have no real evidence yet to judge "unreachable" against, only your own assumptions about how this site probably works. Only plan a "goal-unreachable" done step here if the goal itself is genuinely impossible to express as a sequence of steps at all. If you are just unsure whether a later page will actually contain what the goal needs, plan the steps anyway; a live decision later, made against the real rendered page, is what should determine reachability, not a guess made now)`,
     ``,
     `"target" is your best prediction, not something you've already verified exists — a later step resolves it against the real page, or falls back and asks you again if nothing matches clearly. Keep the plan as short as the goal genuinely requires, and end it with a "done" step.`,
     ``,

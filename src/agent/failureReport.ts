@@ -129,6 +129,9 @@ export function formatFailureReport(run: TestRun, rootCauseHypothesis?: string):
     lines.push(`--- Run ${run.runId} stopped: the agent repeated the same action twice in a row (tooling issue, not a finding about the app) ---`)
   } else if (run.outcome === 'stopped-by-cap') {
     lines.push(`--- Run ${run.runId} stopped: reached the step limit before finishing (tooling issue, not a finding about the app) ---`)
+  } else if (run.outcome === 'provider-unavailable') {
+    lines.push(`--- Run ${run.runId} stopped: the LLM provider became unavailable mid-run (tooling issue, not a finding about the app) ---`)
+    lines.push(`Error: ${run.providerError ?? '(no detail captured)'}`)
   }
   lines.push(`${successCount} step(s) succeeded before stopping and were written as real code.`, ...healedStepsNote(run), ...videoNote(run), ...planNote(run))
   return lines.join('\n')

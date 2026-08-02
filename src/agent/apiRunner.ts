@@ -232,7 +232,25 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
     if (!action) {
       const validVarNames = new Set(vars.keys())
       const prompt = buildApiActionPrompt(options.goal, history, validVarNames, options.safety)
-      const raw = await options.provider.complete(prompt, options.apiKey)
+      let raw: string
+      try {
+        raw = await options.provider.complete(prompt, options.apiKey)
+      } catch (err) {
+        // Same real, live-found gap as runner.ts's identical catch — see
+        // its own doc comment. llm/retry.ts's own retry budget is already
+        // exhausted by the time this throws; preserving `steps` and
+        // returning a real outcome instead of letting this propagate
+        // uncaught out of runApiTest matches the "never worse off for
+        // having tried" posture already applied everywhere else here.
+        return withPlanStats({
+          runId,
+          baseUrl: options.baseUrl,
+          goal: options.goal,
+          steps,
+          outcome: 'provider-unavailable',
+          providerError: err instanceof Error ? err.message : String(err),
+        })
+      }
       const parsed = parseApiAction(raw, validVarNames, options.safety)
 
       if (!parsed.ok) {

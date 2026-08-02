@@ -38,6 +38,20 @@ test('formatApiFailureReport labels a tooling outcome as such, not a finding abo
   assert.ok(formatApiFailureReport(run).includes('tooling issue'))
 })
 
+test('formatApiFailureReport labels provider-unavailable as a tooling issue and prints the captured error', () => {
+  const run: ApiTestRun = {
+    runId: 'r2b',
+    baseUrl: 'http://x',
+    goal: 'g',
+    outcome: 'provider-unavailable',
+    steps: [],
+    providerError: 'Gemini API request failed: 503 Service Unavailable',
+  }
+  const report = formatApiFailureReport(run)
+  assert.ok(report.includes('tooling issue'))
+  assert.ok(report.includes('Gemini API request failed: 503 Service Unavailable'))
+})
+
 test('formatApiFailureReport discloses structured-plan stats when a plan was used, and omits the line entirely when it was not', () => {
   const withPlan: ApiTestRun = { runId: 'r3', baseUrl: 'http://x', goal: 'g', outcome: 'goal-reached', steps: [], planStats: { plannedSteps: 4, fastPathedSteps: 3 } }
   assert.ok(formatApiFailureReport(withPlan).includes('Structured plan: 4 step(s) planned upfront, 3 executed without a live LLM decision.'))

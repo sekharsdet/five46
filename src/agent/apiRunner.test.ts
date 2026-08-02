@@ -591,3 +591,37 @@ test('runApiTest with useStructuredPlan degrades silently to the full adaptive l
     await server.close()
   }
 })
+
+test('runApiTest returns a real, honest outcome with prior steps preserved when the LLM provider itself throws mid-run, instead of the run silently vanishing', async () => {
+  // Mirrors runner.ts's identical fix — see its own test's doc comment for
+  // the real, live-found gap this closes (a sustained Gemini 503 patch
+  // previously propagated uncaught out of runApiTest, discarding every
+  // step already completed).
+  const server = await startApiTestServer()
+  try {
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        throw new Error('Gemini API request failed: 503 Service Unavailable')
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+    })
+
+    assert.equal(run.outcome, 'provider-unavailable')
+    assert.equal(run.providerError, 'Gemini API request failed: 503 Service Unavailable')
+    assert.equal(run.steps.length, 1, 'the one real step completed before the throw must be preserved, not discarded')
+    assert.equal(run.steps[0].ok, true)
+  } finally {
+    await server.close()
+  }
+})

@@ -286,6 +286,18 @@ test('buildPlanPrompt includes the goal, the initial outline, and the plan JSON 
   assert.ok(prompt.includes('prediction'))
 })
 
+test('buildPlanPrompt warns against declaring goal-unreachable from assumption alone, since a plan is made before any real evidence exists', () => {
+  // Real, live-found gap: a plan-time "unreachable" has nothing but the
+  // model's own assumptions to go on (no request/page has been seen yet),
+  // unlike the live per-step prompt's equivalent guidance which is
+  // explicitly grounded in "the elements list above" / "responses seen so
+  // far." Without this, a model with strong priors about a well-known site
+  // could give up before ever trying anything.
+  const prompt = buildPlanPrompt('reveal the secret message', OUTLINE)
+  assert.ok(prompt.includes('no real evidence yet'))
+  assert.ok(prompt.includes('a guess made now'))
+})
+
 test('parsePlan strictly parses a real, well-formed plan response', () => {
   const raw = JSON.stringify({
     steps: [

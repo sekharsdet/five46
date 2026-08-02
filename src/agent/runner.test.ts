@@ -1303,6 +1303,48 @@ test('runAgent with useStructuredPlan degrades silently to the full adaptive loo
   }
 })
 
+test('runAgent returns a real, honest outcome with prior steps preserved when the LLM provider itself throws mid-run, instead of the run silently vanishing', async (t) => {
+  // Real, live-found gap: a sustained Gemini 503 patch made a live per-step
+  // provider.complete() call throw after llm/retry.ts's own retry budget
+  // was exhausted. Before this fix, that error propagated straight out of
+  // runAgent uncaught, discarding every step already completed. A caller
+  // opting into more steps must never end up worse off for having tried.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        throw new Error('Gemini API request failed: 503 Service Unavailable')
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'provider-unavailable')
+    assert.equal(run.providerError, 'Gemini API request failed: 503 Service Unavailable')
+    assert.equal(run.steps.length, 1, 'the one real step completed before the throw must be preserved, not discarded')
+    assert.equal(run.steps[0].ok, true)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
 test('runAgent rejects an indecisive model trying to "verify" its own click by re-asserting the same element is visible', async (t) => {
   // Regression test for a real, live-observed gap (demoblaze.com): the
   // model clicked a button, then "confirmed" success by asserting that

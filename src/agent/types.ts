@@ -30,8 +30,18 @@ export interface PageOutline {
  * before the agent reached `done` — a real, honest outcome, not hidden
  * behind a generic failure. `'unparseable-response'` means the LLM's
  * response couldn't be safely parsed on some step — stop and say so, never
- * guess at what the model probably meant. */
-export type RunOutcome = 'goal-reached' | 'goal-unreachable' | 'stuck-repeating' | 'stopped-by-cap' | 'unparseable-response' | 'assertion-failed'
+ * guess at what the model probably meant. `'provider-unavailable'` means a
+ * live per-step decision call itself never returned a response at all —
+ * distinct from `'unparseable-response'` (which got a response, just an
+ * unusable one) — after `llm/retry.ts`'s own retry budget (4 attempts) was
+ * already exhausted. Found via a real, live run that hit a sustained
+ * Gemini 503 patch: before this outcome existed, that error propagated
+ * all the way out of `runAgent`/`runApiTest` uncaught, discarding every
+ * step already completed — a caller opting into more steps or
+ * `--structured-plan` must never end up *worse off* than a plain failure
+ * for having tried, the same posture already applied to a malformed plan
+ * response. */
+export type RunOutcome = 'goal-reached' | 'goal-unreachable' | 'stuck-repeating' | 'stopped-by-cap' | 'unparseable-response' | 'assertion-failed' | 'provider-unavailable'
 
 /** One step the agent decided to take. `ref` (when present) must be a ref
  * from the *same* PageOutline the action was decided against — the caller
@@ -178,6 +188,10 @@ export interface TestRun {
   /** Populated when `outcome` is `'unparseable-response'` — the raw text
    * that failed to parse, kept for the failure report. */
   unparseableResponse?: string
+  /** Populated when `outcome` is `'provider-unavailable'` — the underlying
+   * error's message, after `llm/retry.ts`'s own retry budget was already
+   * exhausted. See `RunOutcome`'s own doc comment for the full reasoning. */
+  providerError?: string
   /** Populated when `RunAgentOptions.recordVideo` was set and the
    * recording was actually finalized — see `browser.ts`'s
    * `AgentBrowser.close()`. `ApiTestRun` has no equivalent field: no

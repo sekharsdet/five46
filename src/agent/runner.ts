@@ -323,7 +323,28 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         outline = await snapshot(browser.page, undefined, true)
         const planStepNote = plannedStep && plan ? { index: planStepIndex - 1, total: plan.steps.length, step: plannedStep } : undefined
         const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes, planStepNote)
-        const raw = await options.provider.complete(prompt, options.apiKey)
+        let raw: string
+        try {
+          raw = await options.provider.complete(prompt, options.apiKey)
+        } catch (err) {
+          // llm/retry.ts's own retry budget (4 attempts) is already
+          // exhausted by the time this throws — found via a real, live run
+          // that hit a sustained Gemini 503 patch: before this catch
+          // existed, this error propagated straight out of runAgent
+          // uncaught, discarding every step already completed. Preserving
+          // `steps` here and returning a real, honest outcome instead
+          // matches this codebase's "a caller must never end up worse off
+          // for having tried" posture everywhere else (a malformed plan
+          // response, a recoverable parse rejection, ...).
+          return done({
+            runId,
+            url: options.url,
+            goal: options.goal,
+            steps,
+            outcome: 'provider-unavailable',
+            providerError: err instanceof Error ? err.message : String(err),
+          })
+        }
         const parsed = parseAgentAction(raw, outline, options.allowDeletes ?? false, lastInteractedElement)
 
         if (!parsed.ok) {

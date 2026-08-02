@@ -133,7 +133,13 @@ export function generateAgentSpec(run: TestRun): string {
     if (rendered) lines.push(rendered)
   }
 
-  if (run.outcome === 'assertion-failed' || run.outcome === 'unparseable-response' || run.outcome === 'stuck-repeating' || run.outcome === 'stopped-by-cap') {
+  if (
+    run.outcome === 'assertion-failed' ||
+    run.outcome === 'unparseable-response' ||
+    run.outcome === 'stuck-repeating' ||
+    run.outcome === 'stopped-by-cap' ||
+    run.outcome === 'provider-unavailable'
+  ) {
     lines.push(
       ``,
       `  // This run did not reach "goal-reached" (outcome: ${run.outcome}) — only the`,
