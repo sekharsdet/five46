@@ -115,6 +115,51 @@ test('runApiTest rejects a done claim once a further write has happened since th
   }
 })
 
+test('runApiTest requires a fresh assertion for EACH confirm-clause in a compound goal, not just one for the whole run', async () => {
+  // Mirrors runner.ts's identical test — see countConfirmationClauses' own
+  // doc comment for the real, live-found bug this closes (a compound goal
+  // skipping an earlier confirm-clause entirely, satisfied by one fresh
+  // assertion covering only the last clause).
+  const server = await startApiTestServer()
+  try {
+    const create = await fetch(server.url + '/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'widget' }),
+    })
+    const { id } = (await create.json()) as { id: number }
+
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'request', method: 'GET', url: `${server.url}/items/${id}`, reason: 'read it' }),
+      // Only ONE fresh assertion before the first done attempt — the goal
+      // below asks for two.
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm it exists' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, one check is enough' }),
+      // Only reached if the done attempt above was correctly rejected.
+      JSON.stringify({ action: 'request', method: 'PUT', url: `${server.url}/items/${id}`, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'renamed' }), reason: 'update it' }),
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm the update succeeded' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both things confirmed now' }),
+    ])
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'confirm the item exists, then update it, and confirm the update succeeded',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url, { allowWrites: true }),
+      maxSteps: 10,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    // Real steps only (done is never pushed): GET, assert, PUT, assert = 4.
+    // If the first done attempt (only 1 of 2 required confirmations) had
+    // been wrongly accepted, the run would have ended after only 2 steps.
+    assert.equal(run.steps.length, 4)
+  } finally {
+    await server.close()
+  }
+})
+
 test('runApiTest blocks a write by default without ending the run, recording it as a failed non-fatal step', async () => {
   const server = await startApiTestServer()
   try {

@@ -1,7 +1,7 @@
 import type { LlmProvider } from '../llm/types'
 import { launchAgentBrowser, snapshot, executeAction } from './browser'
 import type { LoginCredentials, StorageState } from './browser'
-import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, requiresConfirmation, isDestructiveClickTarget, resolvePlannedTarget } from './planner'
+import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, resolvePlannedTarget } from './planner'
 import type { AgentAction, AgentPlan, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId } from './runLoop'
 
@@ -125,7 +125,13 @@ function actionSignature(action: AgentAction): string {
 export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
   const runId = makeRunId()
   const maxSteps = Math.min(options.maxSteps ?? DEFAULT_MAX_STEPS, HARD_MAX_STEPS)
-  const needsConfirmation = options.forceConfirmation || requiresConfirmation(options.goal)
+  // forceConfirmation (five46 login only) needs the floor of 1: a login
+  // goal's own text may contain zero confirm-language, yet a real
+  // assertion must still be unconditionally required — deriving the
+  // threshold purely from clause-count would silently compute 0 here and
+  // defeat the whole point of forceConfirmation.
+  const requiredConfirmationCount = options.forceConfirmation ? Math.max(1, countConfirmationClauses(options.goal)) : countConfirmationClauses(options.goal)
+  const needsConfirmation = requiredConfirmationCount > 0
   const credentialsAvailable = options.credentials
     ? { username: Boolean(options.credentials.username), password: Boolean(options.credentials.password) }
     : undefined
@@ -200,6 +206,13 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     // confirmed, not that anything changed — still a real stuck-loop sign.
     let lastActionMadeProgress = false
     let hasSucceededAssertion = false
+    // How many assertions have succeeded across the WHOLE run — unlike
+    // hasSucceededAssertion, never reset by a state change: an earlier
+    // successful confirm still counts toward the total the goal asked for,
+    // even once it's no longer the *freshest* evidence. See
+    // countConfirmationClauses' own doc comment for the real bug this
+    // closes (a compound goal skipping an earlier confirm-clause entirely).
+    let succeededAssertionCount = 0
     // Catches a real gap the signature-repeat guard above misses: a model
     // that keeps re-verifying the same still-unchanged element by
     // alternating assertion types (assert_visible, assert_text,
@@ -398,12 +411,15 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
 
       if (action.action === 'done') {
         lastActionMadeProgress = false
-        const unverifiedSuccess = action.outcome === 'goal-reached' && needsConfirmation && !hasSucceededAssertion
+        const unverifiedSuccess = action.outcome === 'goal-reached' && needsConfirmation && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
         if (unverifiedSuccess) {
           history.push({
             action,
             result: 'failed',
-            detail: 'rejected: this goal asks to confirm/verify something, but no assert_visible/assert_text has succeeded yet — perform one before declaring done',
+            detail:
+              succeededAssertionCount < requiredConfirmationCount
+                ? `rejected: this goal asks to confirm/verify ${requiredConfirmationCount} thing(s), but only ${succeededAssertionCount} assertion(s) have succeeded so far — perform another before declaring done`
+                : 'rejected: this goal asks to confirm/verify something, but no assert_visible/assert_text has succeeded yet — perform one before declaring done',
           })
           continue
         }
@@ -467,7 +483,10 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       })
 
       const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text'
-      if (isAssertion && result.ok) hasSucceededAssertion = true
+      if (isAssertion && result.ok) {
+        hasSucceededAssertion = true
+        succeededAssertionCount++
+      }
       // A click/fill after the last succeeded assertion means the page may
       // have changed since — that assertion no longer necessarily reflects
       // the *current* state, so it can't keep justifying a later done claim.

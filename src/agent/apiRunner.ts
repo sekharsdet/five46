@@ -3,7 +3,7 @@ import type { StorageState } from './browser'
 import { CookieJar, executeApiAction, resolvePlaceholders } from './apiExecutor'
 import type { LastResponse, ApiExecutionContext } from './apiExecutor'
 import { buildApiActionPrompt, buildApiPlanPrompt, checkVarReferences, parseApiAction, parseApiPlan } from './apiPlanner'
-import { requiresConfirmation } from './planner'
+import { countConfirmationClauses } from './planner'
 import { isHostAllowed, isMethodAllowed, effectiveMethod } from './apiTypes'
 import type { ApiAction, ApiHistoryEntry, ApiPlan, ApiTestRun, ExecutedApiStep, HttpMethod, SafetyMode } from './apiTypes'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId } from './runLoop'
@@ -106,7 +106,8 @@ function describeResultDetail(action: ApiAction, result: { responseStatus?: numb
 export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun> {
   const runId = makeRunId()
   const maxSteps = Math.min(options.maxSteps ?? DEFAULT_MAX_STEPS, HARD_MAX_STEPS)
-  const needsConfirmation = requiresConfirmation(options.goal)
+  const requiredConfirmationCount = countConfirmationClauses(options.goal)
+  const needsConfirmation = requiredConfirmationCount > 0
 
   const cookieJar = new CookieJar()
   if (options.storageState) cookieJar.seedFromStorageState(options.storageState.cookies, options.safety.targetOrigin)
@@ -131,6 +132,11 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   // assertion/`done`, all still trip it exactly as before.
   let lastActionMadeProgress = false
   let hasSucceededAssertion = false
+  // How many assertions have succeeded across the WHOLE run — mirrors
+  // runner.ts's identical counter (see countConfirmationClauses' own doc
+  // comment for the real bug this closes). Unlike hasSucceededAssertion,
+  // never reset by a state change.
+  let succeededAssertionCount = 0
   // Catches the API-engine analog of a real gap the signature-repeat guard
   // missed on the browser side (see `assertionCheckKey`'s doc comment).
   // Any `request` resets this, mirroring `runner.ts`'s "any click/fill/
@@ -306,13 +312,15 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
 
     if (action.action === 'done') {
       lastActionMadeProgress = false
-      const unverifiedSuccess = action.outcome === 'goal-reached' && needsConfirmation && !hasSucceededAssertion
+      const unverifiedSuccess = action.outcome === 'goal-reached' && needsConfirmation && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
       if (unverifiedSuccess) {
         history.push({
           action,
           result: 'failed',
           detail:
-            'rejected: this goal asks to confirm/verify something, but no assert_status/assert_json_path_exists/assert_json_path_equals has succeeded yet — perform one before declaring done',
+            succeededAssertionCount < requiredConfirmationCount
+              ? `rejected: this goal asks to confirm/verify ${requiredConfirmationCount} thing(s), but only ${succeededAssertionCount} assertion(s) have succeeded so far — perform another before declaring done`
+              : 'rejected: this goal asks to confirm/verify something, but no assert_status/assert_json_path_exists/assert_json_path_equals has succeeded yet — perform one before declaring done',
         })
         precedingWasSuccessfulRequest = false
         continue
@@ -351,7 +359,10 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
     precedingWasSuccessfulRequest = action.action === 'request' && result.ok
 
     const isAssertion = action.action === 'assert_status' || action.action === 'assert_json_path_exists' || action.action === 'assert_json_path_equals'
-    if (isAssertion && result.ok) hasSucceededAssertion = true
+    if (isAssertion && result.ok) {
+      hasSucceededAssertion = true
+      succeededAssertionCount++
+    }
     // Mirrors runner.ts's identical fix — see its own doc comment for the
     // full reasoning and the real, live-found bug this closes. A successful
     // write (POST/PUT/PATCH/DELETE) after the last succeeded assertion means

@@ -75,6 +75,7 @@ function describeAction(action: AgentAction): string {
 const ACTION_SCHEMA_EXAMPLE = `{"action":"click","ref":"e2","reason":"the goal requires opening the menu first"}`
 
 const CONFIRMATION_PATTERN = /\b(confirm|verify|ensure|make sure|check that)\b/i
+const CONFIRMATION_PATTERN_GLOBAL = new RegExp(CONFIRMATION_PATTERN.source, 'gi')
 
 /** Naming-heuristic detection of "this goal asks for verification," not
  * real NLP — a goal phrased with confirm/verify/ensure/etc. language is
@@ -88,7 +89,22 @@ const CONFIRMATION_PATTERN = /\b(confirm|verify|ensure|make sure|check that)\b/i
  * `goal-reached` claim for a goal shaped this way — same "don't accept an
  * unverified confident claim" posture as everywhere else in this project. */
 export function requiresConfirmation(goal: string): boolean {
-  return CONFIRMATION_PATTERN.test(goal)
+  return countConfirmationClauses(goal) > 0
+}
+
+/** How many confirm/verify/ensure/etc. occurrences the goal's own text
+ * contains — the same heuristic `requiresConfirmation` uses, just counted
+ * instead of merely tested for. Found via a real, live run
+ * (automationintesting.online: "...confirm the price is shown, then click
+ * Next, confirm the calendar changed") that `hasSucceededAssertion`'s own
+ * "reset when stale" fix (see runner.ts) did not catch: the model jumped
+ * straight to one, perfectly *fresh* assertion for the *second* clause and
+ * never attempted the first at all. A single boolean has no way to know
+ * the goal asked for two checks, not one — `runner.ts`/`apiRunner.ts` use
+ * this count as a required minimum number of successful assertions across
+ * the whole run, on top of (not instead of) the existing freshness check. */
+export function countConfirmationClauses(goal: string): number {
+  return (goal.match(CONFIRMATION_PATTERN_GLOBAL) || []).length
 }
 
 /** Phrases tied specifically to irreversible account/data destruction, not

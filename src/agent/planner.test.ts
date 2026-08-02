@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { serializeOutline, buildActionPrompt, parseAgentAction, requiresConfirmation, isDestructiveClickTarget, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
+import { serializeOutline, buildActionPrompt, parseAgentAction, requiresConfirmation, countConfirmationClauses, isDestructiveClickTarget, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
 import { USERNAME_PLACEHOLDER } from './browser'
 import type { PageOutline } from './types'
 
@@ -242,6 +242,21 @@ test('requiresConfirmation recognizes confirm/verify/ensure/check-that/make-sure
 test('requiresConfirmation does not flag a goal with no verification language', () => {
   assert.equal(requiresConfirmation('add a product to the cart'), false)
   assert.equal(requiresConfirmation('log in as a test user'), false)
+})
+
+test('countConfirmationClauses counts occurrences, not just presence, of confirm/verify/etc. language', () => {
+  // Real, live-found gap this enables the fix for: a compound goal with
+  // two confirm-clauses ("...confirm the price is shown, then click Next,
+  // confirm the calendar changed") let the model skip the first one
+  // entirely — a plain boolean has no way to know two checks were asked
+  // for, not one.
+  assert.equal(countConfirmationClauses('add a product to the cart'), 0)
+  assert.equal(countConfirmationClauses('reveal the secret message and confirm it becomes visible'), 1)
+  assert.equal(
+    countConfirmationClauses('confirm the price is shown, then click Next on the calendar, and confirm the calendar now shows a different month'),
+    2
+  )
+  assert.equal(countConfirmationClauses('confirm X, verify Y, and ensure Z'), 3)
 })
 
 test('buildActionPrompt tells the model upfront when a goal requires verification, not just after rejecting it', () => {

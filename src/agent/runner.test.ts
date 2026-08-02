@@ -761,6 +761,98 @@ test('runAgent reports matching baseline/final storageState to onGoalReached whe
   }
 })
 
+test('runAgent with forceConfirmation still requires exactly one real assertion when the goal itself contains zero confirm-language', async (t) => {
+  // Direct test of the Math.max(1, countConfirmationClauses(goal)) floor:
+  // a goal with no "confirm"/"verify"/etc. at all would otherwise compute
+  // a required count of 0, silently defeating forceConfirmation's whole
+  // point (used only by five46 login, where the goal text may not use any
+  // confirm-language even though a real assertion must still be required).
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me' })
+        if (turn === 2) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 3) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'freshly verified' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      forceConfirmation: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 4, 'the turn-1 done attempt must have been rejected despite zero confirm-language in the goal')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent requires a fresh assertion for EACH confirm-clause in a compound goal, not just one for the whole run', async (t) => {
+  // Real, live-found gap: a compound goal (automationintesting.online:
+  // "...confirm the price is shown, then click Next, confirm the
+  // calendar changed") let the model skip the first confirm-clause
+  // entirely and declare done on the strength of one, perfectly fresh
+  // assertion for only the second. See countConfirmationClauses' own doc
+  // comment for the full reasoning.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        // Only ONE fresh assertion before the first done attempt — the
+        // goal below asks for two.
+        if (turn === 1) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Show secret message'), reason: 'confirm the button is there' })
+        if (turn === 2) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, one check is enough' })
+        // Only reached if turn 2 was correctly rejected: a second, real
+        // assertion, satisfying the count this time.
+        if (turn === 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 4) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both things confirmed now' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'confirm the reveal button is present, then click it, and confirm the secret message appears',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 5, 'the turn-2 done attempt (only 1 of 2 required confirmations) must have been rejected, forcing a real second assertion')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
 test('runAgent blocks a real click on a destructive-looking button by default, never actually clicking it', async (t) => {
   if (!(await playwrightAvailable())) {
     t.skip('playwright unavailable in this environment')
