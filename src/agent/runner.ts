@@ -54,6 +54,13 @@ export interface RunAgentOptions {
    * so this gives real-time visibility instead of only a place in the
    * final report. */
   onDestructiveClick?: (elementName: string, reason: string) => void
+  /** Records the whole session as a `.webm` into `artifactDir` — see
+   * `browser.ts`'s `AgentBrowser.close()` doc comment for exactly when the
+   * file is finalized and how its path is recovered. No API-engine
+   * analog — no browser, structurally impossible, matching the existing
+   * "no analog, and that's correct, not a gap" precedent already
+   * established for self-healing selectors. */
+  recordVideo?: boolean
 }
 
 function actionSignature(action: AgentAction): string {
@@ -65,6 +72,12 @@ function actionSignature(action: AgentAction): string {
       return `${action.action}:${action.ref}:${action.value}`
     case 'assert_text':
       return `${action.action}:${action.ref}:${action.expectedText}`
+    case 'scroll':
+      // Up/down must be distinct repeat-buckets, matching how fill/
+      // assert_text already key off their value, not just the action
+      // type — otherwise two consecutive scrolls in opposite directions
+      // would be treated as the same repeated action.
+      return `scroll:${action.direction}`
     case 'done':
       return `done`
   }
@@ -102,7 +115,24 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     ? { username: Boolean(options.credentials.username), password: Boolean(options.credentials.password) }
     : undefined
 
-  const browser = await launchAgentBrowser({ headless: options.headless, storageState: options.storageState })
+  const browser = await launchAgentBrowser({
+    headless: options.headless,
+    storageState: options.storageState,
+    recordVideoDir: options.recordVideo ? options.artifactDir : undefined,
+  })
+  // The video path is only known after teardown (`browser.close()`, in the
+  // `finally` block below), which runs *after* every one of this
+  // function's several `return` statements has already been decided. A
+  // `finally` can't attach a field to an already-returned literal, but it
+  // *can* mutate an object those returns already reference, since `finally`
+  // runs before control actually leaves the function — so every `return`
+  // below goes through this `done()` wrapper instead of a bare object
+  // literal, purely so the `finally` block has something to mutate.
+  let result: TestRun | undefined
+  const done = (run: TestRun): TestRun => {
+    result = run
+    return run
+  }
   try {
     await browser.page.goto(options.url)
     const baselineState = await browser.context.storageState()
@@ -126,9 +156,27 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     // confirmed, not that anything changed — still a real stuck-loop sign.
     let lastActionMadeProgress = false
     let hasSucceededAssertion = false
+    // Catches a real gap the signature-repeat guard above misses: a model
+    // that keeps re-verifying the same still-unchanged element by
+    // alternating assertion types (assert_visible, assert_text,
+    // assert_visible, ...) never produces two *identical* consecutive
+    // signatures, so it evades that guard entirely — confirmed against a
+    // real model in practice, not a hypothetical. Two assertions in a row
+    // on the same ref (e.g. "confirm visible, then confirm the text") is a
+    // completely normal verification pattern and must not trip this; a
+    // third, still on the same ref with nothing else attempted in between,
+    // is genuinely redundant — the page hasn't changed, so re-checking it
+    // again provides no new information. Any click/fill/scroll attempt
+    // resets this, since the model was at least trying to change
+    // something, not purely re-asserting.
+    let repeatedAssertionRef: string | undefined
+    let repeatedAssertionCount = 0
 
     for (let stepNumber = 1; stepNumber <= maxSteps; stepNumber++) {
-      const outline = await snapshot(browser.page)
+      // prioritizeViewport: true here (and only here) — self-healing's own
+      // re-snapshot call in browser.ts deliberately leaves this off. See
+      // snapshot()'s doc comment for why the two must not share this.
+      const outline = await snapshot(browser.page, undefined, true)
       const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes)
       const raw = await options.provider.complete(prompt, options.apiKey)
       const parsed = parseAgentAction(raw, outline, options.allowDeletes ?? false)
@@ -144,7 +192,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
           history.push({ action: parsed.attemptedAction, result: 'failed', detail: parsed.error })
           continue
         }
-        return { runId, url: options.url, goal: options.goal, steps, outcome: 'unparseable-response', unparseableResponse: parsed.raw }
+        return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'unparseable-response', unparseableResponse: parsed.raw })
       }
 
       const { action } = parsed
@@ -155,12 +203,27 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       } else if (signature === lastSignature) {
         repeatCount++
         if (repeatCount >= 2) {
-          return { runId, url: options.url, goal: options.goal, steps, outcome: 'stuck-repeating' }
+          return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'stuck-repeating' })
         }
       } else {
         repeatCount = 0
       }
       lastSignature = signature
+
+      if (action.action === 'assert_visible' || action.action === 'assert_text') {
+        if (action.ref === repeatedAssertionRef) {
+          repeatedAssertionCount++
+          if (repeatedAssertionCount >= 3) {
+            return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'stuck-repeating' })
+          }
+        } else {
+          repeatedAssertionRef = action.ref
+          repeatedAssertionCount = 1
+        }
+      } else if (action.action === 'click' || action.action === 'fill' || action.action === 'scroll') {
+        repeatedAssertionRef = undefined
+        repeatedAssertionCount = 0
+      }
 
       if (action.action === 'done') {
         lastActionMadeProgress = false
@@ -176,7 +239,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         if (action.outcome === 'goal-reached') {
           await options.onGoalReached?.(browser.context, baselineState)
         }
-        return { runId, url: options.url, goal: options.goal, steps, outcome: action.outcome }
+        return done({ runId, url: options.url, goal: options.goal, steps, outcome: action.outcome })
       }
 
       if (action.action === 'click' && options.allowDeletes) {
@@ -185,7 +248,25 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       }
 
       const result = await executeAction(browser.page, action, outline, options.artifactDir, stepNumber, options.credentials)
-      lastActionMadeProgress = (action.action === 'click' || action.action === 'fill') && result.ok
+      // A checkbox/radio click *toggles* state — repeating it is never
+      // progress the way repeating a click on an additive control (a
+      // counter, "Add Element") is; two identical clicks net out to
+      // exactly where it started. Confirmed against a real model in
+      // practice: an indecisive model clicked the same checkbox 8 times in
+      // a row (an even count — the opposite of the goal) before ever
+      // exhausting the step budget, since the general click-repeat
+      // exemption below didn't distinguish the two cases. Excluded from
+      // that exemption here, so two identical clicks on the same
+      // checkbox/radio fall back to the ordinary repeat-guard above.
+      const clickedRole = action.action === 'click' ? outline.elements.find((el) => el.ref === action.ref)?.role : undefined
+      const isToggleControlClick = action.action === 'click' && (clickedRole === 'checkbox' || clickedRole === 'radio')
+      // A scroll that actually moved the page counts as progress the same
+      // way a successful non-toggle click/fill does — a scroll already at
+      // a page boundary still returns ok:true but scrolled:false, and that
+      // must NOT count as progress, or a genuinely stuck no-op scroll
+      // would never trip the guard.
+      const isProgressableClickOrFill = (action.action === 'click' && !isToggleControlClick) || action.action === 'fill'
+      lastActionMadeProgress = (isProgressableClickOrFill && result.ok) || (action.action === 'scroll' && result.scrolled === true)
       steps.push({
         step: stepNumber,
         action,
@@ -212,12 +293,16 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text'
       if (isAssertion && result.ok) hasSucceededAssertion = true
       if (!result.ok && isAssertion) {
-        return { runId, url: options.url, goal: options.goal, steps, outcome: 'assertion-failed' }
+        return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'assertion-failed' })
       }
     }
 
-    return { runId, url: options.url, goal: options.goal, steps, outcome: 'stopped-by-cap' }
+    return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'stopped-by-cap' })
   } finally {
-    await browser.close()
+    const { videoPath } = await browser.close()
+    // `result` is `undefined` only if something above threw rather than
+    // returning normally — in that case there's no TestRun to attach a
+    // video path to, and this is skipped entirely (no new failure mode).
+    if (result && videoPath) result.videoPath = videoPath
   }
 }

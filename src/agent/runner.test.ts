@@ -1,11 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, existsSync, statSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { runAgent } from './runner'
 import { launchAgentBrowser, USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
-import { startFixtureServer } from './testServer'
+import { startFixtureServer, startScrollFixtureServer } from './testServer'
 import { startLoginFixtureServer, LOGIN_FIXTURE_USERNAME, LOGIN_FIXTURE_PASSWORD } from './loginTestServer'
 import type { LlmProvider } from '../llm/types'
 import type { StorageState } from './browser'
@@ -63,6 +63,51 @@ test('runAgent drives a real browser through a real multi-step flow scripted by 
     assert.equal(run.outcome, 'goal-reached')
     assert.equal(run.steps.length, 2)
     assert.ok(run.steps.every((s) => s.ok))
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with recordVideo: true attaches a real, existing videoPath to the returned TestRun', async (t) => {
+  // This is the test that specifically exercises the done()/finally
+  // plumbing: the video path is only known after teardown, inside
+  // runAgent's own `finally` block, well after every `return` statement
+  // has already been decided — this proves that value actually reaches
+  // the caller's TestRun, not just that browser.close() itself works
+  // (already covered directly in browser.test.ts).
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      recordVideo: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(run.videoPath, 'expected a real videoPath on the returned TestRun')
+    assert.ok(existsSync(run.videoPath!), 'expected the video file to actually exist on disk')
+    assert.ok(statSync(run.videoPath!).size > 0, 'expected a nonempty video file')
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })
@@ -599,6 +644,226 @@ test('runAgent performs a real destructive click when allowDeletes is true, and 
     assert.equal(run.outcome, 'goal-reached')
     assert.equal(destructiveClicks.length, 1)
     assert.equal(destructiveClicks[0].name, 'Delete Account')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+function tryRefFor(prompt: string, nameSubstring: string): string | undefined {
+  return prompt.match(new RegExp(`\\[(e\\d+)\\][^\\n]*${nameSubstring}`))?.[1]
+}
+
+test('runAgent allows a goal that legitimately requires several consecutive scroll-down actions, without tripping stuck-repeating', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startScrollFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    // Forces 3 consecutive scroll-down actions before ever clicking —
+    // `isVisible` doesn't filter by viewport (an off-screen element is
+    // already in the outline, and Playwright's own click() would auto-
+    // scroll to it regardless), so this deliberately doesn't make scrolling
+    // it a *precondition* for the click to succeed; it directly tests the
+    // thing that actually matters here: 3 identical `scroll:down` actions
+    // that each genuinely move the page must not trip stuck-repeating,
+    // mirroring the existing "same successful click 3x" precedent test.
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn <= 3) return JSON.stringify({ action: 'scroll', direction: 'down', reason: 'scroll toward the target' })
+        if (turn === 4) {
+          const ref = tryRefFor(prompt, 'Bottom button')
+          if (!ref) throw new Error(`test setup: "Bottom button" not found in prompt:\n${prompt}`)
+          return JSON.stringify({ action: 'click', ref, reason: 'click it' })
+        }
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'scroll down and click the bottom button',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 15,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached', `expected the goal to be reached; run ended with ${run.outcome} after ${run.steps.length} step(s)`)
+    const scrollSteps = run.steps.filter((s) => s.action.action === 'scroll')
+    assert.ok(scrollSteps.length >= 2, `expected at least 2 scroll steps to reach the target, got ${scrollSteps.length}`)
+    assert.ok(scrollSteps.every((s) => s.ok))
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent trips stuck-repeating when scrolling never reveals the target (already at the bottom), never claiming false success', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startScrollFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    // Always scrolls down, never finding (or looking for) any target —
+    // once the page bottoms out, repeated no-op scrolls must eventually
+    // trip stuck-repeating rather than burning the whole step budget.
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        return JSON.stringify({ action: 'scroll', direction: 'down', reason: 'keep scrolling' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'scroll down forever',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 30,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 30, 'must trip the guard well before exhausting the full step budget')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent trips stuck-repeating when an indecisive model alternates assertion types on the same still-unchanged ref, instead of ever declaring done', async (t) => {
+  // Regression test for a real, live finding: Llama 3.3 70B (via Groq)
+  // repeatedly alternated assert_visible/assert_text on the same ref after
+  // already successfully confirming it, never declaring done. Two
+  // *identical* consecutive signatures never occurred (assert_visible and
+  // assert_text are different signatures), so the existing repeat-guard
+  // never caught it.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        const ref = refFor(prompt, 'agentic testing works')
+        // Alternates forever between the two assertion types on the same
+        // ref — never done.
+        return turn % 2 === 0
+          ? JSON.stringify({ action: 'assert_visible', ref, reason: 'check visible' })
+          : JSON.stringify({ action: 'assert_text', ref, expectedText: 'agentic testing works', reason: 'check text' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 15,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 15, 'must trip well before exhausting the step budget')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent allows exactly two different assertion types on the same ref in a row (a normal verify-visible-then-verify-text pattern), without tripping', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'check visible' })
+        if (turn === 3) {
+          return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'agentic testing works'), expectedText: 'agentic testing works', reason: 'check text' })
+        }
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent trips stuck-repeating on a repeatedly-clicked checkbox, unlike a repeatedly-clicked additive control', async (t) => {
+  // Regression test for a real, live finding: an indecisive model clicked
+  // the same checkbox 8 times in a row on a real page
+  // (the-internet.herokuapp.com/checkboxes) before ever exhausting the
+  // step budget — since a checkbox click *toggles* state, an even number
+  // of clicks nets out to no change at all (the opposite of most goals
+  // asking to check one), unlike a repeated click on an additive control
+  // like "Add Element"/increment-btn, which genuinely keeps changing
+  // state each time and legitimately must not trip this guard (see the
+  // test above).
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        const ref = refFor(prompt, 'Subscribe to updates')
+        return JSON.stringify({ action: 'click', ref, reason: 'toggle it' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'check the subscribe checkbox',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 10, 'must trip well before exhausting the step budget, unlike an additive control')
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })

@@ -44,6 +44,11 @@ export type AgentAction =
   | { action: 'fill'; ref: string; value: string; submit?: boolean; reason: string }
   | { action: 'assert_visible'; ref: string; reason: string }
   | { action: 'assert_text'; ref: string; expectedText: string; reason: string }
+  /** Scrolls the whole page (`window`) by one viewport height — never a
+   * specific nested scroll container (a modal's internal `overflow:auto`
+   * region, say). No `ref`: unlike every other action, this doesn't target
+   * a specific element, only a direction. */
+  | { action: 'scroll'; direction: 'up' | 'down'; reason: string }
   | { action: 'done'; outcome: 'goal-reached' | 'goal-unreachable' | 'stuck-repeating'; reason: string }
 
 /** Whether login credentials are configured — *presence only*, never the
@@ -104,4 +109,9 @@ export interface TestRun {
   /** Populated when `outcome` is `'unparseable-response'` — the raw text
    * that failed to parse, kept for the failure report. */
   unparseableResponse?: string
+  /** Populated when `RunAgentOptions.recordVideo` was set and the
+   * recording was actually finalized — see `browser.ts`'s
+   * `AgentBrowser.close()`. `ApiTestRun` has no equivalent field: no
+   * browser, structurally impossible to record a video of. */
+  videoPath?: string
 }

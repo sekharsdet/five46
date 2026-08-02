@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Five46 Scroll Fixture</title></head>
+<body>
+  <button id="top-btn">Top button</button>
+
+  <div style="height: 1400px;"></div>
+
+  <button id="bottom-btn">Bottom button</button>
+  <p id="bottom-status" role="status">Bottom not clicked</p>
+
+  <div style="height: 1400px;"></div>
+
+  <button id="deepest-btn">Deepest button</button>
+  <p id="deepest-status" role="status">Deepest not clicked</p>
+
+  <script>
+    document.getElementById('bottom-btn').addEventListener('click', () => {
+      document.getElementById('bottom-status').textContent = 'Bottom clicked';
+    });
+    document.getElementById('deepest-btn').addEventListener('click', () => {
+      document.getElementById('deepest-status').textContent = 'Deepest clicked';
+    });
+  </script>
+</body>
+</html>

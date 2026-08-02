@@ -34,7 +34,10 @@ export interface StorageState {
 export interface AgentBrowser {
   page: import('playwright').Page
   context: import('playwright').BrowserContext
-  close(): Promise<void>
+  /** Returns the recorded video's path when `recordVideoDir` was set at
+   * launch and the video was actually finalized (best-effort — a video
+   * capture failure here must never itself fail the close). */
+  close(): Promise<{ videoPath?: string }>
 }
 
 export interface LoginCredentials {
@@ -83,6 +86,13 @@ export interface StepExecutionResult {
    * healing logic. */
   healed?: boolean
   healedSelector?: string
+  /** Present only for a `scroll` action — whether the page's scroll
+   * position actually changed. `runner.ts` uses this (not just `ok`) to
+   * decide whether a scroll counts as progress for stuck-repeating
+   * purposes: a scroll already at a page boundary still succeeds (`ok:
+   * true`) but didn't move anything, the same way a click that hits an
+   * already-open dropdown still "succeeds" without changing anything. */
+  scrolled?: boolean
 }
 
 /** Distinguishes the two real, distinct ways a Playwright launch fails —
@@ -114,8 +124,21 @@ function describeUnavailable(err: unknown): string {
  * `newContext({ storageState })` is the only way to start a context already
  * authenticated. A regression test compares `page.viewportSize()`
  * before/after this change to confirm that claim directly rather than trust
- * the doc wording alone. */
-export async function launchAgentBrowser(options?: { headless?: boolean; storageState?: StorageState }): Promise<AgentBrowser> {
+ * the doc wording alone.
+ *
+ * `recordVideoDir`, when set, records the whole session as a `.webm` into
+ * that directory (see `AgentBrowser.close()`'s doc comment for exactly
+ * when the file is finalized and how its path is recovered). The
+ * directory is created *eagerly* here via `mkdirSync` — unlike
+ * `executeAction`'s own *lazy* mkdir-on-failure — because Playwright
+ * needs the directory to already exist before `newContext({ recordVideo
+ * })`, confirmed directly against a real launch rather than assumed from
+ * documentation. */
+export async function launchAgentBrowser(options?: {
+  headless?: boolean
+  storageState?: StorageState
+  recordVideoDir?: string
+}): Promise<AgentBrowser> {
   let playwright: typeof import('playwright')
   try {
     playwright = require('playwright')
@@ -126,14 +149,35 @@ export async function launchAgentBrowser(options?: { headless?: boolean; storage
   }
 
   try {
+    if (options?.recordVideoDir) mkdirSync(options.recordVideoDir, { recursive: true })
     const browser = await playwright.chromium.launch({ headless: options?.headless ?? true })
-    const context = await browser.newContext(options?.storageState ? { storageState: options.storageState } : {})
+    const context = await browser.newContext({
+      ...(options?.storageState ? { storageState: options.storageState } : {}),
+      ...(options?.recordVideoDir ? { recordVideo: { dir: options.recordVideoDir } } : {}),
+    })
     const page = await context.newPage()
     return {
       page,
       context,
       async close() {
+        // Playwright only finalizes/writes a video file to disk on context
+        // close, not `browser.close()` alone — `page.video()` must be read
+        // *before* teardown, and `context.close()` (previously never called
+        // separately here — only `browser.close()` was) must actually run
+        // for the file to be flushed, confirmed via a real regression test
+        // rather than trusted from documentation alone.
+        const video = page.video()
+        await context.close()
         await browser.close()
+        let videoPath: string | undefined
+        if (video) {
+          try {
+            videoPath = await video.path()
+          } catch {
+            // Best-effort — a video-capture failure must never fail close().
+          }
+        }
+        return { videoPath }
       },
     }
   } catch (err) {
@@ -160,6 +204,15 @@ const SNAPSHOT_SCRIPT = `(() => {
     if (el.hasAttribute('hidden')) return false
     if (el.getAttribute('aria-hidden') === 'true') return false
     return true
+  }
+  // Any vertical overlap with the current viewport counts — not "fully
+  // visible," just "at least partially reachable without scrolling."
+  // Reuses the same getBoundingClientRect() call isVisible already makes
+  // conceptually (a fresh call here, since isVisible only returns a
+  // boolean, not the rect itself).
+  function isInViewport(el) {
+    const rect = el.getBoundingClientRect()
+    return rect.bottom > 0 && rect.top < window.innerHeight
   }
   function labelText(el) {
     // Real accessible-name computation, matched at the level this needs
@@ -268,6 +321,7 @@ const SNAPSHOT_SCRIPT = `(() => {
     id: el.id || undefined,
     testId: el.getAttribute('data-testid') || el.getAttribute('data-cy') || el.getAttribute('data-test') || undefined,
     positionalSelector: positionalSelector(el),
+    inViewport: isInViewport(el),
   }))
 })()`
 
@@ -284,6 +338,10 @@ interface RawSnapshotElement {
    * parent, which requires real DOM access `computeSelector` (Node-side)
    * doesn't have. */
   positionalSelector: string
+  /** Whether this element had any vertical overlap with the viewport at
+   * snapshot time — used by `snapshot()`'s `prioritizeViewport` option,
+   * never by anything inside the page context itself. */
+  inViewport: boolean
 }
 
 /** Preference order for a real, working selector, also reused by
@@ -319,16 +377,31 @@ function computeSelector(el: RawSnapshotElement): string {
 /** One `page.evaluate()` round trip to find every visible interactive
  * element, then ref-assignment/selector-computation happens here in Node —
  * never inside the page, and never authored by an LLM. Caps at
- * `maxElements` (document order, so the same page always caps the same way)
- * and discloses truncation explicitly via `PageOutline.truncated` — capping
- * silently would let the agent decide on an incomplete picture of the page
- * without ever knowing that happened. */
-export async function snapshot(page: import('playwright').Page, maxElements = 40): Promise<PageOutline> {
+ * `maxElements` and discloses truncation explicitly via
+ * `PageOutline.truncated` — capping silently would let the agent decide on
+ * an incomplete picture of the page without ever knowing that happened.
+ *
+ * `prioritizeViewport` (default off) sorts in-viewport elements ahead of
+ * off-screen ones before capping — a **stable** sort, so document order is
+ * preserved within each group. Off by default so the cap is otherwise a
+ * plain document-order slice (the same page always caps the same way
+ * regardless of scroll position) — deliberately **not** used by
+ * `executeAction`'s self-healing re-match (see its call site below): if
+ * healing's ambiguity check searched a viewport-reordered list, whether a
+ * duplicate-named element falls inside the cap would depend on current
+ * scroll position instead of page structure, making an already-refused
+ * "ambiguous, won't guess" case silently flip to "one match, heal it"
+ * purely because the second match scrolled off-screen — the caller driving
+ * the agentic loop (`runner.ts`) opts in; healing never does. */
+export async function snapshot(page: import('playwright').Page, maxElements = 40, prioritizeViewport = false): Promise<PageOutline> {
   const raw = (await page.evaluate(SNAPSHOT_SCRIPT)) as RawSnapshotElement[]
 
   const withSelectors = raw.map((el) => ({ ...el, selector: computeSelector(el) }))
+  const ordered = prioritizeViewport
+    ? [...withSelectors].sort((a, b) => (a.inViewport === b.inViewport ? 0 : a.inViewport ? -1 : 1))
+    : withSelectors
 
-  const capped = withSelectors.slice(0, maxElements)
+  const capped = ordered.slice(0, maxElements)
   const elements: OutlineElement[] = capped.map((el, i) => ({
     ref: `e${i + 1}`,
     tag: el.tag,
@@ -387,6 +460,33 @@ export async function executeAction(
   }
 
   if (action.action === 'done') return { ok: true }
+
+  if (action.action === 'scroll') {
+    try {
+      // String-evaluated (like SNAPSHOT_SCRIPT above), not an inline TS
+      // function — this project's tsconfig deliberately has no "dom" lib
+      // (Node-only types; adding it risks colliding with Node's own
+      // global fetch/Headers/Response types this codebase already uses
+      // directly), so browser-context code can't reference `window`
+      // inside an ordinary typed function passed to page.evaluate().
+      //
+      // The object form with an explicit behavior:'instant' bypasses a
+      // page's CSS scroll-behavior:'smooth' entirely — the 2-arg
+      // scrollBy(x, y) form defaults to behavior:'auto', which respects
+      // that CSS, and reading scrollY synchronously right after would see
+      // the animation not yet having run, producing a false "didn't move"
+      // signal on a page that scrolls just fine.
+      const delta = action.direction === 'down' ? 'window.innerHeight' : '-window.innerHeight'
+      const scrolled = (await page.evaluate(`(() => {
+        const before = window.scrollY
+        window.scrollBy({ top: ${delta}, left: 0, behavior: 'instant' })
+        return window.scrollY !== before
+      })()`)) as boolean
+      return { ok: true, scrolled }
+    } catch (err) {
+      return fail(err instanceof Error ? err.message.split('\n')[0] : String(err))
+    }
+  }
 
   const el = resolve(outline, action.ref)
   if (!el) return fail(`ref "${action.ref}" not found in this turn's outline`)

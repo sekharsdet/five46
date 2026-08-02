@@ -10,7 +10,11 @@ function selectorFor(step: ExecutedStep): string | undefined {
   // find nothing or resolve to an unrelated element.
   if (step.resolvedSelector) return step.resolvedSelector
   const action = step.action
-  if (action.action === 'done') return undefined
+  // Neither has a ref/selector at all — `renderStep` intercepts `scroll`
+  // before ever calling this, but the guard is required here regardless
+  // for the discriminated-union narrowing below to type-check: `scroll`
+  // has no `.ref` field.
+  if (action.action === 'done' || action.action === 'scroll') return undefined
   return step.outline.elements.find((el) => el.ref === action.ref)?.selector
 }
 
@@ -54,9 +58,17 @@ function renderCredentialAwareExpression(value: string): string {
  * back to five46's own ref/outline machinery, which only exists to keep
  * the LLM from authoring its own selectors during the run itself. */
 function renderStep(step: ExecutedStep): string | undefined {
+  // scroll has no selector at all — handled before selectorFor, not as one
+  // of its branches, since selectorFor's whole job is finding *a* selector
+  // for the step's target and scroll has none.
+  if (step.action.action === 'scroll') {
+    const top = step.action.direction === 'down' ? 'window.innerHeight' : '-window.innerHeight'
+    return `  await page.evaluate(() => window.scrollBy({ top: ${top}, left: 0, behavior: 'instant' }))`
+  }
+
   const selector = selectorFor(step)
   if (!selector) return undefined
-  const action = step.action as Exclude<AgentAction, { action: 'done' }>
+  const action = step.action as Exclude<AgentAction, { action: 'done' | 'scroll' }>
   const sel = JSON.stringify(selector)
 
   switch (action.action) {

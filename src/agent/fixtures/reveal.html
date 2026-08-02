@@ -32,6 +32,14 @@
   <button id="delete-account-btn">Delete Account</button>
   <p id="delete-status" role="status">Account active</p>
 
+  <!-- Used by runner.test.ts to verify a real, live-found bug: clicking a
+       checkbox *toggles* it, so unlike an additive control (increment-btn
+       above), two clicks on the same checkbox net out to no change at
+       all — repeating it must never count as "progress" the way a
+       repeated successful click on increment-btn legitimately does. -->
+  <input id="subscribe-checkbox" type="checkbox" />
+  <label for="subscribe-checkbox">Subscribe to updates</label>
+
   <script>
     document.getElementById('reveal-btn').addEventListener('click', () => {
       document.getElementById('secret').hidden = false;

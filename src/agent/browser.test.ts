@@ -1,10 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync } from 'fs'
+import { mkdtempSync, rmSync, existsSync, statSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders, USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
-import { startFixtureServer } from './testServer'
+import { startFixtureServer, startScrollFixtureServer } from './testServer'
 import { startLoginFixtureServer, LOGIN_FIXTURE_USERNAME, LOGIN_FIXTURE_PASSWORD } from './loginTestServer'
 import type { AgentBrowser } from './browser'
 
@@ -120,6 +120,41 @@ test('snapshot computes a positional selector that is actually unique and resolv
 
     const visible = await browser.page.locator(target!.selector).first().isVisible()
     assert.equal(visible, true)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot with prioritizeViewport surfaces an off-screen element only once scrolled into view, unlike the plain document-order cap', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <button id="a">Top button</button>
+      <div style="height: 3000px;"></div>
+      <button id="b">Bottom button</button>
+    `)
+
+    // maxElements: 1, so the cap genuinely has to choose between the two —
+    // at the top of the page, both the prioritized and plain cap agree.
+    const atTop = await snapshot(browser.page, 1, true)
+    assert.equal(atTop.elements[0]?.name, 'Top button')
+
+    // Scroll down until the bottom button is actually in the viewport —
+    // bounded loop, robust to whatever the real test viewport height is.
+    for (let i = 0; i < 20; i++) {
+      const current = await snapshot(browser.page, 1, true)
+      if (current.elements[0]?.name === 'Bottom button') break
+      await browser.page.evaluate(`window.scrollBy({ top: window.innerHeight, left: 0, behavior: 'instant' })`)
+    }
+    const afterScroll = await snapshot(browser.page, 1, true)
+    assert.equal(afterScroll.elements[0]?.name, 'Bottom button', 'prioritizeViewport must surface the now-on-screen element once capped to 1')
+
+    // The plain document-order cap must NOT depend on scroll position at
+    // all — still "Top button" even after scrolling all the way down,
+    // confirming the difference above is really due to prioritizeViewport.
+    const unprioritized = await snapshot(browser.page, 1, false)
+    assert.equal(unprioritized.elements[0]?.name, 'Top button')
   } finally {
     await browser.close()
   }
@@ -248,6 +283,90 @@ test('executeAction refuses to heal when re-matching by name finds more than one
     assert.equal(clickedId, undefined, 'must never guess which ambiguous candidate to click')
   } finally {
     await browser.close()
+  }
+})
+
+test('executeAction never lets self-healing\'s ambiguity check depend on current scroll position', async (t) => {
+  // The direct regression test for a design-review finding: if healing's
+  // re-match snapshot used the same viewport-priority ordering the main
+  // agentic loop opts into, an off-screen duplicate could silently fall
+  // out of the (still 40-max) capped candidate list purely because of
+  // where the page happened to be scrolled — flipping a correct "2
+  // ambiguous candidates, refuse" into an incorrect "1 match, heal it."
+  // `original-btn` here is fixed-position (always "in-viewport" by
+  // definition), `far-delete` starts genuinely off-screen, and 40 filler
+  // buttons (also fixed-position, so always in-viewport) push the total
+  // past the 40-element cap — exactly the shape that would expose the bug
+  // if the heal path used prioritizeViewport. It must not.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <button id="original-btn" style="position:fixed;top:0;left:0;">Delete</button>
+      <div style="height: 3000px;"></div>
+      <button id="far-delete">Delete</button>
+      <div id="fillers"></div>
+      <script>
+        const fillers = document.getElementById('fillers')
+        for (let i = 0; i < 40; i++) {
+          const b = document.createElement('button')
+          b.textContent = 'Filler'
+          b.style.position = 'fixed'
+          b.style.top = '0px'
+          b.style.left = (i + 2) + 'px'
+          b.style.width = '1px'
+          b.style.height = '1px'
+          fillers.appendChild(b)
+        }
+      </script>
+    `)
+    const outline = await snapshot(browser.page)
+    const ref = outline.elements.find((el) => el.name === 'Delete')!.ref
+
+    // Rename the id so the outline's original selector ([id="original-btn"])
+    // goes stale (0 matches), forcing a heal re-match by (tag, role, name)
+    // — the page is still scrolled to the very top, so `far-delete` is
+    // genuinely off-screen at this exact moment.
+    await browser.page.evaluate(`document.getElementById('original-btn').id = 'renamed'`)
+
+    const result = await executeAction(
+      browser.page,
+      { action: 'click', ref, reason: 'test' },
+      outline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      1
+    )
+    assert.equal(result.ok, false)
+    assert.match(result.failureDetail ?? '', /ambiguous/, `expected an honest ambiguous-refusal, got: ${result.failureDetail}`)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('executeAction scroll actually moves the page and reports scrolled:true, then honestly reports scrolled:false once at the bottom', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startScrollFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+
+    const first = await executeAction(browser.page, { action: 'scroll', direction: 'down', reason: 'r' }, outline, artifactDir, 1)
+    assert.equal(first.ok, true)
+    assert.equal(first.scrolled, true)
+
+    // Keep scrolling down until it genuinely stops moving anything —
+    // bounded loop, robust to the real fixture/viewport height.
+    let last = first
+    for (let i = 0; i < 30 && last.scrolled; i++) {
+      last = await executeAction(browser.page, { action: 'scroll', direction: 'down', reason: 'r' }, outline, artifactDir, 1)
+    }
+    assert.equal(last.scrolled, false, 'a scroll already at the page boundary must honestly report no movement')
+    assert.equal(last.ok, true, 'a no-op scroll at a boundary is not itself a failure')
+  } finally {
+    await browser.close()
+    await server.close()
   }
 })
 
@@ -488,5 +607,46 @@ test('launchAgentBrowser uses the same default viewport with or without the expl
     assert.ok(viewport && viewport.width > 0 && viewport.height > 0, 'expected a real, non-empty default viewport')
   } finally {
     await browser.close()
+  }
+})
+
+test('launchAgentBrowser with recordVideoDir records a real, nonempty .webm on close', async (t) => {
+  // Regression test for the highest-risk edit in the --record-video
+  // feature: close() must actually call context.close() (not just
+  // browser.close()) for Playwright to finalize/flush the video file —
+  // verified against a real Chromium recording, not assumed from docs.
+  const videoDir = mkdtempSync(join(tmpdir(), 'five46-video-test-'))
+  let browser: AgentBrowser
+  try {
+    browser = await launchAgentBrowser({ headless: true, recordVideoDir: videoDir })
+  } catch (err) {
+    t.skip(`playwright unavailable in this environment: ${err instanceof Error ? err.message : String(err)}`)
+    rmSync(videoDir, { recursive: true, force: true })
+    return
+  }
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    await browser.page.locator('#reveal-btn').click()
+    const { videoPath } = await browser.close()
+    assert.ok(videoPath, 'expected a real video path to be returned')
+    assert.ok(existsSync(videoPath!), 'expected the video file to actually exist on disk')
+    assert.ok(statSync(videoPath!).size > 0, 'expected a nonempty video file, not just an empty placeholder')
+  } finally {
+    await server.close()
+    rmSync(videoDir, { recursive: true, force: true })
+  }
+})
+
+test('launchAgentBrowser without recordVideoDir returns no videoPath on close — the feature is opt-in', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const { videoPath } = await browser.close()
+    assert.equal(videoPath, undefined)
+  } finally {
+    await server.close()
   }
 })

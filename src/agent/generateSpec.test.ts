@@ -28,6 +28,28 @@ test('generateAgentSpec renders real, standalone Playwright code for successful 
   assert.ok(spec.includes('frozen recording'), 'must disclose non-determinism in the header')
 })
 
+test('generateAgentSpec renders a scroll step as real, standalone Playwright code, not silently dropped', () => {
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'scroll', direction: 'down', reason: 'reach the target' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true },
+    { step: 2, action: { action: 'click', ref: 'e1', reason: 'click it' }, outline: outlineWith('e1', '#bottom-btn'), ok: true },
+  ]
+  const run: TestRun = { runId: 'abc123', url: 'http://localhost:1234', goal: 'scroll and click', steps, outcome: 'goal-reached' }
+
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes("window.scrollBy({ top: window.innerHeight, left: 0, behavior: 'instant' })"))
+  assert.ok(spec.includes('await page.locator("#bottom-btn").click()'), 'the step after the scroll must still render too')
+})
+
+test('generateAgentSpec renders an upward scroll with a negated delta', () => {
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'scroll', direction: 'up', reason: 'back to the top' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true },
+  ]
+  const run: TestRun = { runId: 'abc123', url: 'http://localhost:1234', goal: 'scroll up', steps, outcome: 'goal-reached' }
+
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes("window.scrollBy({ top: -window.innerHeight, left: 0, behavior: 'instant' })"))
+})
+
 test('generateAgentSpec still writes the steps that succeeded before a failure, with an honest note about the outcome', () => {
   const steps: ExecutedStep[] = [
     { step: 1, action: { action: 'click', ref: 'e1', reason: 'open' }, outline: outlineWith('e1', '#reveal-btn'), ok: true },

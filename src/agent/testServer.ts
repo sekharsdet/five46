@@ -6,14 +6,14 @@ import { join } from 'path'
  * serving `fixtures/reveal.html` — used by `browser.test.ts`/`runner.test.ts`
  * to drive a real Playwright browser against a real page, matching this
  * project's "mock only the true external boundary" testing norm. */
-export function startFixtureServer(): Promise<{ url: string; close: () => Promise<void> }> {
+function startStaticFixtureServer(fixtureFile: string): Promise<{ url: string; close: () => Promise<void> }> {
   // `.html` isn't compiled by tsc, so it stays at its source location even
   // when this file runs from `dist/` (tsconfig's rootDir:src/outDir:dist
   // mirror each other 1:1, so `../../src/agent/fixtures` from `dist/agent`
   // lands back on the real source file) — same reason `examples/*.tsx`
   // fixtures get referenced with `../../` from every test file's `dist/`
   // location rather than expecting a copy inside `dist/`.
-  const html = readFileSync(join(__dirname, '..', '..', 'src', 'agent', 'fixtures', 'reveal.html'), 'utf8')
+  const html = readFileSync(join(__dirname, '..', '..', 'src', 'agent', 'fixtures', fixtureFile), 'utf8')
   const server = http.createServer((_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html' })
     res.end(html)
@@ -28,4 +28,16 @@ export function startFixtureServer(): Promise<{ url: string; close: () => Promis
       })
     })
   })
+}
+
+export function startFixtureServer(): Promise<{ url: string; close: () => Promise<void> }> {
+  return startStaticFixtureServer('reveal.html')
+}
+
+/** Serves `fixtures/scroll.html` — a page taller than one viewport, used by
+ * `runner.test.ts`/`browser.test.ts` to test the `scroll` action and
+ * viewport-priority snapshot capping against a real, real-scrolling
+ * browser. */
+export function startScrollFixtureServer(): Promise<{ url: string; close: () => Promise<void> }> {
+  return startStaticFixtureServer('scroll.html')
 }
