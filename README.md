@@ -5,9 +5,9 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![node](https://img.shields.io/node/v/five46.svg)](https://www.npmjs.com/package/five46)
 
-**AI-powered, BYOK, fully local agentic E2E and API testing for Playwright — no cloud sandbox, no data leaving your machine except the LLM call itself.**
+**An autonomous AI testing agent that verifies your app or API actually works while you're still building it — fully local, using your own LLM key.**
 
-Point five46 at a real running page (or API) and a plain-English goal — "log in and confirm the dashboard loads," "create a user via POST, then confirm it via GET." An LLM — using your own OpenAI, Anthropic, Gemini, Groq, or AWS Bedrock key — drives a real local Playwright browser or real HTTP requests toward that goal, one action at a time, and writes a real, standalone, re-runnable Playwright (or `node:test`) spec on success. No five46, no LLM, and no network call back to us involved in re-running the generated test — it's just ordinary Playwright code you own outright.
+You just changed something, and you want to know — right now, against the real running thing — whether it actually works, without first writing a test yourself. Give five46 a plain-English goal — "log in and confirm the dashboard loads," "create a user via POST, then confirm it via GET" — and an LLM, using your own OpenAI, Anthropic, Gemini, Groq, or AWS Bedrock key, drives your real app or real API, one real action at a time, and tells you honestly whether it worked, with a root-cause hypothesis if it didn't. Once it does, that exact run is captured as a real, standalone Playwright (or `node:test`) spec you keep — so the same check that helped you while you were building the feature becomes a permanent regression test afterward, with no five46 or LLM involved in ever running it again.
 
 > **Status:** early proof of concept, verified end-to-end against real live LLM keys across dozens of real-world sites and APIs.
 
@@ -15,7 +15,9 @@ If five46 is useful to you, a ⭐ on [GitHub](https://github.com/sekharsdet/five
 
 ## Why five46, and how it's different
 
-Most AI-driven test-generation tools run in a cloud sandbox: your app's traffic, screenshots, and DOM leave your machine and go through a third-party service you don't control. five46 is the opposite bet — **everything runs on your laptop**, using a key you already pay for, and the *only* thing that ever leaves your machine is the text sent to your chosen LLM provider on each step (always disclosed, never hidden). If your organization can't adopt a cloud-hosted AI testing platform for compliance or trust reasons, this is built for exactly that constraint.
+Most testing tools assume you already have a suite to run. five46 is built for the moment *before* that — mid-feature, before a test exists at all. Point it at what you're building, describe the outcome you expect in plain English, and keep re-running it as you keep changing code; once it's solid, the run it just did becomes your regression test, not a separate thing you write afterward.
+
+Most AI-driven test-generation tools also run in a cloud sandbox: your app's traffic, screenshots, and DOM leave your machine and go through a third-party service you don't control. five46 is the opposite bet — **everything runs on your laptop**, using a key you already pay for, and the *only* thing that ever leaves your machine is the text sent to your chosen LLM provider on each step (always disclosed, never hidden). If your organization can't adopt a cloud-hosted AI testing platform for compliance or trust reasons, this is built for exactly that constraint.
 
 It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` file you can read, diff, commit to your repo, and run in CI with plain `npx playwright test` — no vendor lock-in, no proprietary runner.
 
@@ -25,11 +27,11 @@ It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` fil
   Bedrock. Your key, your usage, your cost.
 - **Fully local** — no cloud sandbox, no tunneling for local dev servers.
   Nothing but the LLM calls ever leaves your machine.
+- **Browser and API testing** — drive a real Chromium browser, or drive
+  real HTTP requests directly, from the same agentic engine.
 - **Real, standalone output** — every successful run writes a plain
   Playwright `.spec.ts` (or `node:test` script for API tests) you can
   re-run any time, with no five46 or LLM involved.
-- **Browser and API testing** — drive a real Chromium browser, or drive
-  real HTTP requests directly, from the same agentic engine.
 - **Session reuse** — log in once, capture the session, reuse it across
   runs without paying the LLM cost of logging in every time.
 - **Self-healing selectors** — a stale selector gets one bounded, disclosed
@@ -109,6 +111,37 @@ config, which is useful for CI:
 export FIVE46_LLM_PROVIDER=openai   # or: anthropic, gemini, groq, bedrock
 export FIVE46_LLM_API_KEY=sk-...    # for bedrock, use your AWS region instead
 ```
+
+### Getting a key
+
+Don't have a key yet? Pick whichever's easiest to get, or whichever you
+already use — five46 calls one small, cheap model per provider on every
+step (never a "flagship" model), so per-run cost is low regardless of
+which one you pick:
+
+| Provider | Get a key at | Notes |
+|---|---|---|
+| **Gemini** | [aistudio.google.com](https://aistudio.google.com/apikey) → "Get API key" | Free tier, no credit card required — the fastest path to a first successful run. |
+| **Groq** | [console.groq.com/keys](https://console.groq.com/keys) → "Create API Key" | Free tier, no credit card required, generous rate limits. |
+| **OpenAI** | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) → "Create new secret key" | Account creation is free, but a key can't make real calls until you add a payment method — no meaningful free tier. |
+| **Anthropic** | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) → "Create Key" | Same shape as OpenAI — you can browse the console for free, but need billing set up before a key actually works. |
+| **AWS Bedrock** | No key — see below | Uses your existing AWS credentials instead of an API key. |
+
+The model each provider calls: `gpt-4o-mini` (OpenAI), `claude-3-5-haiku-latest`
+(Anthropic), `gemini-flash-latest` (Gemini), `llama-3.3-70b-versatile` (Groq),
+`anthropic.claude-3-5-haiku-20241022-v1:0` (Bedrock).
+
+**AWS Bedrock is different — there's no key to paste in:**
+
+1. In the [Bedrock console](https://console.aws.amazon.com/bedrock/home) →
+   **Model access**, request/enable access to the Claude model above, in
+   the region you plan to use.
+2. Make sure AWS credentials are available the normal way — five46 relies
+   on the standard AWS SDK credential chain, same as the AWS CLI:
+   `aws configure`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, or
+   an IAM role.
+3. Run `five46 config`, choose `bedrock`, and enter your **region**
+   (e.g. `us-east-1`) when prompted — not a key.
 
 ## Quick start
 
