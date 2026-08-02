@@ -1,5 +1,6 @@
 import type { LlmProvider } from './types'
 import { describeApiError, LlmHttpError } from './httpError'
+import { fetchWithTimeout } from './fetchWithTimeout'
 
 /** Google's Generative Language API —
  * https://ai.google.dev/api/generate-content. Request shape confirmed
@@ -25,7 +26,7 @@ import { describeApiError, LlmHttpError } from './httpError'
 export const geminiProvider: LlmProvider = {
   id: 'gemini',
   async complete(prompt, apiKey) {
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
         method: 'POST',

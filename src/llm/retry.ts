@@ -2,15 +2,24 @@ import type { LlmProvider } from './types'
 import { LlmHttpError } from './httpError'
 
 export interface RetryOptions {
-  /** Default 3 — the first attempt plus 2 real retries. */
+  /** Default 4 — the first attempt plus 3 real retries. Raised from an
+   * original default of 3 after live testing against
+   * automationintesting.online: with each attempt now individually bounded
+   * by `fetchWithTimeout`'s 30s cap (see that file's own doc comment), 3
+   * consecutive attempts landing on Gemini's rare 30s+ tail-latency outliers
+   * back-to-back is unlikely but real — observed live, once, in the same
+   * session this cap was added. Real per-call latency samples from that
+   * same run (post-fix, uninstrumented) were 3-8s, so a 4th attempt costs
+   * little in the common case while meaningfully improving the odds of
+   * surviving a bad streak instead of failing the whole run outright. */
   maxAttempts?: number
   /** Default 1000ms. */
   baseDelayMs?: number
-  /** Default 8000ms — dead at the default `maxAttempts` of 3 (only two
-   * waits ever happen: 1s, then 2s), only relevant if a caller raises
-   * `maxAttempts` past 4. Kept as a real cap rather than removed, since a
-   * future caller (MCP progress-streaming, say) may reasonably want more
-   * attempts without an unbounded wait between them. */
+  /** Default 8000ms — dead at the default `maxAttempts` of 4 (three waits
+   * ever happen: 1s, 2s, 4s), only relevant if a caller raises `maxAttempts`
+   * past 5. Kept as a real cap rather than removed, since a future caller
+   * (MCP progress-streaming, say) may reasonably want more attempts without
+   * an unbounded wait between them. */
   maxDelayMs?: number
   /** Fired once per retry, right before the wait — never fired on the
    * final, non-retried failure (there's nothing to wait for at that
@@ -72,7 +81,13 @@ export function isRetryableLlmError(err: unknown): boolean {
     if (typeof httpStatusCode === 'number' && (httpStatusCode === 429 || httpStatusCode >= 500)) return true
     const name = (err as { name?: unknown }).name
     if (typeof name === 'string' && RETRYABLE_AWS_EXCEPTION_NAMES.has(name)) return true
-    if (name === 'AbortError') return true
+    // 'AbortError': a manually-aborted fetch. 'TimeoutError': what a fetch
+    // actually rejects with when aborted by `AbortSignal.timeout()`
+    // specifically (per WHATWG spec, not the generic abort name), and also
+    // what @smithy/node-http-handler's own requestTimeout throws (Bedrock) —
+    // both are the timeout added in fetchWithTimeout.ts/bedrock.ts, and both
+    // must be retried the same way a slow-but-erroring request would be.
+    if (name === 'AbortError' || name === 'TimeoutError') return true
     const code = (err as { cause?: { code?: unknown } }).cause?.code
     if (typeof code === 'string' && RETRYABLE_NETWORK_ERROR_CODES.has(code)) return true
   }
@@ -87,7 +102,7 @@ export function isRetryableLlmError(err: unknown): boolean {
  * outright with zero retry. Same `id`, so nothing that keys off
  * `provider.id` (a printed banner, say) can tell the difference. */
 export function withRetry(provider: LlmProvider, options?: RetryOptions): LlmProvider {
-  const maxAttempts = options?.maxAttempts ?? 3
+  const maxAttempts = options?.maxAttempts ?? 4
   const baseDelayMs = options?.baseDelayMs ?? 1000
   const maxDelayMs = options?.maxDelayMs ?? 8000
   const sleep = options?.sleep ?? defaultSleep

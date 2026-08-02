@@ -1,5 +1,6 @@
 import type { LlmProvider } from './types'
 import { describeApiError, LlmHttpError } from './httpError'
+import { fetchWithTimeout } from './fetchWithTimeout'
 
 /** Anthropic's Messages API — https://docs.anthropic.com/en/api/messages.
  * Shape verified against public API docs, not a live call (no test key
@@ -7,7 +8,7 @@ import { describeApiError, LlmHttpError } from './httpError'
 export const anthropicProvider: LlmProvider = {
   id: 'anthropic',
   async complete(prompt, apiKey) {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

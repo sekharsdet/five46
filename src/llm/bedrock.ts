@@ -1,5 +1,6 @@
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime'
 import type { LlmProvider } from './types'
+import { DEFAULT_LLM_TIMEOUT_MS } from './fetchWithTimeout'
 
 /**
  * AWS Bedrock — many enterprises specifically mandate Bedrock rather than
@@ -35,7 +36,11 @@ export const bedrockProvider: LlmProvider = {
     // across all 5 providers uniformly, instead of Bedrock silently getting
     // up to 3x the retries (with two independent backoff schedules) that
     // every other provider gets.
-    const client = new BedrockRuntimeClient({ region, maxAttempts: 1 })
+    // requestHandler: a plain options object here (not a NodeHttpHandler
+    // instance) — the SDK resolves it into one internally, avoiding a direct
+    // dependency on @smithy/node-http-handler, which this package only pulls
+    // in transitively through @aws-sdk/client-bedrock-runtime.
+    const client = new BedrockRuntimeClient({ region, maxAttempts: 1, requestHandler: { requestTimeout: DEFAULT_LLM_TIMEOUT_MS } })
     const command = new ConverseCommand({
       modelId: 'anthropic.claude-3-5-haiku-20241022-v1:0',
       messages: [{ role: 'user', content: [{ text: prompt }] }],

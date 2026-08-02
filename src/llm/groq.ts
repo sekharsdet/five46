@@ -1,5 +1,6 @@
 import type { LlmProvider } from './types'
 import { describeApiError, LlmHttpError } from './httpError'
+import { fetchWithTimeout } from './fetchWithTimeout'
 
 /** Groq's Chat Completions API — OpenAI-compatible request/response shape
  * (https://console.groq.com/docs/openai), just a different base URL and
@@ -15,7 +16,7 @@ import { describeApiError, LlmHttpError } from './httpError'
 export const groqProvider: LlmProvider = {
   id: 'groq',
   async complete(prompt, apiKey) {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const response = await fetchWithTimeout('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

@@ -45,6 +45,10 @@ test('isRetryableLlmError recognizes a real network-level failure (connection re
   assert.equal(isRetryableLlmError({ cause: { code: 'EPIPE' } }), false)
 })
 
+test('isRetryableLlmError recognizes TimeoutError — what fetch actually throws for AbortSignal.timeout(), and what Bedrock\'s node-http-handler throws for its own requestTimeout', () => {
+  assert.equal(isRetryableLlmError({ name: 'TimeoutError' }), true)
+})
+
 test('isRetryableLlmError never retries a plain, unrecognized Error — safe default', () => {
   assert.equal(isRetryableLlmError(new Error('something went wrong')), false)
   assert.equal(isRetryableLlmError('a plain string, not even an object'), false)

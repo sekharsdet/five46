@@ -31,3 +31,27 @@ test('bedrockProvider sends a Converse API request and parses the text content b
     BedrockRuntimeClient.prototype.send = originalSend
   }
 })
+
+// Real, live testing found every fetch-based provider hanging indefinitely
+// on a slow upstream response with no timeout — bedrockProvider is the one
+// provider that can't go through `fetchWithTimeout` (it doesn't call
+// `fetch` directly at all; the AWS SDK owns the transport), so it needs its
+// own equivalent bound via the SDK's own `requestHandler.requestTimeout`.
+test('bedrockProvider configures its own request timeout via the SDK requestHandler, matching the timeout every fetch-based provider gets', async () => {
+  const originalSend = BedrockRuntimeClient.prototype.send
+  let capturedClient: BedrockRuntimeClient | undefined
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  BedrockRuntimeClient.prototype.send = (async function (this: BedrockRuntimeClient) {
+    capturedClient = this
+    return { output: { message: { content: [{ text: 'ok' }] } } }
+  }) as any
+
+  try {
+    await bedrockProvider.complete('hi', 'us-east-1')
+    const resolvedHandlerConfig = await (capturedClient!.config as unknown as { requestHandler: { configProvider: Promise<{ requestTimeout?: number }> } })
+      .requestHandler.configProvider
+    assert.equal(resolvedHandlerConfig.requestTimeout, 30000)
+  } finally {
+    BedrockRuntimeClient.prototype.send = originalSend
+  }
+})

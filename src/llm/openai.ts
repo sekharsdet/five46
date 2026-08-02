@@ -1,5 +1,6 @@
 import type { LlmProvider } from './types'
 import { describeApiError, LlmHttpError } from './httpError'
+import { fetchWithTimeout } from './fetchWithTimeout'
 
 /** OpenAI's Chat Completions API — https://platform.openai.com/docs/api-reference/chat.
  * Shape verified against public API docs, not a live call (no test key
@@ -9,7 +10,7 @@ import { describeApiError, LlmHttpError } from './httpError'
 export const openAiProvider: LlmProvider = {
   id: 'openai',
   async complete(prompt, apiKey) {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetchWithTimeout('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
