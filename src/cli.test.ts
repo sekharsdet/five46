@@ -4,7 +4,7 @@ import { spawnSync, spawn } from 'child_process'
 import { join } from 'path'
 import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { parseAgentArgs, parseApiArgs } from './cli'
+import { parseAgentArgs, parseApiArgs, parseDiffArgs, parseListArgs, withProjectHeaderLine } from './cli'
 
 // cli.ts guards its own `main()` invocation behind `require.main === module`
 // specifically so this import doesn't trigger a full CLI run as a side
@@ -38,6 +38,40 @@ test('parseAgentArgs recognizes --no-root-cause', () => {
   const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--no-root-cause'])
   assert.equal(result.noRootCause, true)
   assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).noRootCause, undefined)
+})
+
+test('parseAgentArgs recognizes --repeat, leaving it undefined when not passed', () => {
+  const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--repeat', '3'])
+  assert.equal(result.repeat, 3)
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).repeat, undefined)
+})
+
+test('parseAgentArgs recognizes --project, leaving it undefined when not passed', () => {
+  const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--project', 'checkout'])
+  assert.equal(result.project, 'checkout')
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).project, undefined)
+})
+
+test('parseAgentArgs recognizes --record-video, leaving it undefined when not passed', () => {
+  const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--record-video'])
+  assert.equal(result.recordVideo, true)
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).recordVideo, undefined)
+})
+
+test('parseListArgs takes a positional dir and a --project filter, in either order', () => {
+  assert.deepEqual(parseListArgs(['./tests', '--project', 'checkout']), { dir: './tests', project: 'checkout' })
+  assert.deepEqual(parseListArgs(['--project', 'checkout', './tests']), { dir: './tests', project: 'checkout' })
+  assert.deepEqual(parseListArgs([]), {})
+})
+
+test('withProjectHeaderLine splices a Project line right after the Run/outcome header line', () => {
+  const specBody = ['// Goal: g', '// Run abc123 — outcome: goal-reached', 'body'].join('\n')
+  assert.equal(withProjectHeaderLine(specBody, 'checkout'), ['// Goal: g', '// Run abc123 — outcome: goal-reached', '// Project: checkout', 'body'].join('\n'))
+})
+
+test('withProjectHeaderLine is a graceful no-op when the expected header line is not found', () => {
+  const specBody = 'not a five46 header at all'
+  assert.equal(withProjectHeaderLine(specBody, 'checkout'), specBody)
 })
 
 test('parseApiArgs separates base URL, --goal, --max-steps, --out, --storage-state, and repeatable --allow-host', () => {
@@ -75,6 +109,12 @@ test('parseApiArgs defaults allowWrites/allowDeletes to false and allowHosts to 
 test('parseApiArgs recognizes --no-root-cause', () => {
   const result = parseApiArgs(['http://localhost:3000', '--goal', 'g', '--no-root-cause'])
   assert.equal(result.noRootCause, true)
+})
+
+test('parseApiArgs recognizes --repeat, leaving it undefined when not passed', () => {
+  const result = parseApiArgs(['http://localhost:3000', '--goal', 'g', '--repeat', '3'])
+  assert.equal(result.repeat, 3)
+  assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).repeat, undefined)
 })
 
 test('parseApiArgs sets allowWrites/allowDeletes independently', () => {
@@ -141,15 +181,33 @@ test('CLI "test" subcommand rejects a non-http(s)/file URL before attempting any
   assert.ok(stderr.includes("isn't a valid URL"))
 })
 
-test('CLI "test" subcommand without an LLM key configured explains what is missing, without crashing', () => {
+test('CLI "test" subcommand with --repeat still fails at the same missing-API-key preflight check, without launching anything', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--repeat', '3'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "api" subcommand with --repeat still fails at the same missing-API-key preflight check, without launching anything', () => {
+  const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g', '--repeat', '3'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "test" subcommand with --record-video still fails at the same missing-API-key preflight check, without launching anything', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--record-video'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "test" subcommand without an LLM key configured explains what is missing and exits non-zero, without crashing', () => {
   const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g'])
-  assert.equal(status, 0)
+  assert.notEqual(status, 0)
   assert.ok(stderr.includes('requires an LLM API key'))
 })
 
 test('CLI "test" subcommand rejects an unreadable --storage-state file before attempting anything', () => {
   const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--storage-state', '/nonexistent/path.json'], FAKE_LLM_ENV)
-  assert.equal(status, 0)
+  assert.notEqual(status, 0)
   assert.ok(stderr.includes("Couldn't read the storage state file"))
 })
 
@@ -159,7 +217,7 @@ test('CLI "test" subcommand rejects a --storage-state file that is valid JSON bu
   writeFileSync(badPath, JSON.stringify({ hello: 'world' }))
   try {
     const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--storage-state', badPath], FAKE_LLM_ENV)
-    assert.equal(status, 0)
+    assert.notEqual(status, 0)
     assert.ok(stderr.includes("doesn't look like a storage-state file"))
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -174,7 +232,7 @@ test('CLI "login" subcommand requires --out, same as it requires --goal', () => 
 
 test('CLI "login" subcommand without login credentials configured explains what is missing, without attempting a login', () => {
   const { stderr, status } = runCli(['login', 'http://localhost:1', '--goal', 'g', '--out', '/tmp/wont-be-written.json'], FAKE_LLM_ENV)
-  assert.equal(status, 0)
+  assert.notEqual(status, 0)
   assert.ok(stderr.includes('requires login credentials'))
 })
 
@@ -183,7 +241,7 @@ test('CLI "login" subcommand refuses to proceed if --goal contains the real conf
     ['login', 'http://localhost:1', '--goal', 'log in with password hunter2', '--out', '/tmp/wont-be-written.json'],
     { ...FAKE_LLM_ENV, FIVE46_LOGIN_USERNAME: 'ada', FIVE46_LOGIN_PASSWORD: 'hunter2' }
   )
-  assert.equal(status, 0)
+  assert.notEqual(status, 0)
   assert.ok(stderr.includes('appears to contain the configured username/password in plaintext'))
 })
 
@@ -203,15 +261,15 @@ test('CLI "api" subcommand rejects a non-http(s) base URL before attempting anyt
   assert.ok(fileUrl.stderr.includes('Needs an http(s) URL'))
 })
 
-test('CLI "api" subcommand without an LLM key configured explains what is missing, without crashing', () => {
+test('CLI "api" subcommand without an LLM key configured explains what is missing and exits non-zero, without crashing', () => {
   const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g'])
-  assert.equal(status, 0)
+  assert.notEqual(status, 0)
   assert.ok(stderr.includes('requires an LLM API key'))
 })
 
 test('CLI "api" subcommand rejects an unreadable --storage-state file before attempting anything', () => {
   const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g', '--storage-state', '/nonexistent/path.json'], FAKE_LLM_ENV)
-  assert.equal(status, 0)
+  assert.notEqual(status, 0)
   assert.ok(stderr.includes("Couldn't read the storage state file"))
 })
 
@@ -221,8 +279,202 @@ test('CLI "api" subcommand rejects a --storage-state file that is valid JSON but
   writeFileSync(badPath, JSON.stringify({ hello: 'world' }))
   try {
     const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g', '--storage-state', badPath], FAKE_LLM_ENV)
-    assert.equal(status, 0)
+    assert.notEqual(status, 0)
     assert.ok(stderr.includes("doesn't look like a storage-state file"))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "list" subcommand reports no runs found in an empty directory, exits zero', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    const { stdout, status } = runCli(['list', dir])
+    assert.equal(status, 0, 'an empty result is a normal state, not a CI failure')
+    assert.ok(stdout.includes('No generated five46 runs found'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "list" subcommand parses real generated files\' own header comments — no separate metadata format', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    writeFileSync(
+      join(dir, 'five46-agent-abc123.spec.ts'),
+      [
+        '// Auto-generated by five46 test from a real agent run against http://localhost:1',
+        '// Goal: reveal the secret message',
+        '// Run abc123 — outcome: goal-reached',
+        '',
+        "import { test, expect } from '@playwright/test'",
+      ].join('\n')
+    )
+    writeFileSync(
+      join(dir, 'five46-api-def456.test.mjs'),
+      ['// Auto-generated by five46 api from a real run against http://localhost:2', '// Goal: create a user', '// Run def456 — outcome: assertion-failed'].join('\n')
+    )
+    // Must never treat an unrelated file as a generated run.
+    writeFileSync(join(dir, 'not-a-five46-file.txt'), 'hello')
+
+    const { stdout, status } = runCli(['list', dir])
+    assert.equal(status, 0)
+    assert.ok(stdout.includes('2 generated run(s)'))
+    assert.ok(stdout.includes('five46-agent-abc123.spec.ts'))
+    assert.ok(stdout.includes('succeeded'), 'goal-reached should render as "succeeded"')
+    assert.ok(stdout.includes('reveal the secret message'))
+    assert.ok(stdout.includes('five46-api-def456.test.mjs'))
+    assert.ok(stdout.includes('assertion-failed'))
+    assert.ok(!stdout.includes('not-a-five46-file.txt'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "list" subcommand defaults to the current directory when none is given', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    writeFileSync(join(dir, 'five46-agent-xyz789.spec.ts'), ['// Goal: g', '// Run xyz789 — outcome: goal-reached'].join('\n'))
+    const result = spawnSync('node', [CLI_PATH, 'list'], { encoding: 'utf8', cwd: dir, env: { ...process.env } })
+    assert.equal(result.status, 0)
+    assert.ok((result.stdout ?? '').includes('five46-agent-xyz789.spec.ts'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "list" subcommand fails honestly, exits non-zero, for a directory that does not exist', () => {
+  const { stderr, status } = runCli(['list', '/definitely/does/not/exist/five46'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes("Couldn't read directory"))
+})
+
+test('parseDiffArgs takes the first two positionals as fileA/fileB', () => {
+  const result = parseDiffArgs(['a.spec.ts', 'b.spec.ts'])
+  assert.equal(result.fileA, 'a.spec.ts')
+  assert.equal(result.fileB, 'b.spec.ts')
+})
+
+test('CLI "diff" subcommand reports identical files as identical and exits zero, ignoring only the run-id', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    const fileA = join(dir, 'a.spec.ts')
+    const fileB = join(dir, 'b.spec.ts')
+    writeFileSync(fileA, ['// Goal: g', '// Run aaa111 — outcome: goal-reached', 'body'].join('\n'))
+    writeFileSync(fileB, ['// Goal: g', '// Run bbb222 — outcome: goal-reached', 'body'].join('\n'))
+
+    const { stdout, status } = runCli(['diff', fileA, fileB])
+    assert.equal(status, 0)
+    assert.ok(stdout.includes('identical'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "diff" subcommand shows a real difference and exits non-zero', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    const fileA = join(dir, 'a.spec.ts')
+    const fileB = join(dir, 'b.spec.ts')
+    writeFileSync(fileA, ['// Goal: g', '// Run aaa111 — outcome: goal-reached', 'await page.locator("x").click()'].join('\n'))
+    writeFileSync(fileB, ['// Goal: g', '// Run bbb222 — outcome: goal-reached', 'await page.locator("y").click()'].join('\n'))
+
+    const { stdout, status } = runCli(['diff', fileA, fileB])
+    assert.notEqual(status, 0)
+    assert.ok(stdout.includes('- await page.locator("x").click()'))
+    assert.ok(stdout.includes('+ await page.locator("y").click()'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "diff" subcommand fails honestly, exits non-zero, when a file does not exist', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    const fileA = join(dir, 'a.spec.ts')
+    writeFileSync(fileA, 'content')
+    const { stderr, status } = runCli(['diff', fileA, join(dir, 'missing.spec.ts')])
+    assert.notEqual(status, 0)
+    assert.ok(stderr.includes("Couldn't read"))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "diff" subcommand with a missing second argument prints usage and exits non-zero', () => {
+  const { stderr, status } = runCli(['diff', 'onlyone.spec.ts'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('Usage: five46 test'))
+})
+
+test('CLI "test" subcommand with --project fails honestly, exits non-zero, when five46.config.json does not exist', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    const result = spawnSync('node', [CLI_PATH, 'test', 'http://localhost:1', '--goal', 'g', '--project', 'checkout'], {
+      encoding: 'utf8',
+      cwd: dir,
+      env: { ...process.env, ...FAKE_LLM_ENV },
+    })
+    assert.notEqual(result.status, 0)
+    assert.ok((result.stderr ?? '').includes('five46.config.json'))
+    assert.ok((result.stderr ?? '').includes('not found'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "test" subcommand with --project fails honestly, exits non-zero, and lists real project names, when the named project is not configured', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    writeFileSync(join(dir, 'five46.config.json'), JSON.stringify({ projects: { checkout: { url: 'http://localhost:3000' } } }))
+    const result = spawnSync('node', [CLI_PATH, 'test', 'http://localhost:1', '--goal', 'g', '--project', 'nope'], {
+      encoding: 'utf8',
+      cwd: dir,
+      env: { ...process.env, ...FAKE_LLM_ENV },
+    })
+    assert.notEqual(result.status, 0)
+    assert.ok((result.stderr ?? '').includes('No project named "nope"'))
+    assert.ok((result.stderr ?? '').includes('checkout'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "test" subcommand with --project fills in the URL from five46.config.json when none is given on the command line', () => {
+  // Confirms the merge actually ran (reaching the URL-validation step using
+  // the project's configured URL) rather than --project being silently
+  // ignored — a bad scheme in the *project's* url is enough to prove it
+  // was really substituted in, since an omitted bare url would instead hit
+  // the earlier "missing url/goal" usage error, not URL validation.
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    writeFileSync(join(dir, 'five46.config.json'), JSON.stringify({ projects: { checkout: { url: 'ftp://not-http' } } }))
+    const result = spawnSync('node', [CLI_PATH, 'test', '--goal', 'g', '--project', 'checkout'], {
+      encoding: 'utf8',
+      cwd: dir,
+      env: { ...process.env, ...FAKE_LLM_ENV },
+    })
+    assert.notEqual(result.status, 0)
+    assert.ok(!(result.stderr ?? '').includes('Usage: five46 test'), 'should have gotten past "missing url", proving the project default was used')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI "list" subcommand --project filters to only the matching tagged run', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    writeFileSync(
+      join(dir, 'five46-agent-tagged.spec.ts'),
+      ['// Goal: g1', '// Run tagged — outcome: goal-reached', '// Project: checkout', ''].join('\n')
+    )
+    writeFileSync(join(dir, 'five46-agent-untagged.spec.ts'), ['// Goal: g2', '// Run untagged — outcome: goal-reached', ''].join('\n'))
+
+    const { stdout, status } = runCli(['list', dir, '--project', 'checkout'])
+    assert.equal(status, 0)
+    assert.ok(stdout.includes('1 generated run(s)'))
+    assert.ok(stdout.includes('five46-agent-tagged.spec.ts'))
+    assert.ok(!stdout.includes('five46-agent-untagged.spec.ts'))
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
