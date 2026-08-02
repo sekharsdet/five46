@@ -268,13 +268,6 @@ to unlock writes — set `FIVE46_MCP_ALLOW_WRITES=1`/
 them; tool arguments can never do it. `five46 login` is deliberately not
 exposed via MCP.
 
-## Roadmap
-
-Not yet built: a multi-file/dependency-graph backend-test model, auto-
-refresh login (session expiry mid-run), MCP exposure for `five46 login`,
-concurrent `--repeat` execution, and a cheaper/faster model for per-step
-decisions with a stronger model reserved for planning.
-
 ## Development
 
 ```bash
