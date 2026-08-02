@@ -30,6 +30,27 @@ test('formatFailureReport labels an assertion failure as a real finding about th
   assert.ok(report.includes('No root-cause hypothesis'), 'must disclose the missing capability rather than silently omit it')
 })
 
+test('formatFailureReport prints the visible-text artifact path when present, for a human to open directly', () => {
+  const run: TestRun = {
+    runId: 'r1c',
+    url: 'http://x',
+    goal: 'g',
+    outcome: 'assertion-failed',
+    steps: [
+      {
+        step: 1,
+        action: { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'r' },
+        outline: OUTLINE,
+        ok: false,
+        failureDetail: 'expected the page to contain text "Hello World!", but it never appeared',
+        visibleTextPath: '/tmp/step-1-failure-visible-text.txt',
+      },
+    ],
+  }
+  const report = formatFailureReport(run)
+  assert.ok(report.includes('/tmp/step-1-failure-visible-text.txt'))
+})
+
 test('formatFailureReport renders a passed rootCauseHypothesis under a hedged header, instead of the deferred-capability text', () => {
   const run: TestRun = {
     runId: 'r1b',

@@ -429,6 +429,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         failureDetail: result.failureDetail,
         screenshotPath: result.screenshotPath,
         domSnapshotPath: result.domSnapshotPath,
+        visibleTextPath: result.visibleTextPath,
         healed: result.healed,
         resolvedSelector: result.healedSelector,
       })

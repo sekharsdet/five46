@@ -107,6 +107,7 @@ export function formatFailureReport(run: TestRun, rootCauseHypothesis?: string):
       lines.push(`${failed.failureDetail ?? '(no detail captured)'}`)
       if (failed.screenshotPath) lines.push(`Screenshot: ${failed.screenshotPath}`)
       if (failed.domSnapshotPath) lines.push(`DOM snapshot: ${failed.domSnapshotPath}`)
+      if (failed.visibleTextPath) lines.push(`Page's visible text at failure: ${failed.visibleTextPath}`)
     }
     lines.push(
       ``,

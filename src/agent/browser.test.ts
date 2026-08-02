@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync, statSync } from 'fs'
+import { mkdtempSync, rmSync, existsSync, statSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders, USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
@@ -342,6 +342,43 @@ test('executeAction on a failing assertion captures a real screenshot and DOM sn
   } finally {
     await browser.close()
     await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('executeAction on a failing assertion captures the page\'s real visible text to a local file, even when the interactive-elements outline is sparse', async (t) => {
+  // Reproduces the real, live-found bug directly: a page with rich TEXT
+  // content (a heading, a paragraph) but almost no INTERACTIVE elements
+  // (button/a/input/[role]) — the exact shape that made a root-cause
+  // hypothesis wrongly call a fully-rendered real page "blank." Proves the
+  // captured file holds the real content the sparse outline alone would
+  // never reveal.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    await browser.page.setContent(`
+      <h1>Single Room</h1>
+      <p>A cozy, accessible room with a view.</p>
+      <div>£100 per night</div>
+      <button id="unrelated-btn">Unrelated</button>
+    `)
+    const outline = await snapshot(browser.page)
+    // Confirms the real gap: the outline the root-cause LLM used to see is
+    // near-empty despite the page being full of real, rendered content.
+    assert.equal(outline.elements.length, 1, 'test setup: only the button should be interactive-eligible')
+
+    // A ref that never existed in this outline — a simple, reliable way to
+    // force a genuine failure through the same fail() path any real
+    // assertion/click/fill failure goes through.
+    const result = await executeAction(browser.page, { action: 'assert_visible', ref: 'e-does-not-exist', reason: 'test' }, outline, artifactDir, 1)
+    assert.equal(result.ok, false)
+    assert.ok(result.visibleTextPath && existsSync(result.visibleTextPath))
+    const capturedText = readFileSync(result.visibleTextPath!, 'utf8')
+    assert.ok(capturedText.includes('Single Room'))
+    assert.ok(capturedText.includes('£100 per night'), 'the real content missing from the sparse outline must be in the captured file')
+  } finally {
+    await browser.close()
     rmSync(artifactDir, { recursive: true, force: true })
   }
 })

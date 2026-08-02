@@ -144,6 +144,15 @@ export interface ExecutedStep {
   failureDetail?: string
   screenshotPath?: string
   domSnapshotPath?: string
+  /** Present only when `ok` is false — a local `.txt` file holding the
+   * page's actual rendered text at the moment of failure, for a human to
+   * open directly (see `browser.ts`'s `StepExecutionResult.visibleTextPath`
+   * doc comment for the full reasoning, including why this is a file never
+   * fed into any LLM prompt: `outline` above is scoped to *interactive*
+   * elements only and can be near-empty on a fully-rendered, content-rich
+   * page, which previously caused a real root-cause hypothesis to wrongly
+   * call a working page "blank"). */
+  visibleTextPath?: string
   /** Present only when this step's original selector had gone stale (0
    * matches) and a fresh re-match by (tag, role, name) found exactly one
    * unambiguous replacement. `generateSpec.ts` must prefer this over its

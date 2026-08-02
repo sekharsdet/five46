@@ -46,6 +46,33 @@ test('buildRootCausePrompt never includes the raw mismatched live value from an 
   assert.ok(!prompt.includes('alice@example.com'))
 })
 
+test('buildRootCausePrompt tells the model the outline is interactive-elements-only, so it does not infer "blank page" from a sparse list', () => {
+  // Real, live-found bug: a fully-rendered page (a room description, a
+  // price — confirmed via its own screenshot) whose content had no
+  // button/a/input/[role] markup at all produced a near-empty outline, and
+  // the root-cause LLM wrongly concluded the page had "failed to load" /
+  // was "blank." This note is the fix: it removes the false premise
+  // ("short outline" == "little content") without disclosing any new live
+  // page data to the LLM.
+  const prompt = buildRootCausePrompt(assertTextFailureRun())!
+  assert.ok(prompt.toLowerCase().includes('interactive elements'))
+  assert.ok(/does not mean|not mean/i.test(prompt), 'must explicitly warn against inferring "blank"/"failed to load" from a short list')
+})
+
+test('buildRootCausePrompt never includes the real page\'s full visible text — that would violate its own "only what the LLM already saw" rule', () => {
+  // The real fix for the "blank page" hallucination is a clarifying NOTE,
+  // deliberately not the page's actual rendered text (captured separately
+  // as a local file only — see browser.ts's visibleTextPath — never fed
+  // into any LLM prompt), since the latter would be exactly the kind of
+  // previously-undisclosed live value this function's own doc comment
+  // already establishes as off-limits (the same rule that scrubs
+  // assert_text's mismatched value).
+  const run = assertTextFailureRun()
+  run.steps[1] = { ...run.steps[1], visibleTextPath: '/tmp/step-2-failure-visible-text.txt' } as (typeof run.steps)[number]
+  const prompt = buildRootCausePrompt(run)!
+  assert.ok(!prompt.includes('/tmp/step-2-failure-visible-text.txt'), 'the file path itself is a local artifact, not something the analysis LLM needs')
+})
+
 test('buildRootCausePrompt returns undefined when the run has no failed step', () => {
   const run: TestRun = { runId: 'r2', url: 'http://x', goal: 'g', outcome: 'goal-reached', steps: [] }
   assert.equal(buildRootCausePrompt(run), undefined)

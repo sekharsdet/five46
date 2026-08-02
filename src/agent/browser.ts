@@ -81,6 +81,12 @@ export interface StepExecutionResult {
   failureDetail?: string
   screenshotPath?: string
   domSnapshotPath?: string
+  /** Present only on failure — a local `.txt` file (best-effort) holding
+   * the page's real rendered text (`body`'s `innerText`, bounded to
+   * `MAX_VISIBLE_TEXT_CHARS`) at the moment of failure. See `fail()`'s own
+   * doc comment for why this exists and why it's a file for a human to
+   * open, never text embedded in any LLM prompt. */
+  visibleTextPath?: string
   /** Present only when the original selector had gone stale and healing
    * found exactly one unambiguous replacement — see `executeAction`'s
    * healing logic. */
@@ -94,6 +100,11 @@ export interface StepExecutionResult {
    * already-open dropdown still "succeeds" without changing anything. */
   scrolled?: boolean
 }
+
+/** Bound on the `visibleTextPath` file's content — not an LLM-prompt-size
+ * concern (this file is never sent to any LLM), just a sane cap on how
+ * much a human has to scroll through when opening it. */
+const MAX_VISIBLE_TEXT_CHARS = 3000
 
 /** Distinguishes the two real, distinct ways a Playwright launch fails —
  * the package itself isn't installed (an `optionalDependency`, per
@@ -483,7 +494,33 @@ export async function executeAction(
       // failure shouldn't itself throw and mask the real failureDetail.
       return { ok: false, failureDetail: detail }
     }
-    return { ok: false, failureDetail: detail, screenshotPath, domSnapshotPath }
+    // Found via a real, live failure: a fully-rendered real page (confirmed
+    // via its own screenshot) got a root-cause hypothesis claiming it was
+    // "blank"/"failed to load," because that page's actual content (a room
+    // description, a price) had no button/a/input/[role] markup at all, so
+    // almost nothing showed up in the interactive-elements outline —
+    // rootCause.ts's LLM prompt has no way to tell "few interactive
+    // elements" apart from "little content" on outline alone. This is a
+    // *local file* only, deliberately never fed into any LLM prompt —
+    // rootCause.ts's own doc comment establishes "only what the LLM already
+    // saw during the run, never a live, previously-undisclosed value" as a
+    // real, deliberate privacy rule (the same one that scrubs assert_text's
+    // mismatched value), and the page's full rendered text is exactly the
+    // kind of previously-undisclosed live value that rule exists to keep
+    // out of a third-party LLM call — this is for a human reviewing the
+    // failure report to open directly, same as the screenshot/DOM snapshot.
+    let visibleTextPath: string | undefined
+    try {
+      const rawText = await page.locator('body').innerText({ timeout: 2000 })
+      const bounded = rawText.length > MAX_VISIBLE_TEXT_CHARS ? rawText.slice(0, MAX_VISIBLE_TEXT_CHARS) + '... (truncated)' : rawText
+      const candidatePath = join(artifactDir, `step-${stepNumber}-failure-visible-text.txt`)
+      writeFileSync(candidatePath, bounded)
+      visibleTextPath = candidatePath
+    } catch {
+      // Same best-effort posture as the screenshot/DOM capture above — an
+      // empty/unreadable body shouldn't mask the real failureDetail.
+    }
+    return { ok: false, failureDetail: detail, screenshotPath, domSnapshotPath, visibleTextPath }
   }
 
   if (action.action === 'done') return { ok: true }
