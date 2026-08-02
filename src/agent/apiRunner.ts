@@ -4,7 +4,7 @@ import { CookieJar, executeApiAction, resolvePlaceholders } from './apiExecutor'
 import type { LastResponse, ApiExecutionContext } from './apiExecutor'
 import { buildApiActionPrompt, buildApiPlanPrompt, checkVarReferences, parseApiAction, parseApiPlan } from './apiPlanner'
 import { requiresConfirmation } from './planner'
-import { isHostAllowed, isMethodAllowed } from './apiTypes'
+import { isHostAllowed, isMethodAllowed, effectiveMethod } from './apiTypes'
 import type { ApiAction, ApiHistoryEntry, ApiPlan, ApiTestRun, ExecutedApiStep, HttpMethod, SafetyMode } from './apiTypes'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId } from './runLoop'
 
@@ -205,9 +205,15 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
         // most important risk in this whole feature: without it, a
         // fast-pathed request could fire for real with zero method/host
         // gating even at default safety settings.
-        if (!isMethodAllowed(plannedStep.method, options.safety)) {
+        // Gated on the *effective* method, not just the declared one — see
+        // effectiveMethod's own doc comment (apiTypes.ts) for the real,
+        // live finding: a plan step carrying a method-override header could
+        // otherwise fast-path past this exact check.
+        const effective = effectiveMethod(plannedStep.method, resolvedUrl, plannedStep.headers)
+        if (!isMethodAllowed(effective, options.safety)) {
           const attempted: ApiAction = plannedStep
-          steps.push({ step: stepNumber, action: attempted, ok: false, failureDetail: `method "${plannedStep.method}" is not allowed this run (see --allow-writes/--allow-deletes)` })
+          const overrideNote = effective !== plannedStep.method ? ` (effectively ${effective} via a method-override header/param)` : ''
+          steps.push({ step: stepNumber, action: attempted, ok: false, failureDetail: `method "${plannedStep.method}"${overrideNote} is not allowed this run (see --allow-writes/--allow-deletes)` })
           history.push({ action: attempted, result: 'failed', detail: 'blocked: disallowed method' })
           precedingWasSuccessfulRequest = false
           continue

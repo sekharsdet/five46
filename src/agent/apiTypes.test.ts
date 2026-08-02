@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { isMethodAllowed, isHostAllowed } from './apiTypes'
+import { isMethodAllowed, isHostAllowed, effectiveMethod } from './apiTypes'
 import type { SafetyMode } from './apiTypes'
 
 const READ_ONLY: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set() }
@@ -50,4 +50,42 @@ test('isHostAllowed allows an explicitly allowlisted host, still blocks everythi
 
 test('isHostAllowed fails closed (not allowed) on a malformed URL rather than throwing', () => {
   assert.equal(isHostAllowed('not a url', READ_ONLY), false)
+})
+
+// Real, live-found gap: a model blocked from DELETE (no --allow-deletes)
+// sent POST with X-HTTP-Method-Override: DELETE instead. Confirmed
+// empirically that specific target didn't honor it, but isMethodAllowed
+// alone only ever inspects the literally-declared method — against any
+// real target that DOES honor one of these conventions, this would be a
+// genuine --allow-deletes bypass.
+test('effectiveMethod returns the declared method unchanged when no override is present', () => {
+  assert.equal(effectiveMethod('POST', 'https://example.com/items'), 'POST')
+  assert.equal(effectiveMethod('POST', 'https://example.com/items', { 'Content-Type': 'application/json' }), 'POST')
+})
+
+test('effectiveMethod detects X-HTTP-Method-Override and its common sibling header names, case-insensitively', () => {
+  assert.equal(effectiveMethod('POST', 'https://example.com/items/1', { 'X-HTTP-Method-Override': 'DELETE' }), 'DELETE')
+  assert.equal(effectiveMethod('POST', 'https://example.com/items/1', { 'x-http-method-override': 'delete' }), 'DELETE')
+  assert.equal(effectiveMethod('POST', 'https://example.com/items/1', { 'X-HTTP-Method': 'PUT' }), 'PUT')
+  assert.equal(effectiveMethod('POST', 'https://example.com/items/1', { 'X-Method-Override': 'PATCH' }), 'PATCH')
+})
+
+test('effectiveMethod detects the Rails/Laravel/Sinatra _method query-parameter convention', () => {
+  assert.equal(effectiveMethod('POST', 'https://example.com/items/1?_method=DELETE'), 'DELETE')
+  assert.equal(effectiveMethod('POST', 'https://example.com/items/1?_method=delete'), 'DELETE')
+})
+
+test('effectiveMethod ignores an unrecognized override value rather than guessing', () => {
+  assert.equal(effectiveMethod('POST', 'https://example.com/items', { 'X-HTTP-Method-Override': 'NOT-A-REAL-METHOD' }), 'POST')
+  assert.equal(effectiveMethod('POST', 'https://example.com/items?_method=also-not-real'), 'POST')
+})
+
+test('effectiveMethod never throws on a malformed URL — fails closed to the declared method, matching isHostAllowed', () => {
+  assert.equal(effectiveMethod('POST', 'not a url'), 'POST')
+})
+
+test('isMethodAllowed blocks a POST carrying a DELETE method-override header, once checked against effectiveMethod — the real fix', () => {
+  const method = effectiveMethod('POST', 'https://example.com/items/1', { 'X-HTTP-Method-Override': 'DELETE' })
+  assert.equal(isMethodAllowed(method, WRITES_ONLY), false, 'allowWrites alone must not let a method-override DELETE through, same as a literal one')
+  assert.equal(isMethodAllowed(method, WRITES_AND_DELETES), true)
 })

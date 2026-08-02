@@ -488,6 +488,53 @@ test('runApiTest with useStructuredPlan still blocks a fast-pathed DELETE by def
   }
 })
 
+test('runApiTest with useStructuredPlan blocks a fast-pathed POST carrying an X-HTTP-Method-Override: DELETE header, even with allowWrites (but not allowDeletes) set', async () => {
+  // Real, live-found gap: a model blocked from DELETE tried exactly this
+  // technique against a real live target this session — see apiTypes.ts's
+  // effectiveMethod doc comment. Proves the fast path's own re-check
+  // (apiRunner.ts) catches it too, not just parseApiAction's live-decision
+  // path — the same "no single point of failure" posture the DELETE test
+  // above already established for the literal-method case.
+  const server = await startApiTestServer()
+  try {
+    const create = await fetch(server.url + '/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'widget' }),
+    })
+    const { id } = (await create.json()) as { id: string }
+
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        return JSON.stringify({
+          steps: [{ action: 'request', method: 'POST', url: `${server.url}/items/${id}`, headers: { 'X-HTTP-Method-Override': 'DELETE' }, reason: 'delete it via a method override' }],
+        })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'delete the item',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url, { allowWrites: true }), // writes allowed, deletes NOT allowed
+      useStructuredPlan: true,
+      maxSteps: 2,
+    })
+
+    assert.notEqual(run.outcome, 'goal-reached')
+    assert.ok(run.steps.every((s) => !s.ok), 'a fast-pathed method-override DELETE must never be recorded as a successful step')
+    assert.ok(run.steps.every((s) => s.failureDetail?.includes('effectively DELETE via a method-override')))
+
+    // Prove it was never actually sent — the item must still exist.
+    const check = await fetch(`${server.url}/items/${id}`)
+    assert.equal(check.status, 200, 'the item must still exist — the blocked override must never have reached the real server')
+  } finally {
+    await server.close()
+  }
+})
+
 test('runApiTest with useStructuredPlan does not fast-path an assertion immediately after a failed planned request', async () => {
   const server = await startApiTestServer()
   try {

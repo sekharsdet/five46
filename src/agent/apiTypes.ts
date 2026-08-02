@@ -29,6 +29,56 @@ export function isMethodAllowed(method: HttpMethod, safety: SafetyMode): boolean
   return safety.allowWrites // POST, PUT, PATCH
 }
 
+/** Exported so `apiPlanner.ts` (which already needed an identical set for
+ * its own "is this a recognized method at all" validation) has one source
+ * of truth to import instead of a second, independently-drifting copy. */
+export const VALID_METHODS: ReadonlySet<HttpMethod> = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'])
+
+/** Header names, checked case-insensitively (real HTTP header names are),
+ * that real server frameworks commonly honor to execute a *different*
+ * method than the one an HTTP client literally declares — Google's own
+ * documented convention, IBM's, and what many Rails (`Rack::MethodOverride`)
+ * and Express/Laravel setups accept out of the box. */
+const METHOD_OVERRIDE_HEADERS = new Set(['x-http-method-override', 'x-http-method', 'x-method-override'])
+
+/** Returns the method a real server could actually execute for this
+ * request — not just the one declared in `method` — by checking known
+ * method-override conventions (a header above, or Rails/Laravel/Sinatra's
+ * long-standing `?_method=` query-parameter equivalent for form-friendly
+ * clients that can't natively send DELETE/PUT). Found via a real, live
+ * run: a model blocked from DELETE (no `--allow-deletes`) sent `POST` with
+ * `X-HTTP-Method-Override: DELETE` instead. Confirmed empirically against
+ * that specific real target that the attempt was a no-op (it doesn't honor
+ * the header) — but `isMethodAllowed(method, safety)` alone only ever
+ * inspects the literally-declared method, so against any real target that
+ * *does* honor one of these conventions, that exact same request would
+ * have genuinely bypassed `--allow-deletes` while five46's own gate
+ * believed it was only permitting a plain, already-allowed POST. Both call
+ * sites that gate a `request` action (`apiPlanner.ts`'s parse-time check,
+ * `apiRunner.ts`'s fast-path re-check) must check this, not just `method`
+ * — the same "no single point of failure" posture already applied to
+ * `isMethodAllowed`/`isHostAllowed` themselves. */
+export function effectiveMethod(method: HttpMethod, url: string, headers?: Record<string, string>): HttpMethod {
+  if (headers) {
+    for (const [key, value] of Object.entries(headers)) {
+      if (!METHOD_OVERRIDE_HEADERS.has(key.toLowerCase())) continue
+      const upper = value.trim().toUpperCase()
+      if (VALID_METHODS.has(upper as HttpMethod)) return upper as HttpMethod
+    }
+  }
+  try {
+    const overrideParam = new URL(url).searchParams.get('_method')
+    if (overrideParam) {
+      const upper = overrideParam.trim().toUpperCase()
+      if (VALID_METHODS.has(upper as HttpMethod)) return upper as HttpMethod
+    }
+  } catch {
+    // A malformed URL is already handled by isHostAllowed's own identical
+    // fail-closed catch — nothing extra to do here.
+  }
+  return method
+}
+
 /** True if `url`'s origin is the target's own origin, or its hostname is on
  * the explicit allowlist. Never throws on a malformed URL — treated as not
  * allowed, the same honest-fail-closed posture as everything else here. */

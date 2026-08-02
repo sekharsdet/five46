@@ -73,6 +73,38 @@ test('parseApiAction rejects DELETE when allowWrites is set but allowDeletes is 
   assert.equal(result.ok, false)
 })
 
+test('parseApiAction rejects a POST carrying an X-HTTP-Method-Override: DELETE header when allowDeletes is not set, even though POST alone would be allowed', () => {
+  // Real, live-found gap: a model blocked from DELETE tried exactly this
+  // technique against a real target — see apiTypes.ts's effectiveMethod
+  // doc comment for the full reasoning and the confirmed-real-world
+  // frameworks that honor this convention server-side.
+  const writesOnly: SafetyMode = { ...READ_ONLY, allowWrites: true }
+  const raw = JSON.stringify({
+    action: 'request',
+    method: 'POST',
+    url: 'http://localhost:1/items/1',
+    headers: { 'X-HTTP-Method-Override': 'DELETE' },
+    reason: 'try to delete via a POST override',
+  })
+  const result = parseApiAction(raw, new Set(), writesOnly)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /effectively DELETE via a method-override/)
+})
+
+test('parseApiAction rejects a POST carrying a _method=DELETE query parameter under the same rule', () => {
+  const writesOnly: SafetyMode = { ...READ_ONLY, allowWrites: true }
+  const raw = JSON.stringify({ action: 'request', method: 'POST', url: 'http://localhost:1/items/1?_method=DELETE', reason: 'try to delete via a query param override' })
+  const result = parseApiAction(raw, new Set(), writesOnly)
+  assert.equal(result.ok, false)
+})
+
+test('parseApiAction still allows an ordinary POST that merely happens to carry an unrelated header, unaffected by the override check', () => {
+  const writesOnly: SafetyMode = { ...READ_ONLY, allowWrites: true }
+  const raw = JSON.stringify({ action: 'request', method: 'POST', url: 'http://localhost:1/items', headers: { 'Content-Type': 'application/json' }, reason: 'ordinary create' })
+  const result = parseApiAction(raw, new Set(), writesOnly)
+  assert.equal(result.ok, true)
+})
+
 test('parseApiAction rejects a request to a host that is not the target origin or allowlisted', () => {
   const raw = JSON.stringify({ action: 'request', method: 'GET', url: 'http://evil.example.com/steal', reason: 'wander off' })
   const result = parseApiAction(raw, new Set(), READ_ONLY)

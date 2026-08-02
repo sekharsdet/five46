@@ -1,5 +1,5 @@
 import type { ApiAction, ApiHistoryEntry, ApiPlan, HttpMethod, SafetyMode } from './apiTypes'
-import { isMethodAllowed, isHostAllowed } from './apiTypes'
+import { isMethodAllowed, isHostAllowed, effectiveMethod, VALID_METHODS } from './apiTypes'
 import { extractPlaceholderNames } from './apiExecutor'
 
 const MAX_HISTORY = 10
@@ -90,8 +90,6 @@ export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], v
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0
 }
-
-const VALID_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE'])
 
 const API_PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"request","method":"POST","url":"/users","body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user"},{"action":"request","method":"GET","url":"/users/{{userId}}","reason":"fetch it back"},{"action":"assert_json_path_equals","path":"name","expected":"Ada","reason":"confirm the name matches"},{"action":"done","outcome":"goal-reached","reason":"confirmed"}]}`
 
@@ -291,10 +289,17 @@ export function parseApiAction(raw: string, validVarNames: ReadonlySet<string>, 
       }
       const attempted: ApiAction = { action: 'request', method, url: obj.url, headers, body, saveAs, reason }
 
-      if (!isMethodAllowed(method, safety)) {
+      // Checked against the *effective* method, not just the literally
+      // declared one — a request carrying a method-override header/param
+      // could otherwise execute as something isMethodAllowed never actually
+      // gated. See effectiveMethod's own doc comment for the real, live
+      // finding that motivated this.
+      const effective = effectiveMethod(method, obj.url, headers)
+      if (!isMethodAllowed(effective, safety)) {
+        const overrideNote = effective !== method ? ` (effectively ${effective} via a method-override header/param)` : ''
         return {
           ok: false,
-          error: `method "${method}" is not allowed this run (see --allow-writes/--allow-deletes)`,
+          error: `method "${method}"${overrideNote} is not allowed this run (see --allow-writes/--allow-deletes)`,
           raw,
           recoverable: true,
           attemptedAction: attempted,
