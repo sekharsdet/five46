@@ -206,7 +206,26 @@ export async function launchAgentBrowser(options?: {
  * even sees it — an invisible element isn't a real, clickable option. */
 const SNAPSHOT_SCRIPT = `(() => {
   const SELECTOR = 'button, a, input, select, textarea, [role]'
-  const nodes = Array.from(document.querySelectorAll(SELECTOR))
+  const baseNodes = Array.from(document.querySelectorAll(SELECTOR))
+  // Real, live-found gap: a genuinely clickable icon-only control can have
+  // no button/a tag and no role at all — confirmed against demoqa.com's
+  // actual rendered markup, a table row's edit control is exactly
+  // '<span data-toggle="tooltip" title="Edit" id="...">' wrapping an
+  // <svg>, invisible to the selector above no matter how good the prompt
+  // is. Two signals, deliberately required TOGETHER, not either alone, to
+  // bound false positives: a real accessible-name source ([title] or
+  // [aria-label] — not a guess, it's what the real edit icon actually
+  // has), AND an actual pointer cursor (excludes the common false-positive
+  // case of a plain, non-interactive tooltip like <abbr title="...">,
+  // where title alone is common but mostly not clickable). Deduped against
+  // baseNodes so an element already covered above (e.g. a
+  // <button title="...">) is never listed twice.
+  const baseNodeSet = new Set(baseNodes)
+  const iconCandidates = Array.from(document.querySelectorAll('[title], [aria-label]')).filter((el) => {
+    if (baseNodeSet.has(el)) return false
+    return window.getComputedStyle(el).cursor === 'pointer'
+  })
+  const nodes = [...baseNodes, ...iconCandidates]
   function isVisible(el) {
     const rect = el.getBoundingClientRect()
     if (rect.width === 0 || rect.height === 0) return false
@@ -255,6 +274,10 @@ const SNAPSHOT_SCRIPT = `(() => {
       (el.textContent ? el.textContent.trim().slice(0, 80) : '') ||
       el.getAttribute('placeholder') ||
       el.getAttribute('value') ||
+      // Final fallback — an icon-only element (an <svg>-wrapping <span>,
+      // say) has empty textContent, so without this its name would
+      // otherwise resolve to '' even once the selector above surfaces it.
+      el.getAttribute('title') ||
       ''
     )
   }

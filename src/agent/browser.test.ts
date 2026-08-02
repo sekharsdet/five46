@@ -88,6 +88,59 @@ test('snapshot reports the correct implicit ARIA role for non-text <input> types
   }
 })
 
+test('snapshot finds a real icon-only click target with no button/a tag and no role, matching demoqa.com\'s actual edit-icon markup', async (t) => {
+  // Real, live-found gap: confirmed by driving a real browser against
+  // demoqa.com/webtables and dumping the rendered row HTML — the edit
+  // control is exactly this shape (a <span> with a title and a pointer
+  // cursor, wrapping an <svg>, no button/a tag, no role at all). No amount
+  // of good prompting helps if the target was never in the outline to
+  // begin with.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <span id="edit-record-4" data-toggle="tooltip" title="Edit" style="cursor: pointer;"><svg></svg></span>
+    `)
+    const outline = await snapshot(browser.page)
+    const el = outline.elements.find((e) => e.selector === '[id="edit-record-4"]')
+    assert.ok(el, 'the icon-only span must appear in the outline')
+    assert.equal(el!.name, 'Edit', 'title must be used as the accessible name, since textContent is empty (just an svg)')
+    assert.equal(el!.role, 'span', 'honest fallback to the real tag name — never a guessed semantic role it has not earned')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot excludes a plain tooltip that has a title but is not actually clickable', async (t) => {
+  // The false-positive this guards against: title alone is common (an
+  // <abbr>, an <img>) and mostly does not mean "clickable" — only the
+  // combination of a real name source AND an actual pointer cursor
+  // qualifies, matching the real edit-icon case above.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<abbr id="not-clickable" title="World Wide Web">WWW</abbr>`)
+    const outline = await snapshot(browser.page)
+    assert.ok(!outline.elements.some((e) => e.selector === '[id="not-clickable"]'), 'a title-only, non-pointer-cursor element must not appear in the outline')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot never lists an element twice when it already matches the base selector and also has a title', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<button id="save-btn" title="Save this record">Save</button>`)
+    const outline = await snapshot(browser.page)
+    const matches = outline.elements.filter((e) => e.selector === '[id="save-btn"]')
+    assert.equal(matches.length, 1, 'an element already covered by the base selector must never be duplicated by the icon-candidate check')
+    assert.equal(matches[0].role, 'button', 'the base selector\'s own role computation must win, unaffected by the icon check')
+  } finally {
+    await browser.close()
+  }
+})
+
 test('snapshot computes a positional selector that is actually unique and resolves to the right element, even when a page-global tag count would pick the wrong one', async (t) => {
   // Regression test for a real bug found via a live run against
   // the-internet.herokuapp.com's login flow: a genuine successful login
