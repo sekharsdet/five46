@@ -1,5 +1,5 @@
 import type { LlmProvider } from './types'
-import { describeApiError } from './httpError'
+import { describeApiError, LlmHttpError } from './httpError'
 
 /** Anthropic's Messages API — https://docs.anthropic.com/en/api/messages.
  * Shape verified against public API docs, not a live call (no test key
@@ -22,7 +22,7 @@ export const anthropicProvider: LlmProvider = {
     })
 
     if (!response.ok) {
-      throw new Error(await describeApiError('Anthropic', response))
+      throw new LlmHttpError(await describeApiError('Anthropic', response), response.status)
     }
 
     const body = (await response.json()) as { content?: { type: string; text?: string }[] }

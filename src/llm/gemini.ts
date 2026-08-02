@@ -1,5 +1,5 @@
 import type { LlmProvider } from './types'
-import { describeApiError } from './httpError'
+import { describeApiError, LlmHttpError } from './httpError'
 
 /** Google's Generative Language API —
  * https://ai.google.dev/api/generate-content. Request shape confirmed
@@ -37,7 +37,7 @@ export const geminiProvider: LlmProvider = {
     )
 
     if (!response.ok) {
-      throw new Error(await describeApiError('Gemini', response))
+      throw new LlmHttpError(await describeApiError('Gemini', response), response.status)
     }
 
     const body = (await response.json()) as {

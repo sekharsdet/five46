@@ -9,6 +9,19 @@
  * falls back to the raw response text (truncated) if that shape isn't
  * there, and to just the status if the body can't be read at all — never
  * throws while trying to build a better error message. */
+/** Thrown by each fetch-based provider on `!response.ok`, instead of a bare
+ * `Error` — carries the real HTTP status alongside `describeApiError`'s
+ * message text so a caller (see `llm/retry.ts`) can decide "is this
+ * transient" without regex-parsing the message string. */
+export class LlmHttpError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'LlmHttpError'
+    this.status = status
+  }
+}
+
 export async function describeApiError(providerName: string, response: Response): Promise<string> {
   const prefix = `${providerName} API request failed: ${response.status} ${response.statusText}`
   let bodyText: string

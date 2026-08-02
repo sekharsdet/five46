@@ -27,7 +27,15 @@ import type { LlmProvider } from './types'
 export const bedrockProvider: LlmProvider = {
   id: 'bedrock',
   async complete(prompt, region) {
-    const client = new BedrockRuntimeClient({ region })
+    // maxAttempts: 1 — the AWS SDK's own default StandardRetryStrategy would
+    // otherwise already retry throttling/5xx internally before send()
+    // rejects at all, compounding with the outer retry layer llm/retry.ts
+    // adds on top of every provider (registry.ts's getLlmProvider). Pinning
+    // this to 1 makes that outer layer the single source of retry truth
+    // across all 5 providers uniformly, instead of Bedrock silently getting
+    // up to 3x the retries (with two independent backoff schedules) that
+    // every other provider gets.
+    const client = new BedrockRuntimeClient({ region, maxAttempts: 1 })
     const command = new ConverseCommand({
       modelId: 'anthropic.claude-3-5-haiku-20241022-v1:0',
       messages: [{ role: 'user', content: [{ text: prompt }] }],

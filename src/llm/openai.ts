@@ -1,5 +1,5 @@
 import type { LlmProvider } from './types'
-import { describeApiError } from './httpError'
+import { describeApiError, LlmHttpError } from './httpError'
 
 /** OpenAI's Chat Completions API — https://platform.openai.com/docs/api-reference/chat.
  * Shape verified against public API docs, not a live call (no test key
@@ -23,7 +23,7 @@ export const openAiProvider: LlmProvider = {
     })
 
     if (!response.ok) {
-      throw new Error(await describeApiError('OpenAI', response))
+      throw new LlmHttpError(await describeApiError('OpenAI', response), response.status)
     }
 
     const body = (await response.json()) as { choices?: { message?: { content?: string } }[] }
