@@ -21,6 +21,16 @@ test('buildApiActionPrompt discloses the allowed methods/hosts up front, not jus
   assert.ok(fullLine?.includes('DELETE'))
 })
 
+test('buildApiActionPrompt tells the model to declare goal-unreachable honestly instead of guessing a plausible field name', () => {
+  // Regression test: found via real live testing that the model asserted a
+  // plausible-but-nonexistent JSON field ($.realname) instead of admitting
+  // the real target field wasn't present — unconditional instruction, so it
+  // must appear regardless of safety mode or saved variables.
+  const prompt = buildApiActionPrompt('goal', [], new Set(), READ_ONLY)
+  assert.ok(prompt.includes('goal-unreachable" honestly'))
+  assert.ok(prompt.includes('never guess a field/path name'))
+})
+
 test('buildApiActionPrompt lists currently-saved variable names, only when there are any', () => {
   const withVars = buildApiActionPrompt('goal', [], new Set(['userId', 'token']), READ_ONLY)
   assert.ok(withVars.includes('userId'))

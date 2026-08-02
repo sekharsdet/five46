@@ -19,12 +19,20 @@ type PathSegment = FieldSegment | IndexSegment
  * regex scan, never `eval`/`new Function` on the path text) of a general
  * expression language. Never throws on malformed input; a path that
  * doesn't resolve to anything is `evaluateJsonPath`'s/the caller's problem
- * to treat as an honest failure, not this function's job to guess at. */
+ * to treat as an honest failure, not this function's job to guess at.
+ *
+ * A leading `$` (optionally followed by `.`) — the conventional JSONPath
+ * root marker — is stripped before parsing. Real LLMs reach for standard
+ * JSONPath syntax by default (`$.userId`, `$[0].name`); without this, `$`
+ * would be parsed as a literal field named `$`, silently failing to
+ * resolve anything real — confirmed against a real model in practice, not
+ * a hypothetical. */
 export function parseJsonPath(path: string): PathSegment[] {
+  const normalized = path.replace(/^\$\.?/, '')
   const segments: PathSegment[] = []
   const pattern = /([^.[\]]+)|\[(\d+)\]/g
   let match: RegExpExecArray | null
-  while ((match = pattern.exec(path)) !== null) {
+  while ((match = pattern.exec(normalized)) !== null) {
     if (match[1] !== undefined) segments.push({ kind: 'field', name: match[1] })
     else if (match[2] !== undefined) segments.push({ kind: 'index', index: Number(match[2]) })
   }

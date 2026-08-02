@@ -168,7 +168,7 @@ test('five46_api tool includes a root-cause hypothesis in the report on a real a
     const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
     try {
       const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, goal: 'confirm the items endpoint returns an impossible status' } })
-      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.equal(result.isError, true, JSON.stringify(result))
       const text = (result.content as { type: string; text: string }[])[0].text
       assert.match(text, /a real finding about the API/)
       assert.match(text, /an LLM-generated hypothesis, not a confirmed diagnosis/)
@@ -338,7 +338,7 @@ test('five46_test tool includes a root-cause hypothesis in the report on a real 
     const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
     try {
       const result = await client.callTool({ name: 'five46_test', arguments: { url: server.url, goal: 'reveal the secret message and confirm the text', maxSteps: 5 } })
-      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.equal(result.isError, true, JSON.stringify(result))
       const text = (result.content as { type: string; text: string }[])[0].text
       assert.match(text, /a real finding about the app/)
       assert.match(text, /an LLM-generated hypothesis, not a confirmed diagnosis/)
@@ -370,7 +370,7 @@ test('five46_test tool blocks a destructive-looking click by default, without a 
     const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
     try {
       const result = await client.callTool({ name: 'five46_test', arguments: { url: server.url, goal: 'delete my account and confirm it is gone', maxSteps: 3 } })
-      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.equal(result.isError, true, JSON.stringify(result))
       const text = (result.content as { type: string; text: string }[])[0].text
       assert.ok(!text.includes('succeeded: goal reached'), 'the blocked click must never let the run reach a false goal-reached')
       assert.match(text, /0 step\(s\) succeeded/)
@@ -461,7 +461,12 @@ test('five46_test tool unlocks a destructive click only via the real FIVE46_MCP_
   }
 })
 
-test('five46_test tool surfaces a missing-Playwright-style engine failure as isError, never an uncaught rejection', async () => {
+test('five46_test tool surfaces an unparseable-response run outcome as isError, never an uncaught rejection', async () => {
+  // isError mirrors the CLI's CI-gating exit-code rule: any outcome other
+  // than goal-reached (including a tooling outcome like this one, not just
+  // an app-level assertion failure) is isError:true, giving the calling
+  // IDE AI the same one clear failure signal a human reading an exit code
+  // gets, rather than something it has to parse the report text to learn.
   const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
   try {
     // No goal at all isn't possible (schema requires it), so exercise a
@@ -473,7 +478,7 @@ test('five46_test tool surfaces a missing-Playwright-style engine failure as isE
       const server = await startFixtureServer()
       try {
         const result = await client.callTool({ name: 'five46_test', arguments: { url: server.url, goal: 'g', maxSteps: 2 } })
-        assert.equal(result.isError, undefined)
+        assert.equal(result.isError, true)
         const text = (result.content as { type: string; text: string }[])[0].text
         assert.match(text, /couldn't be safely parsed/)
       } finally {

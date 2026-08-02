@@ -39,7 +39,23 @@ test('buildActionPrompt includes the goal, the outline, and the exact JSON schem
   assert.ok(prompt.includes('reveal the secret message'))
   assert.ok(prompt.includes('[e1] button "Show secret message"'))
   assert.ok(prompt.includes('"action":"click"'))
+  assert.ok(prompt.includes('"action":"scroll"'))
   assert.ok(prompt.includes('ONLY the JSON object'))
+})
+
+test('buildActionPrompt tells the model to declare goal-unreachable honestly instead of guessing at the closest element', () => {
+  // Regression test: found via real live testing that the model would pick
+  // the nearest plausible element (e.g. an unrelated footer link) and
+  // assert against it instead of admitting the real target wasn't present
+  // — this instruction is unconditional (unlike confirmationNote/
+  // deleteNote), so it must appear regardless of goal phrasing.
+  const withConfirmation = buildActionPrompt('reveal the secret and confirm it is visible', [], OUTLINE)
+  const withoutConfirmation = buildActionPrompt('reveal the secret message', [], OUTLINE)
+  for (const prompt of [withConfirmation, withoutConfirmation]) {
+    assert.ok(prompt.includes('goal-unreachable" honestly'))
+    assert.ok(prompt.includes('never guess'))
+    assert.ok(prompt.includes('unopened menu/dropdown/tab/accordion'))
+  }
 })
 
 test('buildActionPrompt bounds history and discloses omitted earlier steps rather than growing unboundedly', () => {
@@ -88,6 +104,20 @@ test('parseAgentAction requires a recognized outcome for done, not just any stri
   const raw = JSON.stringify({ action: 'done', outcome: 'i-think-so', reason: 'maybe' })
   const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
   assert.equal(result.ok, false)
+})
+
+test('parseAgentAction accepts a valid scroll action, needing no ref', () => {
+  const raw = JSON.stringify({ action: 'scroll', direction: 'down', reason: 'look for more content' })
+  const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'scroll', direction: 'down', reason: 'look for more content' })
+})
+
+test('parseAgentAction rejects a scroll direction that is not "up" or "down"', () => {
+  const raw = JSON.stringify({ action: 'scroll', direction: 'sideways', reason: 'r' })
+  const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /"up" or "down"/)
 })
 
 test('isDestructiveClickTarget matches account/data-destruction phrases, not generic delete/remove verbs', () => {

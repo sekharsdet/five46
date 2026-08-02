@@ -45,6 +45,8 @@ function describeAction(action: AgentAction): string {
       return `assert ${action.ref} is visible`
     case 'assert_text':
       return `assert ${action.ref} contains "${action.expectedText}"`
+    case 'scroll':
+      return `scroll ${action.direction}`
     case 'done':
       return `done (${action.outcome})`
   }
@@ -169,7 +171,8 @@ export function buildActionPrompt(
     `- {"action":"fill","ref":"<ref>","value":"<text>","submit":<true|false>,"reason":"<why>"}`,
     `- {"action":"assert_visible","ref":"<ref>","reason":"<why>"}`,
     `- {"action":"assert_text","ref":"<ref>","expectedText":"<text>","reason":"<why>"}`,
-    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"}`,
+    `- {"action":"scroll","direction":"up"|"down","reason":"<why>"} (scrolls the whole page by one viewport height — use this if what you need isn't in the list above)`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely is not in the elements list above, scrolling will not reveal it, and no unopened menu/dropdown/tab/accordion visible on the page is likely to reveal it either — try clicking one such element first if one plausibly exists; never guess by acting on or asserting against the closest-looking element instead)`,
     ``,
     `Example: ${ACTION_SCHEMA_EXAMPLE}`,
     ``,
@@ -274,6 +277,11 @@ export function parseAgentAction(raw: string, outline: PageOutline, allowDeletes
         return { ok: false, error: '"expectedText" is missing for an assert_text action', raw }
       }
       return { ok: true, action: { action: 'assert_text', ref, expectedText: obj.expectedText, reason } }
+    }
+    case 'scroll': {
+      const direction = obj.direction === 'up' || obj.direction === 'down' ? obj.direction : undefined
+      if (!direction) return { ok: false, error: '"direction" must be "up" or "down"', raw }
+      return { ok: true, action: { action: 'scroll', direction, reason } }
     }
     case 'done': {
       const outcome = obj.outcome === 'goal-reached' || obj.outcome === 'goal-unreachable' ? obj.outcome : undefined

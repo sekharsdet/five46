@@ -79,7 +79,7 @@ export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], v
     `- {"action":"assert_status","expected":<number>,"reason":"<why>"}`,
     `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"}`,
     `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"}`,
-    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"}`,
+    `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely does not exist in any response seen so far, and no further request implied by the goal is likely to surface it — never guess a field/path name that looks plausible instead of checking what is actually there)`,
     ``,
     `Example: ${ACTION_SCHEMA_EXAMPLE}`,
     ``,

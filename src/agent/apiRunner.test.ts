@@ -324,3 +324,78 @@ test('runApiTest calls onWrite in real time for an allowed non-safe-method reque
     await server.close()
   }
 })
+
+test('runApiTest trips stuck-repeating when an indecisive model alternates assertion types on the same still-unchecked path, instead of ever declaring done', async () => {
+  // The API-engine analog of a real, live-found browser-engine gap: an
+  // indecisive model alternating assert_json_path_exists/assert_json_path_equals
+  // on the *same* path never produces two identical consecutive
+  // actionSignatures, so it evades the ordinary signature-repeat guard.
+  const server = await startApiTestServer()
+  try {
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' }),
+      JSON.stringify({ action: 'assert_json_path_exists', path: 'items', reason: 'check items exists' }),
+      JSON.stringify({ action: 'assert_json_path_equals', path: 'items', expected: '[]', reason: 'check items value' }),
+      JSON.stringify({ action: 'assert_json_path_exists', path: 'items', reason: 'check items exists again' }),
+    ])
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items',
+      provider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      safety: safetyMode(server.url),
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 10, 'must trip well before exhausting the step budget')
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest allows checking two different things (status, then a path) in a row without tripping — a normal multi-property verification', async () => {
+  const server = await startApiTestServer()
+  try {
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' }),
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'check status' }),
+      JSON.stringify({ action: 'assert_json_path_exists', path: 'items', reason: 'check items exists' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' }),
+    ])
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest allows exactly two checks of the same path (exists, then equals) — a normal verify pattern — without tripping', async () => {
+  const server = await startApiTestServer()
+  try {
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' }),
+      JSON.stringify({ action: 'assert_json_path_exists', path: 'items', reason: 'check items exists' }),
+      JSON.stringify({ action: 'assert_json_path_equals', path: 'items', expected: '[]', reason: 'check items value' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' }),
+    ])
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+  } finally {
+    await server.close()
+  }
+})

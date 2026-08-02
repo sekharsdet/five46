@@ -67,7 +67,7 @@ export interface TestToolParams {
   storageStatePath?: string
 }
 
-/** Loads and minimally validates a `statecheck login`-produced session
+/** Loads and minimally validates a `five46 login`-produced session
  * file, the same shape `cli.ts`'s own `loadStorageStateFile` checks —
  * duplicated rather than imported, since that function reports its failure
  * via `console.error` (a side effect we can't reuse: this needs the reason
@@ -172,7 +172,13 @@ export async function runTestTool(params: TestToolParams, context: McpToolContex
     const outPath = join(context.projectRoot, `five46-agent-${run.runId}.spec.ts`)
     writeFileSync(outPath, redactSecrets(generateAgentSpec(run), [llmApiKey]), 'utf8')
 
-    return textResult(`${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
+    const finalText = `${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`
+    // isError mirrors the CLI's CI-gating exit-code rule exactly (see
+    // DEVELOPMENT.md's "CI gating: exit codes" section): the calling IDE
+    // AI is exactly the kind of automated consumer that feature was built
+    // for, and needs the same one clear signal a human reading exit codes
+    // gets — not just report text it has to parse to learn the run failed.
+    return run.outcome === 'goal-reached' ? textResult(finalText) : errorResult(finalText)
   } catch (err) {
     return errorResult(redactSecrets(err instanceof Error ? err.message : String(err), [llmApiKey]))
   }
@@ -198,9 +204,9 @@ export interface ApiToolParams {
  * notifications are a named, deferred enhancement, not built here. */
 export async function runApiTool(params: ApiToolParams, context: McpToolContext): Promise<McpToolResult> {
   // Same reasoning as runTestTool: hoisted above the try so the outer catch
-  // can redact with them. Previously `secrets` never included the LLM key
-  // at all (only authHeaders values), and the outer catch didn't redact
-  // with anything.
+  // can redact with them, and kept in sync with llmApiKey as soon as it's
+  // resolved (see below) so no window exists where a thrown error would
+  // redact against an incomplete list.
   let llmApiKey: string | undefined
   let secrets: (string | undefined)[] = []
   try {
@@ -218,9 +224,13 @@ export async function runApiTool(params: ApiToolParams, context: McpToolContext)
       provider = getLlmProvider(resolved.llmProvider || 'openai')
       llmApiKey = resolved.llmApiKey
     }
+    // Set as soon as llmApiKey itself is — anything thrown between here and
+    // the authHeaders resolution below (e.g. resolveApiAuthHeaders itself
+    // throwing) must still redact against a real key, not an empty array.
+    secrets = [llmApiKey]
 
     const authHeaders = resolveApiAuthHeaders()
-    secrets = [...(authHeaders ? Object.values(authHeaders) : []), llmApiKey]
+    secrets = [...secrets, ...(authHeaders ? Object.values(authHeaders) : [])]
 
     let targetOrigin: string
     try {
@@ -249,7 +259,9 @@ export async function runApiTool(params: ApiToolParams, context: McpToolContext)
     const outPath = join(context.projectRoot, `five46-api-${run.runId}.test.mjs`)
     writeFileSync(outPath, redactSecrets(generateApiSpec(run), secrets), 'utf8')
 
-    return textResult(`${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
+    const finalText = `${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`
+    // Same isError-mirrors-CI-gating rule as runTestTool — see its comment.
+    return run.outcome === 'goal-reached' ? textResult(finalText) : errorResult(finalText)
   } catch (err) {
     return errorResult(redactSecrets(err instanceof Error ? err.message : String(err), secrets))
   }

@@ -55,6 +55,27 @@ function actionSignature(action: ApiAction): string {
   }
 }
 
+/** What an assertion is actually checking — `'$status'` for `assert_status`
+ * (a reserved key, never a real JSON path), the path itself for
+ * `assert_json_path_exists`/`assert_json_path_equals`, `undefined` for
+ * anything else. Used to catch the API-engine analog of a real,
+ * live-found gap on the browser side: an indecisive model alternating
+ * between different assertion *types* checking the *same* thing
+ * (`assert_json_path_exists` then `assert_json_path_equals` on the same
+ * path, then `assert_json_path_exists` again) never produces two
+ * identical consecutive `actionSignature`s, so it evades the signature-repeat
+ * guard below exactly the way alternating `assert_visible`/`assert_text` on
+ * an unchanged ref did in `runner.ts`. Checking two *different* things in a
+ * row (status, then a path) is a completely normal multi-property
+ * verification and must not trip this — only a *third* check of the *same*
+ * thing does, mirroring `runner.ts`'s "two is a normal verify pattern,
+ * three is redundant" threshold exactly. */
+function assertionCheckKey(action: ApiAction): string | undefined {
+  if (action.action === 'assert_status') return '$status'
+  if (action.action === 'assert_json_path_exists' || action.action === 'assert_json_path_equals') return action.path
+  return undefined
+}
+
 function describeResultDetail(action: ApiAction, result: { responseStatus?: number; responseBodyExcerpt?: string; responseBodyTruncated?: boolean; savedVar?: { name: string; value: string } }): string {
   if (action.action !== 'request' || result.responseStatus === undefined) return ''
   const parts = [`status ${result.responseStatus}`]
@@ -105,6 +126,13 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   // assertion/`done`, all still trip it exactly as before.
   let lastActionMadeProgress = false
   let hasSucceededAssertion = false
+  // Catches the API-engine analog of a real gap the signature-repeat guard
+  // missed on the browser side (see `assertionCheckKey`'s doc comment).
+  // Any `request` resets this, mirroring `runner.ts`'s "any click/fill/
+  // scroll attempt resets it" — the model was at least trying to change
+  // something, not purely re-checking the same still-unchanged response.
+  let repeatedCheckKey: string | undefined
+  let repeatedCheckCount = 0
 
   for (let stepNumber = 1; stepNumber <= maxSteps; stepNumber++) {
     const validVarNames = new Set(vars.keys())
@@ -139,6 +167,22 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
       repeatCount = 0
     }
     lastSignature = signature
+
+    const checkKey = assertionCheckKey(action)
+    if (checkKey !== undefined) {
+      if (checkKey === repeatedCheckKey) {
+        repeatedCheckCount++
+        if (repeatedCheckCount >= 3) {
+          return { runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stuck-repeating' }
+        }
+      } else {
+        repeatedCheckKey = checkKey
+        repeatedCheckCount = 1
+      }
+    } else if (action.action === 'request') {
+      repeatedCheckKey = undefined
+      repeatedCheckCount = 0
+    }
 
     if (action.action === 'done') {
       lastActionMadeProgress = false

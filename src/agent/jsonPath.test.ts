@@ -16,6 +16,25 @@ test('parseJsonPath handles plain field, nested field, and array index, with or 
   ])
 })
 
+test('parseJsonPath strips a conventional leading "$" or "$." root marker, rather than treating it as a literal field name', () => {
+  // Regression test: a real model (Llama 3.3 70B via Groq) wrote standard
+  // JSONPath ("$.userId") by default. Without this, "$" parses as a
+  // literal field, so the path silently never resolves.
+  assert.deepEqual(parseJsonPath('$.userId'), [{ kind: 'field', name: 'userId' }])
+  assert.deepEqual(parseJsonPath('$userId'), [{ kind: 'field', name: 'userId' }])
+  assert.deepEqual(parseJsonPath('$[0].name'), [
+    { kind: 'index', index: 0 },
+    { kind: 'field', name: 'name' },
+  ])
+  assert.deepEqual(parseJsonPath('$'), [], 'bare "$" (the whole document) has no segments to walk')
+})
+
+test('evaluateJsonPath resolves a real value via a "$."-prefixed path exactly like the equivalent unprefixed one', () => {
+  const value = { userId: 1, items: [{ id: 'a' }] }
+  assert.equal(evaluateJsonPath(value, '$.userId'), 1)
+  assert.equal(evaluateJsonPath(value, '$.items[0].id'), 'a')
+})
+
 test('evaluateJsonPath resolves a real nested/indexed value from a real object', () => {
   const value = { user: { name: 'Ada', addresses: [{ city: 'London' }, { city: 'Paris' }] } }
   assert.equal(evaluateJsonPath(value, 'user.name'), 'Ada')

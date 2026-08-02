@@ -85,3 +85,40 @@ test('formatFailureReport reports a clean success plainly', () => {
   const report = formatFailureReport(run)
   assert.ok(report.includes('succeeded'))
 })
+
+test('formatFailureReport discloses a recorded video path on a goal-reached run — not failure-gated', () => {
+  const run: TestRun = {
+    runId: 'r6',
+    url: 'http://x',
+    goal: 'g',
+    outcome: 'goal-reached',
+    steps: [{ step: 1, action: { action: 'click', ref: 'e1', reason: 'r' }, outline: OUTLINE, ok: true }],
+    videoPath: '/tmp/five46-agent-r6/video.webm',
+  }
+  const report = formatFailureReport(run)
+  assert.ok(report.includes('Video: /tmp/five46-agent-r6/video.webm'))
+})
+
+test('formatFailureReport discloses a recorded video path on an assertion-failed run too', () => {
+  const run: TestRun = {
+    runId: 'r7',
+    url: 'http://x',
+    goal: 'g',
+    outcome: 'assertion-failed',
+    steps: [{ step: 1, action: { action: 'assert_text', ref: 'e2', expectedText: 'X', reason: 'r' }, outline: OUTLINE, ok: false, failureDetail: 'expected X' }],
+    videoPath: '/tmp/five46-agent-r7/video.webm',
+  }
+  const report = formatFailureReport(run)
+  assert.ok(report.includes('Video: /tmp/five46-agent-r7/video.webm'))
+})
+
+test('formatFailureReport omits the video line entirely when no video was recorded', () => {
+  const run: TestRun = {
+    runId: 'r8',
+    url: 'http://x',
+    goal: 'g',
+    outcome: 'goal-reached',
+    steps: [{ step: 1, action: { action: 'click', ref: 'e1', reason: 'r' }, outline: OUTLINE, ok: true }],
+  }
+  assert.ok(!formatFailureReport(run).includes('Video:'))
+})

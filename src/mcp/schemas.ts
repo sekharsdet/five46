@@ -15,7 +15,7 @@ export const testToolInputSchema = {
   storageStatePath: z
     .string()
     .optional()
-    .describe('Relative path (under the configured project root) to a session file previously captured by `statecheck login` — starts the browser already authenticated'),
+    .describe('Relative path (under the configured project root) to a session file previously captured by `five46 login` — starts the browser already authenticated'),
 }
 
 export const apiToolInputSchema = {
