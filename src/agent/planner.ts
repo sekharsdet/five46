@@ -226,6 +226,20 @@ export function buildActionPrompt(
           `never write a real-looking username or password yourself, only these exact tokens.`,
         ]
       : []
+  // Ordered so a maximal, byte-identical prefix (the opening sentence, goal,
+  // per-run-static notes, and the full schema/instructions block) comes
+  // BEFORE anything that changes every turn (history, outline, planNote) —
+  // this is deliberate, not incidental. Every provider-native prompt/context
+  // caching mechanism (OpenAI/Gemini automatic, Groq automatic where
+  // supported, Anthropic's explicit cache_control) works by matching a
+  // request's leading prefix against a recently-processed one; putting
+  // per-turn-dynamic content in the middle (as an earlier version of this
+  // function did) meant the "prefix" never stayed identical past turn one,
+  // so none of that ~600-token static block below was ever actually
+  // cacheable, despite being identical on every single turn of every run.
+  // See DEVELOPMENT.md's "Reordering prompts for provider-native caching"
+  // section for the full reasoning, including why this isn't a free lunch
+  // for instruction-following (see the closing reminder line below).
   return [
     `You are a web testing agent driving a real browser toward one goal, one action at a time.`,
     ``,
@@ -233,13 +247,6 @@ export function buildActionPrompt(
     ...confirmationNote,
     ...deleteNote,
     ...credentialNote,
-    ...planNote,
-    ``,
-    `Steps taken so far:`,
-    serializeHistory(history),
-    ``,
-    `Elements currently visible on the page (pick a ref from this list only — you cannot act on anything not listed here):`,
-    serializeOutline(outline),
     ``,
     `Respond with exactly one JSON object describing the next single action to take, one of:`,
     `- {"action":"click","ref":"<ref>","reason":"<why>"}`,
@@ -252,8 +259,22 @@ export function buildActionPrompt(
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely is not in the elements list above, an assert_page_text check for it hasn't found it anywhere on the page either, scrolling will not reveal it, waiting for it to load hasn't revealed it either, and no unopened menu/dropdown/tab/accordion visible on the page is likely to reveal it either — try clicking one such element first if one plausibly exists; never guess by acting on or asserting against the closest-looking element instead)`,
     ``,
     `Example: ${ACTION_SCHEMA_EXAMPLE}`,
+    ...planNote,
     ``,
-    `Respond with ONLY the JSON object — no markdown fence, no prose before or after it.`,
+    `Steps taken so far:`,
+    serializeHistory(history),
+    ``,
+    `Elements currently visible on the page (pick a ref from this list only — you cannot act on anything not listed here):`,
+    serializeOutline(outline),
+    ``,
+    // A short, cheap repeat of the format instruction, deliberately kept
+    // right before generation — moving the full instructions block earlier
+    // trades away the "recency effect" (an instruction immediately
+    // preceding generation is followed more reliably), so this recovers
+    // that reliability for the one instruction most worth repeating,
+    // without undoing the reordering above (the bulk of the static block
+    // still sits in the cacheable prefix).
+    `Respond with ONLY the JSON object matching one of the schemas above — no markdown fence, no prose before or after it.`,
   ].join('\n')
 }
 

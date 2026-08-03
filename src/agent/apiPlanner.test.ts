@@ -21,6 +21,28 @@ test('buildApiActionPrompt discloses the allowed methods/hosts up front, not jus
   assert.ok(fullLine?.includes('DELETE'))
 })
 
+// Regression guard for the actual property this ordering exists for — same
+// reasoning as planner.ts's identical test: the static, byte-identical
+// content (goal + safety disclosure + schema instructions) must sit before
+// the per-turn-dynamic content (varsNote + history), so provider-native
+// prefix-based prompt caching can treat that leading portion as a repeated
+// prefix. See DEVELOPMENT.md's "Reordering prompts for provider-native
+// caching" section.
+test('buildApiActionPrompt places the static schema/instructions block before the dynamic varsNote and history, for prefix-cache friendliness', () => {
+  const history = [{ action: { action: 'request' as const, method: 'GET' as const, url: '/x', reason: 'r' }, result: 'ok' as const, detail: '' }]
+  const prompt = buildApiActionPrompt('goal', history, new Set(['userId']), READ_ONLY)
+
+  const schemaIndex = prompt.indexOf('Respond with exactly one JSON object describing the next single action')
+  const varsIndex = prompt.indexOf('Values saved so far')
+  const historyIndex = prompt.indexOf('Steps taken so far:')
+
+  assert.ok(schemaIndex >= 0 && varsIndex >= 0 && historyIndex >= 0)
+  assert.ok(schemaIndex < varsIndex, 'the static schema block must come before the dynamic varsNote')
+  assert.ok(varsIndex < historyIndex, 'varsNote must come before history, both after the static prefix')
+  const closingReminderIndex = prompt.lastIndexOf('Respond with ONLY the JSON object')
+  assert.ok(closingReminderIndex > historyIndex, 'the closing format reminder must be the last thing in the prompt')
+})
+
 test('buildApiActionPrompt tells the model to declare goal-unreachable honestly instead of guessing a plausible field name', () => {
   // Regression test: found via real live testing that the model asserted a
   // plausible-but-nonexistent JSON field ($.realname) instead of admitting

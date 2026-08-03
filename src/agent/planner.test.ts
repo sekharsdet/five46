@@ -44,6 +44,31 @@ test('buildActionPrompt includes the goal, the outline, and the exact JSON schem
   assert.ok(prompt.includes('ONLY the JSON object'))
 })
 
+// Regression guard for the actual property this ordering exists for: the
+// static, byte-identical-across-every-turn content (goal + schema
+// instructions) must sit entirely BEFORE the per-turn-dynamic content
+// (history + outline), so a provider's prefix-based prompt caching
+// (OpenAI/Gemini automatic, Groq where supported) can actually treat that
+// leading portion as a repeated prefix. See DEVELOPMENT.md's "Reordering
+// prompts for provider-native caching" section.
+test('buildActionPrompt places the static schema/instructions block before the dynamic history and outline, for prefix-cache friendliness', () => {
+  const history = [{ action: { action: 'click' as const, ref: 'e1', reason: 'r' }, result: 'ok' as const, detail: '' }]
+  const prompt = buildActionPrompt('reveal the secret message', history, OUTLINE)
+
+  const schemaIndex = prompt.indexOf('Respond with exactly one JSON object describing the next single action')
+  const historyIndex = prompt.indexOf('Steps taken so far:')
+  const outlineIndex = prompt.indexOf('Elements currently visible on the page')
+
+  assert.ok(schemaIndex >= 0 && historyIndex >= 0 && outlineIndex >= 0)
+  assert.ok(schemaIndex < historyIndex, 'the static schema block must come before the dynamic history')
+  assert.ok(historyIndex < outlineIndex, 'history must come before the outline, both after the static prefix')
+  // The short closing reminder repeats the format instruction right before
+  // generation (recovering the "recency effect" the reordering trades
+  // away) — it must come after the outline, at the very end.
+  const closingReminderIndex = prompt.lastIndexOf('Respond with ONLY the JSON object')
+  assert.ok(closingReminderIndex > outlineIndex, 'the closing format reminder must be the last thing in the prompt')
+})
+
 test('buildActionPrompt tells the model to declare goal-unreachable honestly instead of guessing at the closest element', () => {
   // Regression test: found via real live testing that the model would pick
   // the nearest plausible element (e.g. an unrelated footer link) and

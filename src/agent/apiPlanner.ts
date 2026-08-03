@@ -63,16 +63,17 @@ export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], v
     validVarNames.size > 0
       ? [``, `Values saved so far, referenceable as {{name}} in a request's url/headers/body: ${[...validVarNames].join(', ')}`]
       : []
+  // Same cache-friendly ordering as planner.ts's buildActionPrompt (see its
+  // own doc comment for the full reasoning): static-across-every-turn
+  // content (opener, goal, describeSafetyMode) first, per-turn-dynamic
+  // content (varsNote, history) last, with a short closing reminder to
+  // recover the "recency effect" the reordering trades away.
   return [
     `You are an API testing agent driving real HTTP requests toward one goal, one request/check at a time.`,
     ``,
     `Goal: ${goal}`,
     ``,
     describeSafetyMode(safety),
-    ...varsNote,
-    ``,
-    `Steps taken so far:`,
-    serializeApiHistory(history),
     ``,
     `Respond with exactly one JSON object describing the next single action to take, one of:`,
     `- {"action":"request","method":"<GET|HEAD|OPTIONS|POST|PUT|PATCH|DELETE>","url":"<url>","headers":{...},"body":"<text>","saveAs":{"name":"<var>","path":"<json.path>"},"reason":"<why>"} ("headers"/"body"/"saveAs" are all optional)`,
@@ -82,8 +83,12 @@ export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], v
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely does not exist in any response seen so far, and no further request implied by the goal is likely to surface it — never guess a field/path name that looks plausible instead of checking what is actually there)`,
     ``,
     `Example: ${ACTION_SCHEMA_EXAMPLE}`,
+    ...varsNote,
     ``,
-    `Respond with ONLY the JSON object — no markdown fence, no prose before or after it.`,
+    `Steps taken so far:`,
+    serializeApiHistory(history),
+    ``,
+    `Respond with ONLY the JSON object matching one of the schemas above — no markdown fence, no prose before or after it.`,
   ].join('\n')
 }
 
