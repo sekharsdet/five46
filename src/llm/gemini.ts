@@ -22,12 +22,20 @@ import { fetchWithTimeout } from './fetchWithTimeout'
  * side of that tradeoff for a fast-moving free tier, but worth knowing if
  * agent behavior ever seems to shift between runs for no code reason.
  * Unlike OpenAI/Anthropic's Bearer/header auth, the API key goes in the
- * query string per Google's documented scheme. */
+ * query string per Google's documented scheme.
+ *
+ * `options.fastPath` swaps in `gemini-flash-lite-latest` — confirmed via a
+ * real call to resolve to `gemini-3.5-flash-lite`, the same "documented
+ * stable alias" shape as the default above, just a genuinely faster tier —
+ * used only for the high-frequency per-step decision call, never the
+ * one-time upfront plan call. Opt-in via `--fast-steps`, not default-on;
+ * see that flag's own doc comment for why. */
 export const geminiProvider: LlmProvider = {
   id: 'gemini',
   async complete(prompt, apiKey, options) {
+    const model = options?.fastPath ? 'gemini-flash-lite-latest' : 'gemini-flash-latest'
     const response = await fetchWithTimeout(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${encodeURIComponent(apiKey)}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

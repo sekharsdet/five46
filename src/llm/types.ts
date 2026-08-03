@@ -21,6 +21,19 @@
  * generation time. */
 export interface LlmCompleteOptions {
   maxOutputTokens?: number
+  /** Signals this call is a high-frequency per-step decision, not the
+   * one-time upfront plan or root-cause call — a hint, not a model name.
+   * Each provider owns whether/how it responds: Groq and Gemini map this to
+   * a genuinely faster model tier (`llama-3.1-8b-instant`,
+   * `gemini-flash-lite-latest`); OpenAI/Anthropic/Bedrock deliberately
+   * ignore it, since their default model is already the fastest tier that
+   * provider offers without risking reliability on the strict JSON-only
+   * action schema. Never set on the plan/root-cause calls — those always
+   * use each provider's default (higher-quality) model regardless of this
+   * flag. Opt-in via `--fast-steps` (`RunAgentOptions.useFastSteps`) — real,
+   * currently-unquantified risk to per-step decision quality on Groq/Gemini
+   * specifically, so this is not default-on. */
+  fastPath?: boolean
 }
 
 export interface LlmProvider {

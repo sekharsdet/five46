@@ -74,3 +74,20 @@ test('bedrockProvider forwards maxOutputTokens as inferenceConfig.maxTokens, def
     BedrockRuntimeClient.prototype.send = originalSend
   }
 })
+
+test('bedrockProvider ignores fastPath — always uses the configured Haiku model, already its fastest reliable tier', async () => {
+  const originalSend = BedrockRuntimeClient.prototype.send
+  let capturedCommand: ConverseCommand | undefined
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  BedrockRuntimeClient.prototype.send = (async function (this: BedrockRuntimeClient, command: any) {
+    capturedCommand = command
+    return { output: { message: { content: [{ text: 'ok' }] } } }
+  }) as any
+
+  try {
+    await bedrockProvider.complete('hi', 'us-east-1', { fastPath: true })
+    assert.equal(capturedCommand!.input.modelId, 'anthropic.claude-3-5-haiku-20241022-v1:0')
+  } finally {
+    BedrockRuntimeClient.prototype.send = originalSend
+  }
+})

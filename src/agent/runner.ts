@@ -75,6 +75,17 @@ export interface RunAgentOptions {
    * file. The ordinary fully-adaptive loop (every existing behavior/test)
    * is completely unchanged unless this is set. */
   useStructuredPlan?: boolean
+  /** Default false — opt-in via `--fast-steps`, deliberately not default-on
+   * (unlike `useStructuredPlan`, which earned that status only after this
+   * project's own live validation). When set, every per-turn live action
+   * decision passes `fastPath: true` to the provider (see
+   * `LlmCompleteOptions`), which Groq/Gemini map to a genuinely faster
+   * model tier; OpenAI/Anthropic/Bedrock ignore it. The one-time upfront
+   * plan call and the root-cause call never set this, regardless of this
+   * option — only the high-frequency per-step call is affected. A smaller
+   * model is a real, currently-unquantified risk to per-step decision
+   * quality, which is exactly why this isn't the default. */
+  useFastSteps?: boolean
 }
 
 function actionSignature(action: AgentAction): string {
@@ -345,7 +356,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes, planStepNote)
         let raw: string
         try {
-          raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: ACTION_MAX_OUTPUT_TOKENS })
+          raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: ACTION_MAX_OUTPUT_TOKENS, fastPath: options.useFastSteps })
         } catch (err) {
           // llm/retry.ts's own retry budget (4 attempts) is already
           // exhausted by the time this throws — found via a real, live run

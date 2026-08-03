@@ -6,7 +6,14 @@ import { fetchWithTimeout } from './fetchWithTimeout'
  * Shape verified against public API docs, not a live call (no test key
  * available in this environment). `temperature: 0` since this is used for a
  * consistency check, not creative generation — we want the same AC compared
- * against the same code to give the same answer. */
+ * against the same code to give the same answer.
+ *
+ * `options.fastPath` is deliberately ignored — `gpt-4o-mini` is already
+ * OpenAI's fastest/cheapest general-purpose tier (confirmed: no sunset
+ * date, remains fully active on the API), with no faster alternative that
+ * wouldn't risk reliability on the strict JSON-only action schema. A
+ * no-op, not an oversight — unlike groq.ts/gemini.ts, there's no real
+ * faster tier here to swap in. */
 export const openAiProvider: LlmProvider = {
   id: 'openai',
   async complete(prompt, apiKey, options) {

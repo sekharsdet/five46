@@ -352,3 +352,71 @@ test('groqProvider forwards maxOutputTokens as max_tokens, defaulting to 1024 wh
     global.fetch = originalFetch
   }
 })
+
+// fastPath (opt-in via --fast-steps): Groq and Gemini map it to a genuinely
+// faster model tier; OpenAI/Anthropic deliberately ignore it (already the
+// fastest reliable tier for their own provider).
+
+test('groqProvider uses llama-3.1-8b-instant when fastPath is set, llama-3.3-70b-versatile otherwise', async () => {
+  const originalFetch = global.fetch
+  let capturedBody: { model?: string } | undefined
+  global.fetch = (async (_url: string, init?: RequestInit) => {
+    capturedBody = JSON.parse(init!.body as string)
+    return { ok: true, json: async () => ({ choices: [{ message: { content: 'x' } }] }) } as Response
+  }) as typeof fetch
+  try {
+    await groqProvider.complete('p', 'groq-test-key', { fastPath: true })
+    assert.equal(capturedBody?.model, 'llama-3.1-8b-instant')
+    await groqProvider.complete('p', 'groq-test-key')
+    assert.equal(capturedBody?.model, 'llama-3.3-70b-versatile')
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('geminiProvider uses gemini-flash-lite-latest when fastPath is set, gemini-flash-latest otherwise', async () => {
+  const originalFetch = global.fetch
+  let capturedUrl: string | undefined
+  global.fetch = (async (url: string) => {
+    capturedUrl = url
+    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: 'x' }] } }] }) } as Response
+  }) as typeof fetch
+  try {
+    await geminiProvider.complete('p', 'gemini-test-key', { fastPath: true })
+    assert.ok(capturedUrl?.includes('/models/gemini-flash-lite-latest:generateContent'))
+    await geminiProvider.complete('p', 'gemini-test-key')
+    assert.ok(capturedUrl?.includes('/models/gemini-flash-latest:generateContent'))
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('openAiProvider ignores fastPath — always uses gpt-4o-mini, already its fastest reliable tier', async () => {
+  const originalFetch = global.fetch
+  let capturedBody: { model?: string } | undefined
+  global.fetch = (async (_url: string, init?: RequestInit) => {
+    capturedBody = JSON.parse(init!.body as string)
+    return { ok: true, json: async () => ({ choices: [{ message: { content: 'x' } }] }) } as Response
+  }) as typeof fetch
+  try {
+    await openAiProvider.complete('p', 'sk-test', { fastPath: true })
+    assert.equal(capturedBody?.model, 'gpt-4o-mini')
+  } finally {
+    global.fetch = originalFetch
+  }
+})
+
+test('anthropicProvider ignores fastPath — always uses claude-3-5-haiku-latest, already its fastest tier', async () => {
+  const originalFetch = global.fetch
+  let capturedBody: { model?: string } | undefined
+  global.fetch = (async (_url: string, init?: RequestInit) => {
+    capturedBody = JSON.parse(init!.body as string)
+    return { ok: true, json: async () => ({ content: [{ type: 'text', text: 'x' }] }) } as Response
+  }) as typeof fetch
+  try {
+    await anthropicProvider.complete('p', 'anthropic-test-key', { fastPath: true })
+    assert.equal(capturedBody?.model, 'claude-3-5-haiku-latest')
+  } finally {
+    global.fetch = originalFetch
+  }
+})

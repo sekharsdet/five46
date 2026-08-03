@@ -12,7 +12,15 @@ import { fetchWithTimeout } from './fetchWithTimeout'
  * exact model lineup does shift over time, so this may need revisiting
  * later, the same as any hardcoded provider default here. `temperature: 0`
  * for the same reason `openai.ts` uses it: a consistency check, not
- * creative generation. */
+ * creative generation.
+ *
+ * `options.fastPath` swaps in `llama-3.1-8b-instant` — a real, meaningfully
+ * faster tier on Groq's own LPU hardware (externally documented at roughly
+ * 2-8x the token/sec throughput of the 70B default), used only for the
+ * high-frequency per-step decision call, never the one-time upfront plan
+ * call. Opt-in via `--fast-steps` — a smaller model is a real,
+ * unquantified risk to per-step decision quality, not something to default
+ * on without live validation first. */
 export const groqProvider: LlmProvider = {
   id: 'groq',
   async complete(prompt, apiKey, options) {
@@ -23,7 +31,7 @@ export const groqProvider: LlmProvider = {
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: options?.fastPath ? 'llama-3.1-8b-instant' : 'llama-3.3-70b-versatile',
         temperature: 0,
         max_tokens: options?.maxOutputTokens ?? 1024,
         messages: [{ role: 'user', content: prompt }],

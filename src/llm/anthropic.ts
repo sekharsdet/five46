@@ -4,7 +4,12 @@ import { fetchWithTimeout } from './fetchWithTimeout'
 
 /** Anthropic's Messages API — https://docs.anthropic.com/en/api/messages.
  * Shape verified against public API docs, not a live call (no test key
- * available in this environment). */
+ * available in this environment).
+ *
+ * `options.fastPath` is deliberately ignored — `claude-3-5-haiku-latest` is
+ * already Anthropic's fastest tier; there's no faster alternative that
+ * wouldn't risk reliability on the strict JSON-only action schema. A
+ * no-op, not an oversight. */
 export const anthropicProvider: LlmProvider = {
   id: 'anthropic',
   async complete(prompt, apiKey, options) {

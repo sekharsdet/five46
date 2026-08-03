@@ -43,6 +43,10 @@ export interface RunApiTestOptions {
    * The ordinary fully-adaptive loop is completely unchanged unless this is
    * set. */
   useStructuredPlan?: boolean
+  /** Same meaning as `RunAgentOptions.useFastSteps` — see its own doc
+   * comment. Default false, opt-in via `--fast-steps`, only affects the
+   * per-turn live action-decision call, never the upfront plan call. */
+  useFastSteps?: boolean
 }
 
 const SAFE_METHODS = new Set<HttpMethod>(['GET', 'HEAD', 'OPTIONS'])
@@ -248,7 +252,7 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
       const prompt = buildApiActionPrompt(options.goal, history, validVarNames, options.safety)
       let raw: string
       try {
-        raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: API_ACTION_MAX_OUTPUT_TOKENS })
+        raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: API_ACTION_MAX_OUTPUT_TOKENS, fastPath: options.useFastSteps })
       } catch (err) {
         // Same real, live-found gap as runner.ts's identical catch — see
         // its own doc comment. llm/retry.ts's own retry budget is already

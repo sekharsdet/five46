@@ -63,6 +63,44 @@ test('runApiTest bounds each live per-turn call with API_ACTION_MAX_OUTPUT_TOKEN
   }
 })
 
+test('runApiTest with useFastSteps sends fastPath:true on every live per-turn call', async () => {
+  const server = await startApiTestServer()
+  try {
+    const capturedOptions: ({ fastPath?: boolean } | undefined)[] = []
+    const responses = [
+      JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' }),
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm ok' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'confirmed' }),
+    ]
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(_prompt, _apiKey, options) {
+        capturedOptions.push(options)
+        return responses[Math.min(turn++, responses.length - 1)]
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items and confirm the request succeeded',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+      useFastSteps: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(capturedOptions.length > 0)
+    assert.ok(
+      capturedOptions.every((options) => options?.fastPath === true),
+      'every live per-turn call must set fastPath:true when useFastSteps is on'
+    )
+  } finally {
+    await server.close()
+  }
+})
+
 test('runApiTest drives a full create -> saveAs -> read -> delete chain against a real server', async () => {
   const server = await startApiTestServer()
   try {
@@ -538,7 +576,7 @@ test('runApiTest with useStructuredPlan fast-paths a whole well-formed plan, mak
   const server = await startApiTestServer()
   try {
     let calls = 0
-    let capturedOptions: { maxOutputTokens?: number } | undefined
+    let capturedOptions: { maxOutputTokens?: number; fastPath?: boolean } | undefined
     const provider: LlmProvider = {
       id: 'fake',
       async complete(_prompt, _apiKey, options) {
@@ -565,6 +603,7 @@ test('runApiTest with useStructuredPlan fast-paths a whole well-formed plan, mak
       apiKey: 'fake-key',
       safety: safetyMode(server.url),
       useStructuredPlan: true,
+      useFastSteps: true,
     })
 
     assert.equal(run.outcome, 'goal-reached')
@@ -573,6 +612,7 @@ test('runApiTest with useStructuredPlan fast-paths a whole well-formed plan, mak
     assert.equal(run.planStats?.fastPathedSteps, 3, 'request, assertion (after a successful request), and done should all fast-path')
     assert.equal(calls, 1, 'only the upfront planning call — zero live per-step decisions')
     assert.equal(capturedOptions?.maxOutputTokens, PLAN_MAX_OUTPUT_TOKENS, 'the upfront plan call must be bounded by PLAN_MAX_OUTPUT_TOKENS')
+    assert.notEqual(capturedOptions?.fastPath, true, 'the upfront plan call must never set fastPath, even with useFastSteps on')
   } finally {
     await server.close()
   }

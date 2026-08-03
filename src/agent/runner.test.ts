@@ -151,6 +151,89 @@ test('runAgent with useStructuredPlan bounds the upfront plan call with PLAN_MAX
   }
 })
 
+test('runAgent with useFastSteps sends fastPath:true on every live per-turn call, but never on the upfront plan call', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const capturedOptions: ({ fastPath?: boolean } | undefined)[] = []
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt, _apiKey, options) {
+        turn++
+        capturedOptions.push(options)
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      useFastSteps: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(capturedOptions.length > 0)
+    assert.ok(
+      capturedOptions.every((options) => options?.fastPath === true),
+      'every live per-turn call must set fastPath:true when useFastSteps is on'
+    )
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with both useStructuredPlan and useFastSteps never sets fastPath on the upfront plan call', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let capturedOptions: { fastPath?: boolean } | undefined
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(_prompt, _apiKey, options) {
+        capturedOptions = options
+        return JSON.stringify({
+          steps: [
+            { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+            { action: 'done', outcome: 'goal-reached', reason: 'done' },
+          ],
+        })
+      },
+    }
+
+    await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+      useFastSteps: true,
+    })
+
+    assert.notEqual(capturedOptions?.fastPath, true)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
 test('runAgent recovers from a real async-loading page by using wait, where scrolling alone previously left it stuck', async (t) => {
   // The real, live-found gap this fixes: a page whose target content only
   // appears after an async client-side delay (the-internet.herokuapp.com's

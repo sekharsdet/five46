@@ -24,6 +24,10 @@ import { DEFAULT_LLM_TIMEOUT_MS } from './fetchWithTimeout'
  * than a separately copy-pasted key. Uses the Converse API, Bedrock's
  * unified request/response shape across model providers (Anthropic, Meta,
  * Amazon, ...), so switching the underlying model doesn't change this code.
+ *
+ * `options.fastPath` is deliberately ignored — the configured Haiku model
+ * is already the fastest tier this codebase trusts for the strict
+ * JSON-only action schema; a no-op, not an oversight.
  */
 export const bedrockProvider: LlmProvider = {
   id: 'bedrock',

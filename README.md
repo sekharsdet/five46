@@ -56,6 +56,11 @@ It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` fil
   the whole goal, then most steps execute directly against the real
   page/response with no further live decision needed; `--no-structured-plan`
   opts back into the fully-adaptive, live-decision-every-step loop.
+- **Fast per-step decisions** (`--fast-steps`, opt-in) — on Groq/Gemini,
+  swaps in a genuinely faster model tier for the high-frequency per-step
+  decision only; the upfront plan always uses your configured model. No
+  effect on OpenAI/Anthropic/Bedrock, already at their fastest reliable
+  tier. Opt-in, not default — see "Fast per-step decisions" below.
 
 ## five46 vs. cloud AI testing platforms
 
@@ -120,12 +125,18 @@ export FIVE46_LLM_API_KEY=sk-...    # for bedrock, use your AWS region instead
 Don't have a key yet? Pick whichever's easiest to get, or whichever you
 already use — five46 calls one small, cheap model per provider on every
 step (never a "flagship" model), so per-run cost is low regardless of
-which one you pick:
+which one you pick. **If wall-clock speed is what you care about most,
+pick Groq** — its whole differentiator is LPU-based inference hardware
+built specifically for fast token generation, meaningfully faster
+round-trips than typical GPU-hosted inference for an equivalent-size
+model. Since a run's time is dominated by LLM round-trip latency (not
+five46's own code), the provider you pick is the single biggest lever
+you control over how fast a run feels:
 
 | Provider | Get a key at | Notes |
 |---|---|---|
+| **Groq** | [console.groq.com/keys](https://console.groq.com/keys) → "Create API Key" | Free tier, no credit card required, generous rate limits — also the fastest provider here, built on inference-optimized hardware. |
 | **Gemini** | [aistudio.google.com](https://aistudio.google.com/apikey) → "Get API key" | Free tier, no credit card required — the fastest path to a first successful run. |
-| **Groq** | [console.groq.com/keys](https://console.groq.com/keys) → "Create API Key" | Free tier, no credit card required, generous rate limits. |
 | **OpenAI** | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) → "Create new secret key" | Account creation is free, but a key can't make real calls until you add a payment method — no meaningful free tier. |
 | **Anthropic** | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) → "Create Key" | Same shape as OpenAI — you can browse the console for free, but need billing set up before a key actually works. |
 | **AWS Bedrock** | No key — see below | Uses your existing AWS credentials instead of an API key. |
@@ -161,7 +172,8 @@ and report whether it's flaky — see below), `--record-video` (save a
 `.webm` of the whole session), `--project name` (pull defaults from
 `five46.config.json` — see below), `--no-structured-plan` (opt out of the
 default upfront-plan-then-fast-path behavior and use the fully-adaptive,
-live-decision-every-step loop instead — see below).
+live-decision-every-step loop instead — see below), `--fast-steps` (opt-in,
+use a faster model for per-step decisions on Groq/Gemini — see below).
 
 A successful run writes a real, human-readable Playwright `.spec.ts` file
 containing every confirmed-working step — re-runnable any time via
@@ -298,6 +310,28 @@ decision every single step) — works the same way on `five46 api`. Note:
 this default applies to the `test`/`api` CLI commands only — MCP-driven
 runs (`five46 mcp`) always use the fully-adaptive loop regardless, since
 structured planning isn't exposed as an MCP tool parameter.
+
+## Fast per-step decisions
+
+```bash
+five46 test http://localhost:3000 --goal "..." --fast-steps
+```
+
+Opt-in — off by default. On Groq and Gemini, swaps in a genuinely faster
+model tier (`llama-3.1-8b-instant`, `gemini-flash-lite-latest`) for the
+high-frequency per-step action-decision call only; the one-time upfront
+plan (and the root-cause hypothesis call, if triggered) always use your
+configured model, never the fast one. On OpenAI, Anthropic, and Bedrock
+this flag has no effect — each is already at the fastest model tier that
+provider offers without risking reliability on the strict JSON-only action
+schema.
+
+This is a real tradeoff, not a free win: a smaller/faster model is a
+genuine, currently-unquantified risk to per-step decision quality (more
+wrong-ref picks or retries), which is exactly why it's opt-in rather than
+default like structured planning. If wall-clock speed matters most to you,
+also consider picking Groq as your provider in the first place — see
+"Getting a key" above.
 
 ## MCP server (IDE-embedded use)
 
