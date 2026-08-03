@@ -9,7 +9,7 @@ import { fetchWithTimeout } from './fetchWithTimeout'
  * against the same code to give the same answer. */
 export const openAiProvider: LlmProvider = {
   id: 'openai',
-  async complete(prompt, apiKey) {
+  async complete(prompt, apiKey, options) {
     const response = await fetchWithTimeout('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -19,6 +19,7 @@ export const openAiProvider: LlmProvider = {
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         temperature: 0,
+        max_tokens: options?.maxOutputTokens ?? 1024,
         messages: [{ role: 'user', content: prompt }],
       }),
     })

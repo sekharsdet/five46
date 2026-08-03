@@ -6,7 +6,7 @@ import { buildApiActionPrompt, buildApiPlanPrompt, checkVarReferences, parseApiA
 import { countConfirmationClauses } from './planner'
 import { isHostAllowed, isMethodAllowed, effectiveMethod } from './apiTypes'
 import type { ApiAction, ApiHistoryEntry, ApiPlan, ApiTestRun, ExecutedApiStep, HttpMethod, SafetyMode } from './apiTypes'
-import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId } from './runLoop'
+import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId, API_ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
 export interface RunApiTestOptions {
   baseUrl: string
@@ -38,8 +38,10 @@ export interface RunApiTestOptions {
    * console output. */
   onWrite?: (method: HttpMethod, url: string, reason: string) => void
   /** Same meaning as `RunAgentOptions.useStructuredPlan` — see its own doc
-   * comment. Default false; the ordinary fully-adaptive loop is completely
-   * unchanged unless this is set. */
+   * comment, including the "default false at this engine layer, `cli.ts`
+   * defaults it to true for the `api` command, MCP never sets it" nuance.
+   * The ordinary fully-adaptive loop is completely unchanged unless this is
+   * set. */
   useStructuredPlan?: boolean
 }
 
@@ -154,7 +156,7 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   let fastPathedSteps = 0
   if (options.useStructuredPlan) {
     try {
-      const planRaw = await options.provider.complete(buildApiPlanPrompt(options.goal, options.safety), options.apiKey)
+      const planRaw = await options.provider.complete(buildApiPlanPrompt(options.goal, options.safety), options.apiKey, { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS })
       const parsedPlan = parseApiPlan(planRaw)
       if (parsedPlan.ok) plan = parsedPlan.plan
     } catch {
@@ -246,7 +248,7 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
       const prompt = buildApiActionPrompt(options.goal, history, validVarNames, options.safety)
       let raw: string
       try {
-        raw = await options.provider.complete(prompt, options.apiKey)
+        raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: API_ACTION_MAX_OUTPUT_TOKENS })
       } catch (err) {
         // Same real, live-found gap as runner.ts's identical catch — see
         // its own doc comment. llm/retry.ts's own retry budget is already

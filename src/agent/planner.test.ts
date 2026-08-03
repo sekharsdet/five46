@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { serializeOutline, buildActionPrompt, parseAgentAction, requiresConfirmation, countConfirmationClauses, isDestructiveClickTarget, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
 import { USERNAME_PLACEHOLDER } from './browser'
 import type { PageOutline } from './types'
+import { PLAN_MAX_OUTPUT_TOKENS, HARD_MAX_STEPS } from './runLoop'
 
 const OUTLINE: PageOutline = {
   elements: [
@@ -438,4 +439,27 @@ test('describePlannedStep renders each planned action type in a short, human-rea
   assert.equal(describePlannedStep({ action: 'wait', reason: 'r' }), 'wait')
   assert.equal(describePlannedStep({ action: 'assert_page_text', expectedText: 'Hello World!', reason: 'r' }), 'assert the page contains "Hello World!"')
   assert.equal(describePlannedStep({ action: 'done', outcome: 'goal-reached', reason: 'r' }), 'done (goal-reached)')
+})
+
+// Regression guard for PLAN_MAX_OUTPUT_TOKENS (runLoop.ts): a real plan
+// response has to fit comfortably under this cap or the upfront plan call
+// gets truncated mid-JSON — a failure mode no provider's empty-completion
+// diagnostic catches (see runLoop.ts's own doc comment on the constant).
+// This is a static, non-network sanity check: build the largest realistic
+// plan (HARD_MAX_STEPS worth of step objects) and confirm it stays well
+// under the cap, using a deliberately pessimistic chars-per-token ratio
+// (~3.2, vs. the commonly-cited ~4) so this proves real headroom, not "it
+// fits exactly."
+test('a HARD_MAX_STEPS-sized plan response stays comfortably under PLAN_MAX_OUTPUT_TOKENS', () => {
+  const steps = Array.from({ length: HARD_MAX_STEPS }, (_, i) => ({
+    action: 'click',
+    target: { role: 'link', nameContains: `item ${i}` },
+    reason: `select item ${i} of ${HARD_MAX_STEPS}, a realistically-worded reason string`,
+  }))
+  const raw = JSON.stringify({ steps })
+  const estimatedTokens = Math.ceil(raw.length / 3.2)
+  assert.ok(
+    estimatedTokens < PLAN_MAX_OUTPUT_TOKENS,
+    `estimated ${estimatedTokens} tokens for a ${HARD_MAX_STEPS}-step plan must stay under the ${PLAN_MAX_OUTPUT_TOKENS}-token cap`
+  )
 })

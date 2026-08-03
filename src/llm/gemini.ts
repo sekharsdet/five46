@@ -25,7 +25,7 @@ import { fetchWithTimeout } from './fetchWithTimeout'
  * query string per Google's documented scheme. */
 export const geminiProvider: LlmProvider = {
   id: 'gemini',
-  async complete(prompt, apiKey) {
+  async complete(prompt, apiKey, options) {
     const response = await fetchWithTimeout(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
@@ -33,6 +33,19 @@ export const geminiProvider: LlmProvider = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
+          // thinkingBudget: 1 (not 0 — confirmed via a real call that 0 is
+          // rejected as INVALID_ARGUMENT for this model) — a real, live bug
+          // found the moment maxOutputTokens started being capped: this
+          // model's "thinking" tokens are drawn from the SAME
+          // maxOutputTokens budget as the visible answer (confirmed via a
+          // real call: a trivial prompt with maxOutputTokens:400 spent 237
+          // tokens on invisible thinking, leaving too little for the
+          // truncated-but-non-empty JSON answer that then failed to parse).
+          // Every prompt in this codebase is a rigid, closed-schema JSON
+          // classification task, never open-ended reasoning, so extended
+          // thinking adds latency and truncation risk for zero benefit —
+          // same reasoning as `temperature: 0` on the other providers.
+          generationConfig: { maxOutputTokens: options?.maxOutputTokens ?? 1024, thinkingConfig: { thinkingBudget: 1 } },
         }),
       }
     )

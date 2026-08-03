@@ -27,7 +27,7 @@ import { DEFAULT_LLM_TIMEOUT_MS } from './fetchWithTimeout'
  */
 export const bedrockProvider: LlmProvider = {
   id: 'bedrock',
-  async complete(prompt, region) {
+  async complete(prompt, region, options) {
     // maxAttempts: 1 — the AWS SDK's own default StandardRetryStrategy would
     // otherwise already retry throttling/5xx internally before send()
     // rejects at all, compounding with the outer retry layer llm/retry.ts
@@ -44,6 +44,7 @@ export const bedrockProvider: LlmProvider = {
     const command = new ConverseCommand({
       modelId: 'anthropic.claude-3-5-haiku-20241022-v1:0',
       messages: [{ role: 'user', content: [{ text: prompt }] }],
+      inferenceConfig: { maxTokens: options?.maxOutputTokens ?? 1024 },
     })
     const response = await client.send(command)
     const content = response.output?.message?.content ?? []

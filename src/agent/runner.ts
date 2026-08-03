@@ -3,7 +3,7 @@ import { launchAgentBrowser, snapshot, executeAction } from './browser'
 import type { LoginCredentials, StorageState } from './browser'
 import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, resolvePlannedTarget } from './planner'
 import type { AgentAction, AgentPlan, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
-import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId } from './runLoop'
+import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId, ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
 export interface RunAgentOptions {
   url: string
@@ -61,12 +61,19 @@ export interface RunAgentOptions {
    * "no analog, and that's correct, not a gap" precedent already
    * established for self-healing selectors. */
   recordVideo?: boolean
-  /** Default false. When set: one extra upfront `provider.complete()` call
-   * plans the whole goal (see `planner.ts`'s `buildPlanPrompt`), and most
-   * planned steps then execute directly against a fresh page snapshot with
-   * no further LLM call at all — see the dedicated fast-path section in
-   * this file. Off by default; the ordinary fully-adaptive loop (every
-   * existing behavior/test) is completely unchanged unless this is set. */
+  /** Default false at this engine layer — `runAgent()` itself doesn't
+   * default this to `true`; `cli.ts` is the caller responsible for
+   * defaulting it to `true` for the `test` command (see
+   * `resolveStructuredPlan`), so every existing test calling `runAgent()`
+   * directly without setting this is unaffected by that CLI-level default.
+   * MCP (`src/mcp/tools.ts`) also never sets this, so MCP-driven runs stay
+   * fully-adaptive regardless — a deliberate scope boundary, not an
+   * oversight. When set: one extra upfront `provider.complete()` call plans
+   * the whole goal (see `planner.ts`'s `buildPlanPrompt`), and most planned
+   * steps then execute directly against a fresh page snapshot with no
+   * further LLM call at all — see the dedicated fast-path section in this
+   * file. The ordinary fully-adaptive loop (every existing behavior/test)
+   * is completely unchanged unless this is set. */
   useStructuredPlan?: boolean
 }
 
@@ -178,7 +185,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     if (options.useStructuredPlan) {
       try {
         const initialOutline = await snapshot(browser.page, undefined, true)
-        const planRaw = await options.provider.complete(buildPlanPrompt(options.goal, initialOutline), options.apiKey)
+        const planRaw = await options.provider.complete(buildPlanPrompt(options.goal, initialOutline), options.apiKey, { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS })
         const parsedPlan = parsePlan(planRaw)
         if (parsedPlan.ok) plan = parsedPlan.plan
       } catch {
@@ -338,7 +345,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes, planStepNote)
         let raw: string
         try {
-          raw = await options.provider.complete(prompt, options.apiKey)
+          raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: ACTION_MAX_OUTPUT_TOKENS })
         } catch (err) {
           // llm/retry.ts's own retry budget (4 attempts) is already
           // exhausted by the time this throws — found via a real, live run

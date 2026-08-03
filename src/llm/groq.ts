@@ -15,7 +15,7 @@ import { fetchWithTimeout } from './fetchWithTimeout'
  * creative generation. */
 export const groqProvider: LlmProvider = {
   id: 'groq',
-  async complete(prompt, apiKey) {
+  async complete(prompt, apiKey, options) {
     const response = await fetchWithTimeout('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -25,6 +25,7 @@ export const groqProvider: LlmProvider = {
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
         temperature: 0,
+        max_tokens: options?.maxOutputTokens ?? 1024,
         messages: [{ role: 'user', content: prompt }],
       }),
     })

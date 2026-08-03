@@ -17,6 +17,32 @@ export const HARD_MAX_STEPS = 50
  * existing gap to match. */
 export const HARD_MAX_REPEAT = 10
 
+/** Output-token caps per LLM call type — see DEVELOPMENT.md's "Bounding LLM
+ * output tokens" section for the sizing rationale. A too-generous cap costs
+ * nothing (providers stop naturally at a real end-of-response); a too-tight
+ * one risks truncating a legitimate response mid-JSON, which fails parsing
+ * exactly like any other unparseable response and is NOT caught by any
+ * provider's empty-completion diagnostics (those only fire on a genuinely
+ * empty completion, not a truncated-but-non-empty one). Chosen with real
+ * margin above the actual prompt schemas (planner.ts/apiPlanner.ts), not
+ * guessed — see planner.test.ts's sizing sanity check for PLAN_MAX_OUTPUT_TOKENS. */
+/** Raised from an original 400 after a real live failure: even with Gemini's
+ * `thinkingBudget: 1` (gemini.ts), thinking-token usage still has real
+ * variance on a realistic prompt (33-60+ tokens observed, confirmed via
+ * direct calls) — occasionally enough to truncate a legitimate response mid-JSON
+ * at 400. Raised to match the shared 1024 fallback every provider already
+ * uses when a caller omits maxOutputTokens entirely, removing the
+ * Gemini-fragile special case rather than tuning it tighter. */
+export const ACTION_MAX_OUTPUT_TOKENS = 1024
+/** Larger than the browser engine's action cap: an API `request` action can
+ * carry a real request body (e.g. a multi-field JSON payload for a POST),
+ * meaningfully bigger than a browser action's `{"action":"click","ref":"e3",...}`. */
+export const API_ACTION_MAX_OUTPUT_TOKENS = 800
+/** Covers an upfront plan of up to HARD_MAX_STEPS (50) step objects. */
+export const PLAN_MAX_OUTPUT_TOKENS = 4096
+/** A "1-3 sentence hypothesis" plus a short suggestion — see rootCause.ts. */
+export const ROOT_CAUSE_MAX_OUTPUT_TOKENS = 600
+
 export function makeRunId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 }

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { buildRootCausePrompt, generateRootCauseHypothesis } from './rootCause'
 import type { TestRun, PageOutline } from './types'
 import type { LlmProvider } from '../llm/types'
+import { ROOT_CAUSE_MAX_OUTPUT_TOKENS } from './runLoop'
 
 const OUTLINE: PageOutline = {
   elements: [{ ref: 'e1', tag: 'button', role: 'button', name: 'Submit', selector: '#submit' }],
@@ -82,6 +83,19 @@ test('generateRootCauseHypothesis returns the provider\'s response as-is', async
   const provider: LlmProvider = { id: 'fake', async complete() { return '  A likely cause is a stale cache.  ' } }
   const result = await generateRootCauseHypothesis(assertTextFailureRun(), provider, 'fake-key')
   assert.equal(result, 'A likely cause is a stale cache.')
+})
+
+test('generateRootCauseHypothesis bounds the call with ROOT_CAUSE_MAX_OUTPUT_TOKENS', async () => {
+  let capturedOptions: { maxOutputTokens?: number } | undefined
+  const provider: LlmProvider = {
+    id: 'fake',
+    async complete(_prompt, _apiKey, options) {
+      capturedOptions = options
+      return 'a hypothesis'
+    },
+  }
+  await generateRootCauseHypothesis(assertTextFailureRun(), provider, 'fake-key')
+  assert.equal(capturedOptions?.maxOutputTokens, ROOT_CAUSE_MAX_OUTPUT_TOKENS)
 })
 
 test('generateRootCauseHypothesis never rejects, even when the provider throws', async () => {

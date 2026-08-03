@@ -109,11 +109,11 @@ export function withRetry(provider: LlmProvider, options?: RetryOptions): LlmPro
 
   return {
     id: provider.id,
-    async complete(prompt, apiKey) {
+    async complete(prompt, apiKey, completeOptions) {
       let lastError: unknown
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-          return await provider.complete(prompt, apiKey)
+          return await provider.complete(prompt, apiKey, completeOptions)
         } catch (err) {
           lastError = err
           if (attempt === maxAttempts || !isRetryableLlmError(err)) throw err

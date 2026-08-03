@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { buildApiRootCausePrompt, generateApiRootCauseHypothesis } from './apiRootCause'
 import type { ApiTestRun } from './apiTypes'
 import type { LlmProvider } from '../llm/types'
+import { ROOT_CAUSE_MAX_OUTPUT_TOKENS } from './runLoop'
 
 function assertJsonPathFailureRun(overrides: Partial<ApiTestRun> = {}): ApiTestRun {
   return {
@@ -44,6 +45,19 @@ test('buildApiRootCausePrompt never includes the raw mismatched live value from 
 test('buildApiRootCausePrompt returns undefined when the run has no failed step', () => {
   const run: ApiTestRun = { runId: 'r2', baseUrl: 'http://x', goal: 'g', outcome: 'goal-reached', steps: [] }
   assert.equal(buildApiRootCausePrompt(run), undefined)
+})
+
+test('generateApiRootCauseHypothesis bounds the call with ROOT_CAUSE_MAX_OUTPUT_TOKENS', async () => {
+  let capturedOptions: { maxOutputTokens?: number } | undefined
+  const provider: LlmProvider = {
+    id: 'fake',
+    async complete(_prompt, _apiKey, options) {
+      capturedOptions = options
+      return 'a hypothesis'
+    },
+  }
+  await generateApiRootCauseHypothesis(assertJsonPathFailureRun(), provider, 'fake-key')
+  assert.equal(capturedOptions?.maxOutputTokens, ROOT_CAUSE_MAX_OUTPUT_TOKENS)
 })
 
 test('generateApiRootCauseHypothesis returns the provider\'s response as-is', async () => {

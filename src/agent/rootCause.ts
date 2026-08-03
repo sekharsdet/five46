@@ -2,6 +2,7 @@ import type { LlmProvider } from '../llm/types'
 import type { HistoryEntry, TestRun } from './types'
 import { serializeOutline, serializeHistory } from './planner'
 import { describeAction, findFailedStep } from './failureReport'
+import { ROOT_CAUSE_MAX_OUTPUT_TOKENS } from './runLoop'
 
 /** Builds the "why did this fail" prompt from *only* what the LLM already
  * saw during the run — the failed step's own outline (`serializeOutline`,
@@ -76,7 +77,7 @@ export async function generateRootCauseHypothesis(run: TestRun, provider: LlmPro
   const prompt = buildRootCausePrompt(run)
   if (!prompt) return "couldn't generate a root-cause hypothesis: no failed step found in this run"
   try {
-    const text = await provider.complete(prompt, apiKey)
+    const text = await provider.complete(prompt, apiKey, { maxOutputTokens: ROOT_CAUSE_MAX_OUTPUT_TOKENS })
     return text.trim() || '(the LLM returned an empty response for this analysis)'
   } catch (err) {
     return `couldn't generate a root-cause hypothesis: ${err instanceof Error ? err.message : String(err)}`

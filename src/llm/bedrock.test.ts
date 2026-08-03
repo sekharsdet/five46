@@ -55,3 +55,22 @@ test('bedrockProvider configures its own request timeout via the SDK requestHand
     BedrockRuntimeClient.prototype.send = originalSend
   }
 })
+
+test('bedrockProvider forwards maxOutputTokens as inferenceConfig.maxTokens, defaulting to 1024 when omitted', async () => {
+  const originalSend = BedrockRuntimeClient.prototype.send
+  let capturedCommand: ConverseCommand | undefined
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  BedrockRuntimeClient.prototype.send = (async function (this: BedrockRuntimeClient, command: any) {
+    capturedCommand = command
+    return { output: { message: { content: [{ text: 'ok' }] } } }
+  }) as any
+
+  try {
+    await bedrockProvider.complete('hi', 'us-east-1', { maxOutputTokens: 500 })
+    assert.equal(capturedCommand!.input.inferenceConfig?.maxTokens, 500)
+    await bedrockProvider.complete('hi', 'us-east-1')
+    assert.equal(capturedCommand!.input.inferenceConfig?.maxTokens, 1024)
+  } finally {
+    BedrockRuntimeClient.prototype.send = originalSend
+  }
+})

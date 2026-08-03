@@ -9,6 +9,8 @@
 
 You just changed something, and you want to know — right now, against the real running thing — whether it actually works, without first writing a test yourself. Give five46 a plain-English goal — "log in and confirm the dashboard loads," "create a user via POST, then confirm it via GET" — and an LLM, using your own OpenAI, Anthropic, Gemini, Groq, or AWS Bedrock key, drives your real app or real API, one real action at a time, and tells you honestly whether it worked, with a root-cause hypothesis if it didn't. Once it does, that exact run is captured as a real, standalone Playwright (or `node:test`) spec you keep — so the same check that helped you while you were building the feature becomes a permanent regression test afterward, with no five46 or LLM involved in ever running it again.
 
+![five46 driving a real browser through a login, add-to-cart, and checkout flow, then confirming the order was placed](./assets/demo.gif)
+
 > **Status:** early proof of concept, verified end-to-end against real live LLM keys across dozens of real-world sites and APIs.
 
 If five46 is useful to you, a ⭐ on [GitHub](https://github.com/sekharsdet/five46) helps other people find it — much appreciated!
@@ -50,9 +52,10 @@ It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` fil
   reusable, named target defaults (url, session, safety flags).
 - **Video replay** — `--record-video` records the whole session as a
   `.webm`.
-- **Structured planning** — `--structured-plan` plans the whole goal
-  upfront with one extra LLM call, then executes most steps directly
-  against the real page/response with no further live decision needed.
+- **Structured planning** — on by default, one extra upfront LLM call plans
+  the whole goal, then most steps execute directly against the real
+  page/response with no further live decision needed; `--no-structured-plan`
+  opts back into the fully-adaptive, live-decision-every-step loop.
 
 ## five46 vs. cloud AI testing platforms
 
@@ -156,9 +159,9 @@ elements, e.g. "Delete Account"), `--no-root-cause` (skip the extra LLM
 call that analyzes a failed assertion), `--repeat N` (run the goal N times
 and report whether it's flaky — see below), `--record-video` (save a
 `.webm` of the whole session), `--project name` (pull defaults from
-`five46.config.json` — see below), `--structured-plan` (plan the whole
-goal upfront, executing most steps with no further live LLM decision —
-see below).
+`five46.config.json` — see below), `--no-structured-plan` (opt out of the
+default upfront-plan-then-fast-path behavior and use the fully-adaptive,
+live-decision-every-step loop instead — see below).
 
 A successful run writes a real, human-readable Playwright `.spec.ts` file
 containing every confirmed-working step — re-runnable any time via
@@ -277,17 +280,24 @@ player.
 
 ## Structured planning
 
+On by default. One extra LLM call plans the whole goal upfront; most steps
+then execute directly against the real page/response with no further live
+decision — falling back to a normal live decision only when a step's
+prediction doesn't resolve cleanly. Same safety guarantees as an ordinary
+run (destructive-click gating, method/host allowlisting) are enforced
+independently at the fast path too, not skipped. This is the single biggest
+lever for cutting a run's wall-clock time, since LLM round-trip latency —
+not five46's own code — is the dominant per-run cost.
+
 ```bash
-five46 test http://localhost:3000 --goal "..." --structured-plan
+five46 test http://localhost:3000 --goal "..." --no-structured-plan
 ```
 
-One extra LLM call plans the whole goal upfront; most steps then execute
-directly against the real page/response with no further live decision —
-falling back to a normal live decision only when a step's prediction
-doesn't resolve cleanly. Same safety guarantees as an ordinary run
-(destructive-click gating, method/host allowlisting) are enforced
-independently at the fast path too, not skipped. Off by default; works on
-`five46 api` too.
+`--no-structured-plan` opts back into the fully-adaptive loop (a live
+decision every single step) — works the same way on `five46 api`. Note:
+this default applies to the `test`/`api` CLI commands only — MCP-driven
+runs (`five46 mcp`) always use the fully-adaptive loop regardless, since
+structured planning isn't exposed as an MCP tool parameter.
 
 ## MCP server (IDE-embedded use)
 

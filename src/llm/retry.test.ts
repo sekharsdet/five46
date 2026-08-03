@@ -137,6 +137,22 @@ test('withRetry preserves the provider id unchanged', () => {
   assert.equal(withRetry(fakeProvider).id, 'fake-provider-id')
 })
 
+test('withRetry forwards the third options parameter to the underlying provider unchanged', async () => {
+  let capturedOptions: unknown
+  const fakeProvider: LlmProvider = {
+    id: 'fake',
+    async complete(_prompt, _apiKey, options) {
+      capturedOptions = options
+      return 'ok'
+    },
+  }
+  const provider = withRetry(fakeProvider, { sleep: fakeSleep([]) })
+
+  const result = await provider.complete('prompt', 'key', { maxOutputTokens: 123 })
+  assert.equal(result, 'ok')
+  assert.deepEqual(capturedOptions, { maxOutputTokens: 123 })
+})
+
 test('withRetry caps backoff delay at maxDelayMs', async () => {
   let calls = 0
   const fakeProvider: LlmProvider = {

@@ -4,7 +4,7 @@ import { spawnSync, spawn } from 'child_process'
 import { join } from 'path'
 import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { parseAgentArgs, parseApiArgs, parseDiffArgs, parseListArgs, withProjectHeaderLine } from './cli'
+import { parseAgentArgs, parseApiArgs, parseDiffArgs, parseListArgs, withProjectHeaderLine, resolveStructuredPlan } from './cli'
 
 // cli.ts guards its own `main()` invocation behind `require.main === module`
 // specifically so this import doesn't trigger a full CLI run as a side
@@ -62,6 +62,12 @@ test('parseAgentArgs recognizes --structured-plan, leaving it undefined when not
   const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--structured-plan'])
   assert.equal(result.structuredPlan, true)
   assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).structuredPlan, undefined)
+})
+
+test('parseAgentArgs recognizes --no-structured-plan, leaving it undefined when not passed', () => {
+  const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--no-structured-plan'])
+  assert.equal(result.noStructuredPlan, true)
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).noStructuredPlan, undefined)
 })
 
 test('parseListArgs takes a positional dir and a --project filter, in either order', () => {
@@ -127,6 +133,21 @@ test('parseApiArgs recognizes --structured-plan, leaving it undefined when not p
   const result = parseApiArgs(['http://localhost:3000', '--goal', 'g', '--structured-plan'])
   assert.equal(result.structuredPlan, true)
   assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).structuredPlan, undefined)
+})
+
+test('parseApiArgs recognizes --no-structured-plan, leaving it undefined when not passed', () => {
+  const result = parseApiArgs(['http://localhost:3000', '--goal', 'g', '--no-structured-plan'])
+  assert.equal(result.noStructuredPlan, true)
+  assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).noStructuredPlan, undefined)
+})
+
+test('resolveStructuredPlan defaults to true when --no-structured-plan was not passed', () => {
+  assert.equal(resolveStructuredPlan({}), true)
+  assert.equal(resolveStructuredPlan({ noStructuredPlan: undefined }), true)
+})
+
+test('resolveStructuredPlan resolves to false when --no-structured-plan was passed', () => {
+  assert.equal(resolveStructuredPlan({ noStructuredPlan: true }), false)
 })
 
 test('parseApiArgs sets allowWrites/allowDeletes independently', () => {
@@ -219,6 +240,18 @@ test('CLI "test" subcommand with --structured-plan still fails at the same missi
 
 test('CLI "api" subcommand with --structured-plan still fails at the same missing-API-key preflight check, without launching anything', () => {
   const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g', '--structured-plan'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "test" subcommand with --no-structured-plan still fails at the same missing-API-key preflight check, without launching anything', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--no-structured-plan'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "api" subcommand with --no-structured-plan still fails at the same missing-API-key preflight check, without launching anything', () => {
+  const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g', '--no-structured-plan'])
   assert.notEqual(status, 0)
   assert.ok(stderr.includes('requires an LLM API key'))
 })

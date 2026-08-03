@@ -2,6 +2,7 @@ import type { LlmProvider } from '../llm/types'
 import type { ApiHistoryEntry, ApiTestRun } from './apiTypes'
 import { describeApiAction, serializeApiHistory } from './apiPlanner'
 import { findFailedApiStep } from './apiFailureReport'
+import { ROOT_CAUSE_MAX_OUTPUT_TOKENS } from './runLoop'
 
 /** API-engine counterpart to `rootCause.ts`'s `buildRootCausePrompt` — see
  * that file's doc comment for the full exposure-fix reasoning this mirrors.
@@ -61,7 +62,7 @@ export async function generateApiRootCauseHypothesis(run: ApiTestRun, provider: 
   const prompt = buildApiRootCausePrompt(run)
   if (!prompt) return "couldn't generate a root-cause hypothesis: no failed step found in this run"
   try {
-    const text = await provider.complete(prompt, apiKey)
+    const text = await provider.complete(prompt, apiKey, { maxOutputTokens: ROOT_CAUSE_MAX_OUTPUT_TOKENS })
     return text.trim() || '(the LLM returned an empty response for this analysis)'
   } catch (err) {
     return `couldn't generate a root-cause hypothesis: ${err instanceof Error ? err.message : String(err)}`

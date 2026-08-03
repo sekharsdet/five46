@@ -7,7 +7,7 @@ import { fetchWithTimeout } from './fetchWithTimeout'
  * available in this environment). */
 export const anthropicProvider: LlmProvider = {
   id: 'anthropic',
-  async complete(prompt, apiKey) {
+  async complete(prompt, apiKey, options) {
     const response = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -17,7 +17,7 @@ export const anthropicProvider: LlmProvider = {
       },
       body: JSON.stringify({
         model: 'claude-3-5-haiku-latest',
-        max_tokens: 1024,
+        max_tokens: options?.maxOutputTokens ?? 1024,
         messages: [{ role: 'user', content: prompt }],
       }),
     })

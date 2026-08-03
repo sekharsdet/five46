@@ -4,6 +4,7 @@ import { runApiTest } from './apiRunner'
 import { startApiTestServer } from './apiTestServer'
 import type { SafetyMode } from './apiTypes'
 import type { LlmProvider } from '../llm/types'
+import { API_ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
 function safetyMode(baseUrl: string, overrides: Partial<SafetyMode> = {}): SafetyMode {
   return { allowWrites: false, allowDeletes: false, targetOrigin: new URL(baseUrl).origin, allowedHosts: new Set(), ...overrides }
@@ -24,6 +25,43 @@ function scriptedProvider(responses: string[]): LlmProvider {
     },
   }
 }
+
+test('runApiTest bounds each live per-turn call with API_ACTION_MAX_OUTPUT_TOKENS', async () => {
+  const server = await startApiTestServer()
+  try {
+    const capturedOptions: ({ maxOutputTokens?: number } | undefined)[] = []
+    const responses = [
+      JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' }),
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm ok' }),
+      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'confirmed' }),
+    ]
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(_prompt, _apiKey, options) {
+        capturedOptions.push(options)
+        return responses[Math.min(turn++, responses.length - 1)]
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'list items and confirm the request succeeded',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url),
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(capturedOptions.length > 0)
+    assert.ok(
+      capturedOptions.every((options) => options?.maxOutputTokens === API_ACTION_MAX_OUTPUT_TOKENS),
+      'every live per-turn call must be bounded by API_ACTION_MAX_OUTPUT_TOKENS'
+    )
+  } finally {
+    await server.close()
+  }
+})
 
 test('runApiTest drives a full create -> saveAs -> read -> delete chain against a real server', async () => {
   const server = await startApiTestServer()
@@ -500,10 +538,12 @@ test('runApiTest with useStructuredPlan fast-paths a whole well-formed plan, mak
   const server = await startApiTestServer()
   try {
     let calls = 0
+    let capturedOptions: { maxOutputTokens?: number } | undefined
     const provider: LlmProvider = {
       id: 'fake',
-      async complete() {
+      async complete(_prompt, _apiKey, options) {
         calls++
+        capturedOptions = options
         // The one upfront planning call — a request whose method/host are
         // both allowed, followed by an assert_status that only fast-paths
         // because it immediately follows a real successful request, then a
@@ -532,6 +572,7 @@ test('runApiTest with useStructuredPlan fast-paths a whole well-formed plan, mak
     assert.equal(run.planStats?.plannedSteps, 3)
     assert.equal(run.planStats?.fastPathedSteps, 3, 'request, assertion (after a successful request), and done should all fast-path')
     assert.equal(calls, 1, 'only the upfront planning call — zero live per-step decisions')
+    assert.equal(capturedOptions?.maxOutputTokens, PLAN_MAX_OUTPUT_TOKENS, 'the upfront plan call must be bounded by PLAN_MAX_OUTPUT_TOKENS')
   } finally {
     await server.close()
   }

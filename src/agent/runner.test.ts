@@ -9,6 +9,7 @@ import { startFixtureServer, startScrollFixtureServer } from './testServer'
 import { startLoginFixtureServer, LOGIN_FIXTURE_USERNAME, LOGIN_FIXTURE_PASSWORD } from './loginTestServer'
 import type { LlmProvider } from '../llm/types'
 import type { StorageState } from './browser'
+import { ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
 /** Finds the ref to act on by matching the *real* prompt text the fake
  * provider actually received, rather than hardcoding an assumed ref value
@@ -63,6 +64,87 @@ test('runAgent drives a real browser through a real multi-step flow scripted by 
     assert.equal(run.outcome, 'goal-reached')
     assert.equal(run.steps.length, 2)
     assert.ok(run.steps.every((s) => s.ok))
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent bounds each live per-turn call with ACTION_MAX_OUTPUT_TOKENS', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const capturedOptions: ({ maxOutputTokens?: number } | undefined)[] = []
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt, _apiKey, options) {
+        turn++
+        capturedOptions.push(options)
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(capturedOptions.length > 0)
+    assert.ok(
+      capturedOptions.every((options) => options?.maxOutputTokens === ACTION_MAX_OUTPUT_TOKENS),
+      'every live per-turn call must be bounded by ACTION_MAX_OUTPUT_TOKENS'
+    )
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with useStructuredPlan bounds the upfront plan call with PLAN_MAX_OUTPUT_TOKENS', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let capturedOptions: { maxOutputTokens?: number } | undefined
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(_prompt, _apiKey, options) {
+        capturedOptions = options
+        return JSON.stringify({
+          steps: [
+            { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+            { action: 'done', outcome: 'goal-reached', reason: 'done' },
+          ],
+        })
+      },
+    }
+
+    await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+    })
+
+    assert.equal(capturedOptions?.maxOutputTokens, PLAN_MAX_OUTPUT_TOKENS)
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })

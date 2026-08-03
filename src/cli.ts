@@ -56,8 +56,16 @@ export interface ParsedAgentArgs {
    * `RunApiTestOptions.useStructuredPlan`. Not extended to `login` for the
    * same reason `--repeat` isn't: login's deliverable is one durable
    * session file, and its goal vocabulary is always "log in" — there's no
-   * multi-step ambiguity for an upfront plan to help resolve. */
+   * multi-step ambiguity for an upfront plan to help resolve. Default-on as
+   * of the speed-focused pass that added `noStructuredPlan` below — this
+   * bare flag is now redundant (kept parseable so an existing script that
+   * already passes it keeps working identically) since there's nothing left
+   * for it to turn on that isn't already on by default. */
   structuredPlan?: boolean
+  /** The sole opt-out for structured planning's new default-on behavior —
+   * see `resolveStructuredPlan()`. Mirrors `noRootCause`'s polarity for a
+   * default-on feature with an escape hatch. */
+  noStructuredPlan?: boolean
 }
 
 export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
@@ -95,11 +103,26 @@ export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
       result.recordVideo = true
     } else if (argv[i] === '--structured-plan') {
       result.structuredPlan = true
+    } else if (argv[i] === '--no-structured-plan') {
+      result.noStructuredPlan = true
     } else if (!result.url) {
       result.url = argv[i]
     }
   }
   return result
+}
+
+/** Resolves `--no-structured-plan` into a definite boolean immediately after
+ * parsing, so every downstream consumer (the "one extra LLM call will
+ * plan..." disclosure banners, `RunAgentOptions.useStructuredPlan`/
+ * `RunApiTestOptions.useStructuredPlan`) sees an already-resolved
+ * true/false, never undefined. Structured planning is default-ON as of this
+ * change; `--no-structured-plan` is the sole opt-out (mirrors
+ * `--no-root-cause`'s polarity for a default-on feature). The bare
+ * `--structured-plan` flag no longer has any effect of its own — an
+ * explicit opt-out always wins if both are somehow passed. */
+export function resolveStructuredPlan(parsed: { noStructuredPlan?: boolean }): boolean {
+  return !parsed.noStructuredPlan
 }
 
 export interface ParsedApiArgs {
@@ -115,6 +138,7 @@ export interface ParsedApiArgs {
   repeat?: number
   project?: string
   structuredPlan?: boolean
+  noStructuredPlan?: boolean
 }
 
 export function parseApiArgs(argv: string[]): ParsedApiArgs {
@@ -144,6 +168,8 @@ export function parseApiArgs(argv: string[]): ParsedApiArgs {
       result.project = argv[++i]
     } else if (argv[i] === '--structured-plan') {
       result.structuredPlan = true
+    } else if (argv[i] === '--no-structured-plan') {
+      result.noStructuredPlan = true
     } else if (!result.baseUrl) {
       result.baseUrl = argv[i]
     }
@@ -1060,9 +1086,9 @@ function listGeneratedRuns(dir: string, projectFilter?: string): boolean {
 }
 
 const USAGE = [
-  'Usage: five46 test <url> --goal "text" [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--project name] [--record-video] [--structured-plan]',
+  'Usage: five46 test <url> --goal "text" [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--project name] [--record-video] [--no-structured-plan]',
   '       five46 login <url> --goal "text" --out <path> [--max-steps N] [--headed] [--record-video]',
-  '       five46 api <base-url> --goal "text" [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--project name] [--structured-plan]',
+  '       five46 api <base-url> --goal "text" [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--project name] [--no-structured-plan]',
   '       five46 mcp   (starts an MCP server on stdio, exposing five46_test/five46_api to an IDE-embedded AI assistant)',
   '       five46 list [dir] [--project name]   (lists previously generated runs, default: current directory)',
   '       five46 diff <fileA> <fileB>   (line diff between two generated run files, ignoring the run-id header line)',
@@ -1173,9 +1199,10 @@ async function main() {
   }
 
   if (argv[0] === 'api') {
-    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project, structuredPlan } = resolveProjectForApi(
+    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project, noStructuredPlan } = resolveProjectForApi(
       parseApiArgs(argv.slice(1))
     )
+    const structuredPlan = resolveStructuredPlan({ noStructuredPlan })
     if (!baseUrl || !goal) {
       console.error(USAGE)
       process.exit(1)
@@ -1203,9 +1230,10 @@ async function main() {
     process.exit(1)
   }
 
-  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, structuredPlan } = resolveProjectForTest(
+  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, noStructuredPlan } = resolveProjectForTest(
     parseAgentArgs(argv.slice(1))
   )
+  const structuredPlan = resolveStructuredPlan({ noStructuredPlan })
   if (!url || !goal) {
     console.error(USAGE)
     process.exit(1)
