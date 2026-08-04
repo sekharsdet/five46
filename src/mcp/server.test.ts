@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -10,6 +10,7 @@ import { startApiTestServer } from '../agent/apiTestServer'
 import { launchAgentBrowser } from '../agent/browser'
 import { startFixtureServer } from '../agent/testServer'
 import type { LlmProvider } from '../llm/types'
+import { HARD_MAX_CONCURRENCY } from '../agent/runLoop'
 
 /** Real protocol-level tests: a real `Client` talking to a real
  * `McpServer` over `InMemoryTransport.createLinkedPair()` — real tool
@@ -290,6 +291,10 @@ test('five46_test tool call drives a real browser through a real fixture page an
           const match = prompt.match(/\[(e\d+)\][^\n]*Show secret message/)
           return JSON.stringify({ action: 'click', ref: match![1], reason: 'reveal it' })
         }
+        if (turn === 2) {
+          const match = prompt.match(/\[(e\d+)\][^\n]*agentic testing works/)
+          return JSON.stringify({ action: 'assert_visible', ref: match![1], reason: 'confirm revealed' })
+        }
         return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
       },
     }
@@ -488,6 +493,340 @@ test('five46_test tool surfaces an unparseable-response run outcome as isError, 
       await close()
     }
   } finally {
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_test tool rejects a call with neither goal nor story, as isError', async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const { client, close } = await connectedClient({ projectRoot, provider: scriptedProvider(['unused']), apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_test', arguments: { url: 'http://localhost:1' } })
+      assert.equal(result.isError, true)
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /exactly one of "goal"\/"story" is required/)
+    } finally {
+      await close()
+    }
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_test tool rejects a call with both goal and story, as isError', async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const { client, close } = await connectedClient({ projectRoot, provider: scriptedProvider(['unused']), apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_test', arguments: { url: 'http://localhost:1', goal: 'g', story: 's' } })
+      assert.equal(result.isError, true)
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /mutually exclusive/)
+    } finally {
+      await close()
+    }
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool rejects a call with neither goal nor story, as isError', async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const { client, close } = await connectedClient({ projectRoot, provider: scriptedProvider(['unused']), apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: 'http://localhost:1' } })
+      assert.equal(result.isError, true)
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /exactly one of "goal"\/"story" is required/)
+    } finally {
+      await close()
+    }
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool rejects a call with both goal and story, as isError', async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const { client, close } = await connectedClient({ projectRoot, provider: scriptedProvider(['unused']), apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: 'http://localhost:1', goal: 'g', story: 's' } })
+      assert.equal(result.isError, true)
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /mutually exclusive/)
+    } finally {
+      await close()
+    }
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool with story splits a raw story into independent goals and aggregates a per-AC report, all passing', async () => {
+  const server = await startApiTestServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    // Distinguishes the one-time split call from every per-scenario action
+    // call by prompt content (buildStorySplitPrompt's own "Story:" label,
+    // never present in buildApiActionPrompt) — safe under real concurrent
+    // execution, unlike a single shared turn counter, since per-scenario
+    // progress is tracked in a map keyed by each scenario's own goal text
+    // (unique per AC).
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: ['the items endpoint is reachable (AC1)', 'the items endpoint is reachable (AC2)'] })
+        }
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, story: 'AC1: reachable. AC2: reachable.' } })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /Split into 2 scenario\(s\)/)
+      assert.match(text, /2\/2 acceptance criteria reached goal-reached/)
+      assert.match(text, /AC1: PASS/)
+      assert.match(text, /AC2: PASS/)
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool with story reports a mixed pass/fail per-AC breakdown, isError unless every AC passed', async () => {
+  const server = await startApiTestServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: ['the reachable scenario', 'the unreachable scenario'] })
+        }
+        if (prompt.includes('Goal: the unreachable scenario')) {
+          return JSON.stringify({ action: 'done', outcome: 'goal-unreachable', reason: 'this scenario cannot be verified' })
+        }
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, story: 'AC1: reachable. AC2: unreachable.' } })
+      assert.equal(result.isError, true)
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /1\/2 acceptance criteria reached goal-reached/)
+      assert.match(text, /AC1: PASS/)
+      assert.match(text, /AC2: FAIL \(goal-unreachable\)/)
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool with story: a write failure in ONE scenario does not sink the whole batch — every scenario still resolves and reports', async () => {
+  // Regression test for a real gap found via a deliberate code review (not
+  // a live incident): `runOneApiScenario` used to have no error handling
+  // at all around its report-generation/write step. In `story` mode, each
+  // scenario runs as one task inside a shared `Promise.all`
+  // (`runWithConcurrency`) — an uncaught throw from just one scenario used
+  // to reject the *entire* batch, discarding every other scenario's
+  // already-completed result along with it. `projectRoot` here is a real
+  // *file*, not a directory, so every scenario's own `writeFileSync` call
+  // genuinely fails with a real ENOTDIR — proving the call still resolves
+  // gracefully (never an uncaught rejection) with a per-AC breakdown,
+  // rather than the tool call itself throwing.
+  const server = await startApiTestServer()
+  const projectRootParent = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  const projectRoot = join(projectRootParent, 'this-is-a-file-not-a-directory')
+  writeFileSync(projectRoot, 'not a directory')
+  try {
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: ['scenario one', 'scenario two'] })
+        }
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, story: 'two scenarios, both should run to completion' } })
+      // The real point of this test: reaching this line at all proves the
+      // call resolved instead of the transport-level round trip throwing.
+      assert.equal(result.isError, true, 'a write failure on every scenario means the batch as a whole did not pass')
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /Split into 2 scenario\(s\)/)
+      assert.match(text, /0\/2 acceptance criteria reached goal-reached/)
+      assert.match(text, /AC1: FAIL \(tooling-error\)/)
+      assert.match(text, /AC2: FAIL \(tooling-error\)/)
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRootParent, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool with story never exceeds FIVE46_MCP_CONCURRENCY real in-flight scenarios at once', async () => {
+  const server = await startApiTestServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  const original = process.env.FIVE46_MCP_CONCURRENCY
+  process.env.FIVE46_MCP_CONCURRENCY = '2'
+  try {
+    let inFlight = 0
+    let maxInFlight = 0
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: ['scenario one', 'scenario two', 'scenario three', 'scenario four'] })
+        }
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        inFlight--
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, story: 'a four-scenario story' } })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.ok(maxInFlight <= 2, `expected at most 2 real scenarios in flight, saw ${maxInFlight}`)
+      assert.ok(maxInFlight >= 2, `expected concurrency to actually overlap (not fall back to sequential), saw only ${maxInFlight}`)
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+    process.env.FIVE46_MCP_CONCURRENCY = original
+  }
+})
+
+test('five46_api tool with story falls back to DEFAULT_CONCURRENCY when FIVE46_MCP_CONCURRENCY is unset, and clamps an out-of-range value to HARD_MAX_CONCURRENCY', async () => {
+  const server = await startApiTestServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  const original = process.env.FIVE46_MCP_CONCURRENCY
+  process.env.FIVE46_MCP_CONCURRENCY = String(HARD_MAX_CONCURRENCY + 50)
+  try {
+    let inFlight = 0
+    let maxInFlight = 0
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: Array.from({ length: HARD_MAX_CONCURRENCY + 3 }, (_, i) => `scenario ${i + 1}`) })
+        }
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        inFlight--
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, story: 'a many-scenario story' } })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.ok(maxInFlight <= HARD_MAX_CONCURRENCY, `an out-of-range FIVE46_MCP_CONCURRENCY should clamp to HARD_MAX_CONCURRENCY (${HARD_MAX_CONCURRENCY}), saw ${maxInFlight}`)
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+    process.env.FIVE46_MCP_CONCURRENCY = original
+  }
+})
+
+test('five46_test tool with story splits a raw story into independent goals, driving a real browser per scenario', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: ['reveal the secret message', 'reveal the secret message once more'] })
+        }
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) {
+          const match = prompt.match(/\[(e\d+)\][^\n]*Show secret message/)
+          return JSON.stringify({ action: 'click', ref: match![1], reason: 'reveal it' })
+        }
+        if (turn === 2) {
+          const match = prompt.match(/\[(e\d+)\][^\n]*agentic testing works/)
+          return JSON.stringify({ action: 'assert_visible', ref: match![1], reason: 'confirm revealed' })
+        }
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_test', arguments: { url: server.url, story: 'AC1: reveal message. AC2: reveal message once more.', maxSteps: 5 } })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /Split into 2 scenario\(s\)/)
+      assert.match(text, /2\/2 acceptance criteria reached goal-reached/)
+      assert.match(text, /AC1: PASS/)
+      assert.match(text, /AC2: PASS/)
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
     rmSync(projectRoot, { recursive: true, force: true })
   }
 })

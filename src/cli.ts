@@ -23,7 +23,9 @@ import { generateApiRootCauseHypothesis } from './agent/apiRootCause'
 import { diffSpecFiles, formatDiff } from './agent/diffSpecs'
 import { classifyRepeatResults } from './agent/flaky'
 import type { RepeatIterationResult } from './agent/flaky'
-import { HARD_MAX_REPEAT } from './agent/runLoop'
+import { HARD_MAX_REPEAT, HARD_MAX_SCENARIOS, DEFAULT_CONCURRENCY, HARD_MAX_CONCURRENCY } from './agent/runLoop'
+import { splitUserStory } from './agent/storySplitter'
+import { runWithConcurrency } from './agent/concurrencyPool'
 import type { RunOutcome } from './agent/types'
 import type { LlmProvider } from './llm/types'
 import { loadProjectConfig, resolveProject, mergeProjectDefaultsForTest, mergeProjectDefaultsForApi } from './config/projectConfig'
@@ -73,6 +75,18 @@ export interface ParsedAgentArgs {
    * something to default on without its own live-validation runway first.
    * Not extended to `login` for the same reason `--structured-plan` isn't. */
   fastSteps?: boolean
+  /** `test`/`api` only — a path to a raw user-story text file, split into
+   * independent goals by `splitUserStory` (storySplitter.ts) and run via
+   * `runStoryScenarios`/`runApiStoryScenarios`. Mutually exclusive with
+   * `--goal` (exactly one required) — enforced in `main()`, not here, since
+   * a shared parser accepting both harmlessly is consistent with every
+   * other flag's "parse first, validate meaning after" split in this file. */
+  story?: string
+  /** `test`/`api` only, and only meaningful alongside `--story` — see
+   * `DEFAULT_CONCURRENCY`/`HARD_MAX_CONCURRENCY` (runLoop.ts). Harmlessly
+   * parsed-but-ignored without `--story`, same "shared parser, unused
+   * elsewhere" precedent as `--allow-deletes` on `login`. */
+  concurrency?: number
 }
 
 export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
@@ -114,6 +128,11 @@ export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
       result.noStructuredPlan = true
     } else if (argv[i] === '--fast-steps') {
       result.fastSteps = true
+    } else if (argv[i] === '--story') {
+      result.story = argv[++i]
+    } else if (argv[i] === '--concurrency') {
+      const n = Number(argv[++i])
+      if (Number.isFinite(n)) result.concurrency = n
     } else if (!result.url) {
       result.url = argv[i]
     }
@@ -149,6 +168,8 @@ export interface ParsedApiArgs {
   structuredPlan?: boolean
   noStructuredPlan?: boolean
   fastSteps?: boolean
+  story?: string
+  concurrency?: number
 }
 
 export function parseApiArgs(argv: string[]): ParsedApiArgs {
@@ -182,6 +203,11 @@ export function parseApiArgs(argv: string[]): ParsedApiArgs {
       result.noStructuredPlan = true
     } else if (argv[i] === '--fast-steps') {
       result.fastSteps = true
+    } else if (argv[i] === '--story') {
+      result.story = argv[++i]
+    } else if (argv[i] === '--concurrency') {
+      const n = Number(argv[++i])
+      if (Number.isFinite(n)) result.concurrency = n
     } else if (!result.baseUrl) {
       result.baseUrl = argv[i]
     }
@@ -215,6 +241,21 @@ function loadStorageStateFile(path: string): StorageState | undefined {
     return undefined
   }
   return parsed as StorageState
+}
+
+/** Loads a `--story` file's raw text — same fail-fast, print-and-return-
+ * undefined shape as `loadStorageStateFile` above. Deliberately does no
+ * validation of the story's *content* here (no length cap, no format
+ * check): `splitUserStory` (storySplitter.ts) already degrades safely to
+ * treating the whole text as one goal on anything it can't usefully split,
+ * so there's nothing this layer needs to reject first. */
+function loadStoryFile(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch (err) {
+    console.error(`\nCouldn't read the story file at ${path}: ${err instanceof Error ? err.message : String(err)}`)
+    return undefined
+  }
 }
 
 /** Shared by `test` and `login` — both need the same http(s)/file URL
@@ -267,6 +308,21 @@ export function insertIterationSuffix(path: string, iteration: number): string {
     return `${path.slice(0, lastDot)}.repeat${iteration}${path.slice(lastDot)}`
   }
   return `${path}.repeat${iteration}`
+}
+
+/** Story mode's own version of `insertIterationSuffix` above, for the same
+ * `--out` collision-avoidance reason — kept as a separate function rather
+ * than a parameterized shared one, since "repeat3" naming would misleadingly
+ * imply repetition of the same goal here, when each suffixed file is
+ * actually a *different*, independent split-out scenario ("foo.spec.ts" + 2
+ * -> "foo.spec.ac2.ts"). */
+export function insertScenarioSuffix(path: string, index: number): string {
+  const lastDot = path.lastIndexOf('.')
+  const lastSlash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  if (lastDot > lastSlash) {
+    return `${path.slice(0, lastDot)}.ac${index}${path.slice(lastDot)}`
+  }
+  return `${path}.ac${index}`
 }
 
 /** The actual single-run work shared by `runE2eTest` (one run) and
@@ -329,20 +385,37 @@ export async function performOneE2eRun(
     return 'errored'
   }
 
-  let rootCauseHypothesis: string | undefined
-  if (run.outcome === 'assertion-failed' && !noRootCause) {
-    console.log('\nGenerating a root-cause hypothesis for this failure (one additional LLM call)...')
-    rootCauseHypothesis = redactSecrets(await generateRootCauseHypothesis(run, provider, llmApiKey), secrets)
+  try {
+    let rootCauseHypothesis: string | undefined
+    if (run.outcome === 'assertion-failed' && !noRootCause) {
+      console.log('\nGenerating a root-cause hypothesis for this failure (one additional LLM call)...')
+      rootCauseHypothesis = redactSecrets(await generateRootCauseHypothesis(run, provider, llmApiKey), secrets)
+    }
+
+    console.log(`\n${redactSecrets(formatFailureReport(run, rootCauseHypothesis), secrets)}`)
+
+    const outPath = outArg ?? join(process.cwd(), `five46-agent-${run.runId}.spec.ts`)
+    let specBody = redactSecrets(generateAgentSpec(run), secrets)
+    if (projectName) specBody = withProjectHeaderLine(specBody, projectName)
+    writeFileSync(outPath, specBody, 'utf8')
+    console.log(`\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
+    return { outcome: run.outcome, specBody }
+  } catch (err) {
+    // Same redaction discipline as the runAgent-call catch above, extended
+    // to cover the reporting/write path too — a run that reached a real
+    // outcome must not have its result silently lost, or a raw error reach
+    // the caller unredacted, just because writing the generated spec
+    // afterward hit a real I/O problem (a full disk, an unwritable
+    // directory). Matters even more for `--story`: each scenario runs
+    // inside a shared `Promise.all` (`runWithConcurrency`), so an uncaught
+    // throw here wouldn't just fail this one scenario — it would abort the
+    // whole batch and discard every other scenario's already-completed
+    // result too. Found via a deliberate review of this exact risk, not a
+    // live incident — the same class of gap the runAgent-call catch above
+    // was already written to close, just one step later in the function.
+    console.error(`\nfive46 test failed while writing the report/spec for a completed run: ${redactSecrets(err instanceof Error ? err.message : String(err), secrets)}`)
+    return 'errored'
   }
-
-  console.log(`\n${redactSecrets(formatFailureReport(run, rootCauseHypothesis), secrets)}`)
-
-  const outPath = outArg ?? join(process.cwd(), `five46-agent-${run.runId}.spec.ts`)
-  let specBody = redactSecrets(generateAgentSpec(run), secrets)
-  if (projectName) specBody = withProjectHeaderLine(specBody, projectName)
-  writeFileSync(outPath, specBody, 'utf8')
-  console.log(`\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
-  return { outcome: run.outcome, specBody }
 }
 
 /**
@@ -565,6 +638,130 @@ async function runRepeatedE2eTest(
   return !classification.flaky
 }
 
+/** `five46 test <url> --story <path> [--concurrency N]` — splits a raw,
+ * possibly multi-AC user story (`splitUserStory`, storySplitter.ts) into
+ * independent goals and runs each one via `performOneE2eRun`, completely
+ * unchanged, with up to `--concurrency` running at once
+ * (`runWithConcurrency`, concurrencyPool.ts). Every existing per-run safety
+ * and speed mechanism (destructive-click gating, structured planning,
+ * `--fast-steps`, `assert_visible` fast-pathing) applies automatically to
+ * each split goal, since each one is an ordinary, unmodified single-run
+ * call — nothing here duplicates any of that.
+ *
+ * Console output from concurrently-running scenarios interleaves in
+ * real time (each scenario's own progress lines print as they happen,
+ * same as every other run) — the final per-AC summary below is what a
+ * human/CI should actually read, not the interleaved stream above it.
+ *
+ * Exit code is all-or-nothing, matching `--repeat`'s own CI philosophy:
+ * true only when every AC reached `goal-reached`, since "did the whole
+ * story actually pass" needs to stay one honest signal, not a
+ * partial-credit blend. */
+async function runStoryScenarios(
+  url: string,
+  storyPath: string,
+  maxSteps: number | undefined,
+  headed: boolean | undefined,
+  outArg: string | undefined,
+  storageStatePath: string | undefined,
+  allowDeletes: boolean | undefined,
+  noRootCause: boolean | undefined,
+  recordVideo: boolean | undefined,
+  structuredPlan: boolean | undefined,
+  concurrency: number | undefined,
+  projectName: string | undefined,
+  fastSteps: boolean | undefined
+): Promise<boolean> {
+  const { llmProvider, llmApiKey } = resolveCredentials()
+  if (!llmApiKey) {
+    console.error('\nfive46 test requires an LLM API key.')
+    console.error(
+      'Run `five46 config` to save one, or set FIVE46_LLM_PROVIDER/FIVE46_LLM_API_KEY as environment variables.'
+    )
+    return false
+  }
+  const provider = getLlmProvider(llmProvider || 'openai', (info) =>
+    console.log(`  (transient error, retrying attempt ${info.attempt + 1}/${info.maxAttempts} in ${info.delayMs}ms: ${info.error instanceof Error ? info.error.message : String(info.error)})`)
+  )
+
+  const story = loadStoryFile(storyPath)
+  if (!story) return false
+
+  let storageState: StorageState | undefined
+  if (storageStatePath) {
+    storageState = loadStorageStateFile(storageStatePath)
+    if (!storageState) return false
+  }
+
+  const credentials = resolveLoginCredentials()
+  const secrets = [credentials.username, credentials.password, llmApiKey]
+
+  console.log(`\nfive46 test: splitting the user story at ${storyPath} into independent goals (one extra LLM call)...`)
+  const { goals, clamped } = await splitUserStory(story, provider, llmApiKey)
+  if (clamped) {
+    console.log(`\nNote: the story split into more scenarios than the cap of ${HARD_MAX_SCENARIOS} — running the first ${HARD_MAX_SCENARIOS} only.`)
+  }
+  console.log(`\nSplit into ${goals.length} scenario(s):`)
+  goals.forEach((g, i) => console.log(`  AC${i + 1}: ${g}`))
+
+  const effectiveConcurrency = Math.max(1, Math.min(concurrency ?? DEFAULT_CONCURRENCY, HARD_MAX_CONCURRENCY))
+  if (concurrency !== undefined && concurrency > effectiveConcurrency) {
+    console.log(`\nNote: --concurrency ${concurrency} exceeds the cap of ${HARD_MAX_CONCURRENCY} — running ${effectiveConcurrency} at once instead.`)
+  }
+  console.log(`\nRunning up to ${effectiveConcurrency} scenario(s) at once. This page's visible text/labels/values are sent to ${provider.id} (your own API key) on every step, for every scenario.`)
+  if (storageState) console.log(`Starting each scenario already authenticated, using the session at ${storageStatePath}.`)
+  if (credentials.username || credentials.password) {
+    console.log('A login username/password is configured — never sent to the LLM, only used locally if a scenario fills a credential field.')
+  }
+
+  const batchId = Date.now().toString(36)
+  const tasks = goals.map((goal, i) => async () => {
+    console.log(`\n=== AC${i + 1}/${goals.length}: ${goal} ===`)
+    const artifactDir = join(process.cwd(), `five46-agent-${batchId}-ac${i + 1}`)
+    const scenarioOut = outArg ? insertScenarioSuffix(outArg, i + 1) : undefined
+    const result = await performOneE2eRun(
+      url,
+      goal,
+      maxSteps,
+      headed,
+      scenarioOut,
+      artifactDir,
+      storageState,
+      allowDeletes,
+      noRootCause,
+      recordVideo,
+      structuredPlan,
+      provider,
+      llmApiKey,
+      credentials,
+      secrets,
+      projectName,
+      fastSteps
+    )
+    return { goal, result }
+  })
+
+  const outcomes = await runWithConcurrency(tasks, effectiveConcurrency)
+
+  console.log('\n=== Story mode summary ===')
+  let allPassed = true
+  let passedCount = 0
+  outcomes.forEach(({ goal, result }, i) => {
+    if (result === 'errored') {
+      console.log(`AC${i + 1}: TOOLING ERROR — ${goal}`)
+      allPassed = false
+      return
+    }
+    const passed = result.outcome === 'goal-reached'
+    if (passed) passedCount++
+    else allPassed = false
+    console.log(`AC${i + 1}: ${passed ? 'PASS' : `FAIL (${result.outcome})`} — ${goal}`)
+  })
+  console.log(`\n${passedCount}/${goals.length} acceptance criteria reached goal-reached.`)
+
+  return allPassed
+}
+
 /** The actual single-run work shared by `runApiTestCommand` (one run) and
  * `runRepeatedApiTestCommand` (`--repeat N` runs) — see `performOneE2eRun`'s
  * doc comment for the identical reasoning, mirrored here for the API
@@ -620,20 +817,27 @@ export async function performOneApiRun(
     return 'errored'
   }
 
-  let rootCauseHypothesis: string | undefined
-  if (run.outcome === 'assertion-failed' && !noRootCause) {
-    console.log('\nGenerating a root-cause hypothesis for this failure (one additional LLM call)...')
-    rootCauseHypothesis = redactSecrets(await generateApiRootCauseHypothesis(run, provider, llmApiKey), secrets)
+  try {
+    let rootCauseHypothesis: string | undefined
+    if (run.outcome === 'assertion-failed' && !noRootCause) {
+      console.log('\nGenerating a root-cause hypothesis for this failure (one additional LLM call)...')
+      rootCauseHypothesis = redactSecrets(await generateApiRootCauseHypothesis(run, provider, llmApiKey), secrets)
+    }
+
+    console.log(`\n${redactSecrets(formatApiFailureReport(run, rootCauseHypothesis), secrets)}`)
+
+    const outPath = outArg ?? join(process.cwd(), `five46-api-${run.runId}.test.mjs`)
+    let specBody = redactSecrets(generateApiSpec(run), secrets)
+    if (projectName) specBody = withProjectHeaderLine(specBody, projectName)
+    writeFileSync(outPath, specBody, 'utf8')
+    console.log(`\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
+    return { outcome: run.outcome, specBody }
+  } catch (err) {
+    // Same reasoning as performOneE2eRun's identical fix — see its own
+    // doc comment for the full "why this matters more for --story" story.
+    console.error(`\nfive46 api failed while writing the report/spec for a completed run: ${redactSecrets(err instanceof Error ? err.message : String(err), secrets)}`)
+    return 'errored'
   }
-
-  console.log(`\n${redactSecrets(formatApiFailureReport(run, rootCauseHypothesis), secrets)}`)
-
-  const outPath = outArg ?? join(process.cwd(), `five46-api-${run.runId}.test.mjs`)
-  let specBody = redactSecrets(generateApiSpec(run), secrets)
-  if (projectName) specBody = withProjectHeaderLine(specBody, projectName)
-  writeFileSync(outPath, specBody, 'utf8')
-  console.log(`\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
-  return { outcome: run.outcome, specBody }
 }
 
 /**
@@ -791,6 +995,101 @@ async function runRepeatedApiTestCommand(
   return !classification.flaky
 }
 
+/** `five46 api <base-url> --story <path> [--concurrency N]` — the API-engine
+ * mirror of `runStoryScenarios`; see its doc comment for the full reasoning
+ * (splitting, bounded concurrency reusing `performOneApiRun` unchanged, the
+ * interleaved-output caveat, the all-or-nothing CI exit code). Fully
+ * symmetric with the browser engine — there's no structural reason found to
+ * build story mode asymmetrically between the two, same precedent
+ * `--repeat` already established. */
+async function runApiStoryScenarios(
+  baseUrl: string,
+  storyPath: string,
+  maxSteps: number | undefined,
+  outArg: string | undefined,
+  storageStatePath: string | undefined,
+  allowWrites: boolean,
+  allowDeletes: boolean,
+  allowHosts: string[],
+  noRootCause: boolean | undefined,
+  structuredPlan: boolean | undefined,
+  concurrency: number | undefined,
+  projectName: string | undefined,
+  fastSteps: boolean | undefined
+): Promise<boolean> {
+  const { llmProvider, llmApiKey } = resolveCredentials()
+  if (!llmApiKey) {
+    console.error('\nfive46 api requires an LLM API key.')
+    console.error(
+      'Run `five46 config` to save one, or set FIVE46_LLM_PROVIDER/FIVE46_LLM_API_KEY as environment variables.'
+    )
+    return false
+  }
+  const provider = getLlmProvider(llmProvider || 'openai', (info) =>
+    console.log(`  (transient error, retrying attempt ${info.attempt + 1}/${info.maxAttempts} in ${info.delayMs}ms: ${info.error instanceof Error ? info.error.message : String(info.error)})`)
+  )
+
+  const story = loadStoryFile(storyPath)
+  if (!story) return false
+
+  let storageState: StorageState | undefined
+  if (storageStatePath) {
+    storageState = loadStorageStateFile(storageStatePath)
+    if (!storageState) return false
+  }
+
+  const authHeaders = resolveApiAuthHeaders()
+  const secrets = [...(authHeaders ? Object.values(authHeaders) : []), llmApiKey]
+
+  const targetOrigin = new URL(baseUrl).origin
+  const safety: SafetyMode = { allowWrites, allowDeletes, targetOrigin, allowedHosts: new Set(allowHosts) }
+  const allowedMethods = ['GET', 'HEAD', 'OPTIONS', ...(allowWrites ? ['POST', 'PUT', 'PATCH'] : []), ...(allowDeletes ? ['DELETE'] : [])]
+
+  console.log(`\nfive46 api: splitting the user story at ${storyPath} into independent goals (one extra LLM call)...`)
+  const { goals, clamped } = await splitUserStory(story, provider, llmApiKey)
+  if (clamped) {
+    console.log(`\nNote: the story split into more scenarios than the cap of ${HARD_MAX_SCENARIOS} — running the first ${HARD_MAX_SCENARIOS} only.`)
+  }
+  console.log(`\nSplit into ${goals.length} scenario(s):`)
+  goals.forEach((g, i) => console.log(`  AC${i + 1}: ${g}`))
+
+  const effectiveConcurrency = Math.max(1, Math.min(concurrency ?? DEFAULT_CONCURRENCY, HARD_MAX_CONCURRENCY))
+  if (concurrency !== undefined && concurrency > effectiveConcurrency) {
+    console.log(`\nNote: --concurrency ${concurrency} exceeds the cap of ${HARD_MAX_CONCURRENCY} — running ${effectiveConcurrency} at once instead.`)
+  }
+  console.log(`\nRunning up to ${effectiveConcurrency} scenario(s) at once. Request/response data — including response bodies, which may contain a live session token or other secret — is sent to ${provider.id} (your own API key) on every step, for every scenario.`)
+  console.log(`Allowed methods this run: ${allowedMethods.join(', ')}. Allowed host(s): ${[targetOrigin, ...allowHosts].join(', ')}.`)
+  if (storageState) console.log(`Starting each scenario already authenticated, using the session at ${storageStatePath}.`)
+  if (authHeaders) console.log('An API auth header is configured — attached to every request, never sent to the LLM.')
+
+  const tasks = goals.map((goal, i) => async () => {
+    console.log(`\n=== AC${i + 1}/${goals.length}: ${goal} ===`)
+    const scenarioOut = outArg ? insertScenarioSuffix(outArg, i + 1) : undefined
+    const result = await performOneApiRun(baseUrl, goal, maxSteps, scenarioOut, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName, fastSteps)
+    return { goal, result }
+  })
+
+  const outcomes = await runWithConcurrency(tasks, effectiveConcurrency)
+
+  console.log('\n=== Story mode summary ===')
+  let allPassed = true
+  let passedCount = 0
+  outcomes.forEach(({ goal, result }, i) => {
+    if (result === 'errored') {
+      console.log(`AC${i + 1}: TOOLING ERROR — ${goal}`)
+      allPassed = false
+      return
+    }
+    const passed = result.outcome === 'goal-reached'
+    if (passed) passedCount++
+    else allPassed = false
+    console.log(`AC${i + 1}: ${passed ? 'PASS' : `FAIL (${result.outcome})`} — ${goal}`)
+  })
+  console.log(`\n${passedCount}/${goals.length} acceptance criteria reached goal-reached.`)
+
+  return allPassed
+}
+
 /**
  * `five46 login <url>` — reuses the exact same `runAgent()` engine as
  * `test` to perform a login flow once, then captures the resulting
@@ -869,7 +1168,6 @@ async function runLoginFlow(
       headless: !headed,
       artifactDir,
       credentials,
-      forceConfirmation: true,
       recordVideo,
       onGoalReached: async (context, baselineState) => {
         const finalState = await context.storageState()
@@ -1108,9 +1406,9 @@ function listGeneratedRuns(dir: string, projectFilter?: string): boolean {
 }
 
 const USAGE = [
-  'Usage: five46 test <url> --goal "text" [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--project name] [--record-video] [--no-structured-plan] [--fast-steps]',
+  'Usage: five46 test <url> (--goal "text" | --story <path>) [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--record-video] [--no-structured-plan] [--fast-steps]',
   '       five46 login <url> --goal "text" --out <path> [--max-steps N] [--headed] [--record-video]',
-  '       five46 api <base-url> --goal "text" [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--project name] [--no-structured-plan] [--fast-steps]',
+  '       five46 api <base-url> (--goal "text" | --story <path>) [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--no-structured-plan] [--fast-steps]',
   '       five46 mcp   (starts an MCP server on stdio, exposing five46_test/five46_api to an IDE-embedded AI assistant)',
   '       five46 list [dir] [--project name]   (lists previously generated runs, default: current directory)',
   '       five46 diff <fileA> <fileB>   (line diff between two generated run files, ignoring the run-id header line)',
@@ -1221,12 +1519,15 @@ async function main() {
   }
 
   if (argv[0] === 'api') {
-    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project, noStructuredPlan, fastSteps } = resolveProjectForApi(
-      parseApiArgs(argv.slice(1))
-    )
+    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project, noStructuredPlan, fastSteps, story, concurrency } =
+      resolveProjectForApi(parseApiArgs(argv.slice(1)))
     const structuredPlan = resolveStructuredPlan({ noStructuredPlan })
-    if (!baseUrl || !goal) {
+    if (!baseUrl || (!goal && !story)) {
       console.error(USAGE)
+      process.exit(1)
+    }
+    if (goal && story) {
+      console.error('\n--goal and --story are mutually exclusive — pass exactly one.')
       process.exit(1)
     }
     if (!validateApiBaseUrl(baseUrl)) process.exit(1)
@@ -1235,10 +1536,11 @@ async function main() {
       // repeat === 1 (or unset) is an ordinary single run, not an error —
       // a legitimate if pointless value; only >= 2 actually engages the
       // repeated/flaky-detection path.
-      const succeeded =
-        repeat !== undefined && repeat >= 2
-          ? await runRepeatedApiTestCommand(baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, repeat, project, fastSteps)
-          : await runApiTestCommand(baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, project, fastSteps)
+      const succeeded = story
+        ? await runApiStoryScenarios(baseUrl, story, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, concurrency, project, fastSteps)
+        : repeat !== undefined && repeat >= 2
+          ? await runRepeatedApiTestCommand(baseUrl, goal!, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, repeat, project, fastSteps)
+          : await runApiTestCommand(baseUrl, goal!, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, project, fastSteps)
       if (!succeeded) process.exit(1)
     } catch (err) {
       console.error(`\nfive46 api failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -1252,22 +1554,27 @@ async function main() {
     process.exit(1)
   }
 
-  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, noStructuredPlan, fastSteps } = resolveProjectForTest(
+  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, noStructuredPlan, fastSteps, story, concurrency } = resolveProjectForTest(
     parseAgentArgs(argv.slice(1))
   )
   const structuredPlan = resolveStructuredPlan({ noStructuredPlan })
-  if (!url || !goal) {
+  if (!url || (!goal && !story)) {
     console.error(USAGE)
+    process.exit(1)
+  }
+  if (goal && story) {
+    console.error('\n--goal and --story are mutually exclusive — pass exactly one.')
     process.exit(1)
   }
 
   if (!validateTargetUrl(url)) process.exit(1)
 
   try {
-    const succeeded =
-      repeat !== undefined && repeat >= 2
-        ? await runRepeatedE2eTest(url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, repeat, project, fastSteps)
-        : await runE2eTest(url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, project, fastSteps)
+    const succeeded = story
+      ? await runStoryScenarios(url, story, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, concurrency, project, fastSteps)
+      : repeat !== undefined && repeat >= 2
+        ? await runRepeatedE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, repeat, project, fastSteps)
+        : await runE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, project, fastSteps)
     if (!succeeded) process.exit(1)
   } catch (err) {
     console.error(`\nfive46 test failed: ${err instanceof Error ? err.message : String(err)}`)

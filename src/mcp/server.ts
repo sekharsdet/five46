@@ -3,6 +3,7 @@ import { testToolInputSchema, apiToolInputSchema } from './schemas'
 import { runTestTool, runApiTool } from './tools'
 import type { McpToolContext } from './tools'
 import type { LlmProvider } from '../llm/types'
+import { DEFAULT_CONCURRENCY, HARD_MAX_CONCURRENCY } from '../agent/runLoop'
 import packageJson from '../../package.json'
 
 /** Every file under `src/mcp/` uses normal, static top-level imports
@@ -29,7 +30,18 @@ export function createFive46McpServer(options?: {
   const projectRoot = options?.projectRoot ?? process.env.FIVE46_MCP_PROJECT_ROOT ?? process.cwd()
   const allowWrites = process.env.FIVE46_MCP_ALLOW_WRITES === '1'
   const allowDeletes = process.env.FIVE46_MCP_ALLOW_DELETES === '1'
-  const context: McpToolContext = { projectRoot, allowWrites, allowDeletes, provider: options?.provider, apiKey: options?.apiKey }
+  // Same "human sets an env var once, at server-launch time" posture as
+  // allowWrites/allowDeletes above — story mode's concurrency is a
+  // cost/rate-limit-affecting setting, never a per-call tool argument (see
+  // McpToolContext.concurrency's own doc comment). Resolved to a definite,
+  // in-range number here (unlike the booleans above, there's no meaningful
+  // "unset" state worth preserving past this point) — an unparseable or
+  // out-of-range env var falls back to DEFAULT_CONCURRENCY/is clamped to
+  // HARD_MAX_CONCURRENCY, the same silent-but-safe posture `Number.isFinite`
+  // checks already use elsewhere for a malformed CLI flag value.
+  const parsedConcurrency = Number(process.env.FIVE46_MCP_CONCURRENCY)
+  const concurrency = Number.isFinite(parsedConcurrency) && parsedConcurrency > 0 ? Math.min(parsedConcurrency, HARD_MAX_CONCURRENCY) : DEFAULT_CONCURRENCY
+  const context: McpToolContext = { projectRoot, allowWrites, allowDeletes, concurrency, provider: options?.provider, apiKey: options?.apiKey }
 
   const server = new McpServer({ name: 'five46', version: packageJson.version })
 

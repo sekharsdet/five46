@@ -61,6 +61,9 @@ It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` fil
   decision only; the upfront plan always uses your configured model. No
   effect on OpenAI/Anthropic/Bedrock, already at their fastest reliable
   tier. Opt-in, not default — see "Fast per-step decisions" below.
+- **Story mode** (`--story`) — splits a raw, multi-AC user story into
+  independent goals and runs them with bounded concurrency, reporting a
+  clear pass/fail per acceptance criterion. See "Story mode" below.
 
 ## five46 vs. cloud AI testing platforms
 
@@ -173,7 +176,9 @@ and report whether it's flaky — see below), `--record-video` (save a
 `five46.config.json` — see below), `--no-structured-plan` (opt out of the
 default upfront-plan-then-fast-path behavior and use the fully-adaptive,
 live-decision-every-step loop instead — see below), `--fast-steps` (opt-in,
-use a faster model for per-step decisions on Groq/Gemini — see below).
+use a faster model for per-step decisions on Groq/Gemini — see below),
+`--story path` (split a raw multi-AC user story into independent goals and
+run them concurrently instead of a single `--goal` — see below).
 
 A successful run writes a real, human-readable Playwright `.spec.ts` file
 containing every confirmed-working step — re-runnable any time via
@@ -301,6 +306,17 @@ independently at the fast path too, not skipped. This is the single biggest
 lever for cutting a run's wall-clock time, since LLM round-trip latency —
 not five46's own code — is the dominant per-run cost.
 
+Confirming an outcome fast-paths too, not just navigating to it: a planned
+`assert_visible` step fast-paths under the same rule as clicks/fills (its
+target must resolve to exactly one real element, or it falls back to a live
+decision) — the visibility check itself still runs for real against the
+live page either way, nothing is assumed. `assert_text`/`assert_page_text`
+always make a live decision, since they'd also need to predict an exact
+expected text value for a page the plan never saw, a bigger risk than
+predicting an element's role/name. A well-formed goal can often complete
+with a single LLM call total (the upfront plan) if every step, including
+the final confirmation, fast-paths.
+
 ```bash
 five46 test http://localhost:3000 --goal "..." --no-structured-plan
 ```
@@ -333,6 +349,43 @@ default like structured planning. If wall-clock speed matters most to you,
 also consider picking Groq as your provider in the first place — see
 "Getting a key" above.
 
+## Story mode
+
+```bash
+five46 test http://localhost:3000 --story user-story.txt --concurrency 3
+```
+
+A real user story or Jira ticket often bundles several acceptance criteria
+together — often independent, sometimes mutually-exclusive scenarios
+("checkout succeeds with valid info," "checkout fails with an invalid
+coupon") that can't coexist in one linear run. `--story <path>` reads the
+raw story text, splits it into independent goals with one extra upfront LLM
+call, then runs each one exactly like an ordinary `--goal` run — same
+safety gating, same structured planning/`--fast-steps` speed path, its own
+fresh browser session/artifact directory, its own generated spec file —
+with up to `--concurrency` (default 3, hard-capped at 5) running at once.
+Mutually exclusive with `--goal` — pass exactly one. Works the same way on
+`five46 api`.
+
+```
+Split into 2 scenario(s):
+  AC1: log in with valid credentials and complete checkout, then confirm the order confirmation is shown
+  AC2: attempt checkout with no shipping details entered, then confirm a validation error is shown
+
+=== Story mode summary ===
+AC1: PASS — log in with valid credentials and complete checkout, then confirm the order confirmation is shown
+AC2: PASS — attempt checkout with no shipping details entered, then confirm a validation error is shown
+
+2/2 acceptance criteria reached goal-reached.
+```
+
+Exit code is all-or-nothing, matching `--repeat`'s own CI philosophy: 0
+only if every acceptance criterion reached `goal-reached`. Splitting is
+itself an LLM call and could occasionally group scenarios in an unintended
+way — a malformed or unusable split response degrades safely to treating
+the whole story as a single goal, never worse than not using `--story` at
+all.
+
 ## MCP server (IDE-embedded use)
 
 ```bash
@@ -346,6 +399,14 @@ to unlock writes — set `FIVE46_MCP_ALLOW_WRITES=1`/
 `FIVE46_MCP_ALLOW_DELETES=1` in the server's own environment to unlock
 them; tool arguments can never do it. `five46 login` is deliberately not
 exposed via MCP.
+
+Both tools also accept an optional `story` field alongside `goal` (exactly
+one required) — the same story-mode splitting/bounded-concurrency described
+above, letting a coding agent hand over a whole multi-AC story it just
+implemented a feature against and get back a per-AC pass/fail. Concurrency
+is set via `FIVE46_MCP_CONCURRENCY` in the server's own environment
+(default 3, hard-capped at 5) — never a per-call tool argument, the same
+posture as `allowWrites`/`allowDeletes`.
 
 ## Development
 

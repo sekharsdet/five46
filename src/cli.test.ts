@@ -4,7 +4,10 @@ import { spawnSync, spawn } from 'child_process'
 import { join } from 'path'
 import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { parseAgentArgs, parseApiArgs, parseDiffArgs, parseListArgs, withProjectHeaderLine, resolveStructuredPlan } from './cli'
+import { parseAgentArgs, parseApiArgs, parseDiffArgs, parseListArgs, withProjectHeaderLine, resolveStructuredPlan, performOneApiRun } from './cli'
+import { startApiTestServer } from './agent/apiTestServer'
+import type { SafetyMode } from './agent/apiTypes'
+import type { LlmProvider } from './llm/types'
 
 // cli.ts guards its own `main()` invocation behind `require.main === module`
 // specifically so this import doesn't trigger a full CLI run as a side
@@ -74,6 +77,15 @@ test('parseAgentArgs recognizes --fast-steps, leaving it undefined when not pass
   const result = parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--fast-steps'])
   assert.equal(result.fastSteps, true)
   assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).fastSteps, undefined)
+})
+
+test('parseAgentArgs recognizes --story and --concurrency, leaving them undefined when not passed', () => {
+  const result = parseAgentArgs(['http://localhost:3000', '--story', 'story.txt', '--concurrency', '4'])
+  assert.equal(result.story, 'story.txt')
+  assert.equal(result.concurrency, 4)
+  const withoutEither = parseAgentArgs(['http://localhost:3000', '--goal', 'g'])
+  assert.equal(withoutEither.story, undefined)
+  assert.equal(withoutEither.concurrency, undefined)
 })
 
 test('parseListArgs takes a positional dir and a --project filter, in either order', () => {
@@ -151,6 +163,15 @@ test('parseApiArgs recognizes --fast-steps, leaving it undefined when not passed
   const result = parseApiArgs(['http://localhost:3000', '--goal', 'g', '--fast-steps'])
   assert.equal(result.fastSteps, true)
   assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).fastSteps, undefined)
+})
+
+test('parseApiArgs recognizes --story and --concurrency, leaving them undefined when not passed', () => {
+  const result = parseApiArgs(['http://localhost:3000', '--story', 'story.txt', '--concurrency', '4'])
+  assert.equal(result.story, 'story.txt')
+  assert.equal(result.concurrency, 4)
+  const withoutEither = parseApiArgs(['http://localhost:3000', '--goal', 'g'])
+  assert.equal(withoutEither.story, undefined)
+  assert.equal(withoutEither.concurrency, undefined)
 })
 
 test('resolveStructuredPlan defaults to true when --no-structured-plan was not passed', () => {
@@ -284,6 +305,50 @@ test('CLI "test" subcommand without an LLM key configured explains what is missi
   const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g'])
   assert.notEqual(status, 0)
   assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "test" subcommand rejects --goal and --story passed together as mutually exclusive', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--story', 'story.txt'], FAKE_LLM_ENV)
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('mutually exclusive'))
+})
+
+test('CLI "api" subcommand rejects --goal and --story passed together as mutually exclusive', () => {
+  const { stderr, status } = runCli(['api', 'http://localhost:1', '--goal', 'g', '--story', 'story.txt'], FAKE_LLM_ENV)
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('mutually exclusive'))
+})
+
+test('CLI "test" subcommand without --goal or --story prints usage and exits non-zero', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('Usage: five46 test'))
+})
+
+test('CLI "test" subcommand with --story still fails at the same missing-API-key preflight check, without ever reading the story file', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1', '--story', '/nonexistent/story.txt'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+  assert.ok(!stderr.includes("Couldn't read the story file"), 'should fail at the API-key preflight before ever touching the story file')
+})
+
+test('CLI "api" subcommand with --story still fails at the same missing-API-key preflight check, without ever reading the story file', () => {
+  const { stderr, status } = runCli(['api', 'http://localhost:1', '--story', '/nonexistent/story.txt'])
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes('requires an LLM API key'))
+  assert.ok(!stderr.includes("Couldn't read the story file"))
+})
+
+test('CLI "test" subcommand with --story rejects an unreadable story file, after the API-key preflight passes', () => {
+  const { stderr, status } = runCli(['test', 'http://localhost:1', '--story', '/nonexistent/story.txt'], FAKE_LLM_ENV)
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes("Couldn't read the story file"))
+})
+
+test('CLI "api" subcommand with --story rejects an unreadable story file, after the API-key preflight passes', () => {
+  const { stderr, status } = runCli(['api', 'http://localhost:1', '--story', '/nonexistent/story.txt'], FAKE_LLM_ENV)
+  assert.notEqual(status, 0)
+  assert.ok(stderr.includes("Couldn't read the story file"))
 })
 
 test('CLI "test" subcommand rejects an unreadable --storage-state file before attempting anything', () => {
@@ -656,4 +721,58 @@ test('five46 mcp: a real tool call over real stdio produces only valid JSON-RPC 
 
   await new Promise((resolve) => setTimeout(resolve, 100))
   assert.match(stderrText, /five46 mcp: server running on stdio/)
+})
+
+test('performOneApiRun returns the "errored" sentinel (never throws) when writing the generated spec fails', async () => {
+  // Regression test for a real gap found via a deliberate code review (not
+  // a live incident): the report-generation/write step used to run
+  // completely outside any try/catch, so a genuine I/O failure there (a
+  // full disk, an unwritable directory) would propagate as an uncaught
+  // exception. This matters far more than it looks for `--story`: each
+  // scenario's call runs as one task inside `runWithConcurrency`'s shared
+  // `Promise.all` (see `runStoryScenarios`/`runApiStoryScenarios`) — one
+  // uncaught throw would abort the *entire* batch, discarding every other
+  // scenario's already-completed result along with it, not just failing
+  // the one scenario that hit the error. `outArg` here points *through* a
+  // real file (not a directory), so the write genuinely fails with a real
+  // ENOTDIR, not a simulated error.
+  const server = await startApiTestServer()
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  const notADir = join(dir, 'this-is-a-file-not-a-directory')
+  writeFileSync(notADir, 'not a directory')
+  try {
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const safety: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: new URL(server.url).origin, allowedHosts: new Set() }
+
+    const result = await performOneApiRun(
+      server.url,
+      'list items',
+      undefined,
+      join(notADir, 'out.test.mjs'),
+      undefined,
+      safety,
+      undefined,
+      true,
+      false,
+      provider,
+      'fake-key',
+      [],
+      undefined,
+      false
+    )
+
+    assert.equal(result, 'errored', 'a write failure after a completed run must resolve to the errored sentinel, never throw')
+  } finally {
+    await server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

@@ -17,6 +17,20 @@ export const HARD_MAX_STEPS = 50
  * existing gap to match. */
 export const HARD_MAX_REPEAT = 10
 
+/** Hard cap on the number of scenarios `storySplitter.ts` will split a single
+ * `--story` into, regardless of what the split-LLM-call returns — bounds
+ * worst-case BYOK cost the same way `HARD_MAX_REPEAT` bounds `--repeat`'s (each
+ * scenario is a whole extra LLM-driven run), disclosed explicitly when it clamps. */
+export const HARD_MAX_SCENARIOS = 10
+
+/** Bounded-concurrency defaults for running a `--story`'s split-out scenarios.
+ * Default 3 is faster in aggregate than `--repeat`'s strict sequencing without
+ * risking a live-LLM rate-limit storm or exhausting local resources (many real
+ * headless browser instances at once); hard-capped at 5 regardless of what a
+ * caller passes, mirroring `HARD_MAX_STEPS`/`HARD_MAX_REPEAT`'s own clamps. */
+export const DEFAULT_CONCURRENCY = 3
+export const HARD_MAX_CONCURRENCY = 5
+
 /** Output-token caps per LLM call type — see DEVELOPMENT.md's "Bounding LLM
  * output tokens" section for the sizing rationale. A too-generous cap costs
  * nothing (providers stop naturally at a real end-of-response); a too-tight
