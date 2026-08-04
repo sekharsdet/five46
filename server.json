@@ -1,0 +1,57 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.sekharsdet/five46",
+  "description": "BYOK, fully local AI agent that tests your app/API and writes a real Playwright spec on success.",
+  "title": "five46",
+  "websiteUrl": "https://github.com/sekharsdet/five46#readme",
+  "repository": {
+    "url": "https://github.com/sekharsdet/five46",
+    "source": "github"
+  },
+  "version": "0.2.3",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "five46",
+      "version": "0.2.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "FIVE46_LLM_PROVIDER",
+          "description": "LLM provider to use: openai, anthropic, gemini, groq, or bedrock",
+          "isRequired": true
+        },
+        {
+          "name": "FIVE46_LLM_API_KEY",
+          "description": "Your own API key for the chosen provider (for bedrock, your AWS region instead)",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "FIVE46_MCP_ALLOW_WRITES",
+          "description": "Set to 1 to unlock POST/PUT/PATCH for the five46_api tool (read-only by default)",
+          "isRequired": false
+        },
+        {
+          "name": "FIVE46_MCP_ALLOW_DELETES",
+          "description": "Set to 1 to unlock DELETE (five46_api) and destructive-looking browser clicks (five46_test)",
+          "isRequired": false
+        },
+        {
+          "name": "FIVE46_MCP_CONCURRENCY",
+          "description": "Max concurrent scenarios for story mode (default: 2 for five46_test, 3 for five46_api; hard-capped at 5)",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}
