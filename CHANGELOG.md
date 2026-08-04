@@ -3,11 +3,29 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.2.2
+
+### Fixed
+- `engines.node` corrected from `>=18` to `>=20` — `playwright`/
+  `@playwright/test` (needed for `five46 test`'s browser engine) have
+  always required Node >=20 themselves; the old, looser claim let
+  `npm install` on Node 18/19 silently skip installing them as an
+  optional dependency, and broke building five46 from source on Node 18
+  entirely (a real CI failure this correction was found from).
+- `npm test`'s file discovery no longer depends on `node --test`'s
+  native glob-pattern support, which only exists on Node 22+ — replaced
+  with an explicit file list, portable across every Node version this
+  project supports.
+- A mocked `AbortSignal.timeout()` test relied solely on that API's own
+  (deliberately unref'd) internal timer to keep the test process alive —
+  a known Node test-runner false positive on Node 20.12+ through at
+  least 22.x (nodejs/node#49952, #52304). Fixed with a trivial ref'd
+  keepalive.
+
 ## 0.2.1
 
 ### Added
-- CI (GitHub Actions): build + full test suite on every push/PR, across
-  Node 18/20/22.
+- CI (GitHub Actions): build + full test suite on every push/PR.
 
 ### Fixed
 - The transient Playwright `"Execution context was destroyed, most likely
