@@ -108,12 +108,20 @@ function describeResultDetail(action: ApiAction, result: { responseStatus?: numb
  * failure is the run's actual verdict about the API. `{{var}}` names saved
  * via `saveAs` accumulate across the *whole* run (unlike `validRefs`, which
  * is rebuilt fresh every turn for browser actions) — a value saved in step
- * 2 must still resolve in step 8. */
+ * 2 must still resolve in step 8.
+ *
+ * Same unconditional-floor-of-1 assertion requirement as `runAgent` — see
+ * its own doc comment for the full reasoning. */
 export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun> {
   const runId = makeRunId()
   const maxSteps = Math.min(options.maxSteps ?? DEFAULT_MAX_STEPS, HARD_MAX_STEPS)
-  const requiredConfirmationCount = countConfirmationClauses(options.goal)
-  const needsConfirmation = requiredConfirmationCount > 0
+  // Unconditional floor of 1, not just when the goal's own wording asks
+  // for it — see runner.ts's identical fix/doc comment for the real,
+  // live-found bug this closes (a goal with zero confirm/verify language
+  // got a false goal-reached claim on a real production site).
+  // countConfirmationClauses still raises the floor above 1 when the goal
+  // explicitly asks for more than one check.
+  const requiredConfirmationCount = Math.max(1, countConfirmationClauses(options.goal))
 
   const cookieJar = new CookieJar()
   if (options.storageState) cookieJar.seedFromStorageState(options.storageState.cookies, options.safety.targetOrigin)
@@ -318,7 +326,7 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
 
     if (action.action === 'done') {
       lastActionMadeProgress = false
-      const unverifiedSuccess = action.outcome === 'goal-reached' && needsConfirmation && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
+      const unverifiedSuccess = action.outcome === 'goal-reached' && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
       if (unverifiedSuccess) {
         history.push({
           action,

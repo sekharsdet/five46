@@ -242,6 +242,7 @@ test('runApiTest blocks a write by default without ending the run, recording it 
     const provider = scriptedProvider([
       JSON.stringify({ action: 'request', method: 'POST', url: server.url + '/items', body: '{}', reason: 'try to write' }),
       JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'fall back to reading' }),
+      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm the read succeeded' }),
       JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' }),
     ])
 
@@ -475,6 +476,7 @@ test('runApiTest calls onWrite in real time for an allowed non-safe-method reque
     const provider = scriptedProvider([
       JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'read first' }),
       JSON.stringify({ action: 'request', method: 'POST', url: server.url + '/items', body: '{"name":"gadget"}', reason: 'create it' }),
+      JSON.stringify({ action: 'assert_status', expected: 201, reason: 'confirm it was created' }),
       JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' }),
     ])
 
@@ -796,6 +798,7 @@ test('runApiTest with useStructuredPlan degrades silently to the full adaptive l
         turn++
         if (turn === 1) return 'not valid json at all'
         if (turn === 2) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 3) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm the read succeeded' })
         return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
       },
     }
@@ -830,6 +833,7 @@ test('runApiTest with useStructuredPlan degrades to the full adaptive loop when 
         turn++
         if (turn === 1) return JSON.stringify({ steps: [{ action: 'done', outcome: 'goal-unreachable', reason: 'assumed this API does not support it' }] })
         if (turn === 2) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 3) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm the read succeeded' })
         return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
       },
     }
@@ -847,7 +851,7 @@ test('runApiTest with useStructuredPlan degrades to the full adaptive loop when 
     // rather than the run ending on the plan's own premature claim.
     assert.equal(run.outcome, 'goal-reached')
     assert.equal(run.planStats, undefined, 'the degenerate plan was rejected, so nothing was ever adopted to disclose')
-    assert.equal(run.steps.length, 1)
+    assert.equal(run.steps.length, 2)
   } finally {
     await server.close()
   }

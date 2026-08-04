@@ -128,6 +128,7 @@ test('runAgent with useStructuredPlan bounds the upfront plan call with PLAN_MAX
         return JSON.stringify({
           steps: [
             { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+            { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed' },
             { action: 'done', outcome: 'goal-reached', reason: 'done' },
           ],
         })
@@ -210,6 +211,7 @@ test('runAgent with both useStructuredPlan and useFastSteps never sets fastPath 
         return JSON.stringify({
           steps: [
             { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+            { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed' },
             { action: 'done', outcome: 'goal-reached', reason: 'done' },
           ],
         })
@@ -799,7 +801,6 @@ test('runAgent completes a real login through credential placeholders, never sen
       headless: true,
       artifactDir,
       credentials: { username: LOGIN_FIXTURE_USERNAME, password: LOGIN_FIXTURE_PASSWORD },
-      forceConfirmation: true,
       onGoalReached: async (context, baseline) => {
         onGoalReachedCalled = true
         seenBaseline = baseline
@@ -911,7 +912,6 @@ test('runAgent reports matching baseline/final storageState to onGoalReached whe
       apiKey: 'fake-key',
       headless: true,
       artifactDir,
-      forceConfirmation: true,
       onGoalReached: async (context, baseline) => {
         seenBaseline = baseline
         seenFinal = await context.storageState()
@@ -926,12 +926,14 @@ test('runAgent reports matching baseline/final storageState to onGoalReached whe
   }
 })
 
-test('runAgent with forceConfirmation still requires exactly one real assertion when the goal itself contains zero confirm-language', async (t) => {
-  // Direct test of the Math.max(1, countConfirmationClauses(goal)) floor:
-  // a goal with no "confirm"/"verify"/etc. at all would otherwise compute
-  // a required count of 0, silently defeating forceConfirmation's whole
-  // point (used only by five46 login, where the goal text may not use any
-  // confirm-language even though a real assertion must still be required).
+test('runAgent requires exactly one real assertion before accepting goal-reached by default, even when the goal itself contains zero confirm-language', async (t) => {
+  // Direct test of the Math.max(1, countConfirmationClauses(goal)) floor,
+  // now unconditional (not gated behind a forceConfirmation flag or the
+  // goal's own wording) — found via real live testing against production
+  // sites (Flipkart, Amazon.in): a goal with no "confirm"/"verify"/etc. at
+  // all used to compute a required count of 0, so a done/goal-reached
+  // claim was accepted with zero real verification ever performed. See
+  // DEVELOPMENT.md's "Known limitations" entry for the live evidence.
   if (!(await playwrightAvailable())) {
     t.skip('playwright unavailable in this environment')
     return
@@ -958,7 +960,6 @@ test('runAgent with forceConfirmation still requires exactly one real assertion 
       apiKey: 'fake-key',
       headless: true,
       artifactDir,
-      forceConfirmation: true,
     })
 
     assert.equal(run.outcome, 'goal-reached')
@@ -1012,6 +1013,63 @@ test('runAgent requires a fresh assertion for EACH confirm-clause in a compound 
 
     assert.equal(run.outcome, 'goal-reached')
     assert.equal(turn, 5, 'the turn-2 done attempt (only 1 of 2 required confirmations) must have been rejected, forcing a real second assertion')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent does not accept an assert_page_text whose expected text was already present before any actions ran, as confirmation', async (t) => {
+  // Real, live-found gap (Flipkart, reproduced twice, live): the model
+  // satisfied the confirmation requirement by asserting a persistent
+  // element (a site-wide header link) true on every page regardless of
+  // state, proving nothing. Prompt guidance alone did not fix this in
+  // practice (live-retested) — this is the mechanical fix instead: an
+  // assert_page_text whose expected substring was already true in the
+  // very first page snapshot, before any action ran, doesn't count toward
+  // the confirmation-gate credit. "Simple Reveal" is the fixture's own
+  // static <h1>, present from page load and never changed by any action —
+  // the exact shape of the bug, reproduced deterministically here.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_page_text', expectedText: 'Simple Reveal', reason: 'the page still shows its own heading' })
+        if (turn === 3) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, the heading is there' })
+        // Only reached if turn 3 was correctly rejected: a genuinely new
+        // assertion, only true because of the click, satisfies the gate.
+        if (turn === 4) return JSON.stringify({ action: 'assert_page_text', expectedText: 'agentic testing works', reason: 'confirm the secret actually appeared' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'genuinely confirmed now' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 5, 'the turn-3 done attempt must have been rejected — the turn-2 assertion was true before any action ran, so it must not count as confirmation')
+    // The tautological assertion still genuinely succeeded (the DOM check
+    // itself is real) — it must be recorded as a real, correctly-executed
+    // step, not silently dropped or marked as a failure.
+    const tautologicalStep = run.steps.find((s) => s.action.action === 'assert_page_text' && s.action.expectedText === 'Simple Reveal')
+    assert.ok(tautologicalStep)
+    assert.equal(tautologicalStep!.ok, true)
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })
@@ -1126,6 +1184,11 @@ test('runAgent allows a goal that legitimately requires several consecutive scro
           const ref = tryRefFor(prompt, 'Bottom button')
           if (!ref) throw new Error(`test setup: "Bottom button" not found in prompt:\n${prompt}`)
           return JSON.stringify({ action: 'click', ref, reason: 'click it' })
+        }
+        if (turn === 5) {
+          const ref = tryRefFor(prompt, 'Bottom clicked')
+          if (!ref) throw new Error(`test setup: "Bottom clicked" not found in prompt:\n${prompt}`)
+          return JSON.stringify({ action: 'assert_visible', ref, reason: 'confirm the button was clicked' })
         }
         return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
       },
@@ -1327,22 +1390,19 @@ test('runAgent with useStructuredPlan fast-paths a click plan step, skipping the
     let turn = 0
     const fakeProvider: LlmProvider = {
       id: 'fake',
-      async complete(prompt) {
+      async complete() {
         turn++
-        if (turn === 1) {
-          // The one upfront planning call.
-          return JSON.stringify({
-            steps: [
-              { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
-              { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed' },
-              { action: 'done', outcome: 'goal-reached', reason: 'done' },
-            ],
-          })
-        }
-        // assert_visible never fast-paths, by design — this is the live
-        // decision for the plan's 2nd step, with the real, current outline.
-        if (turn === 2) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
-        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+        // The one upfront planning call — click, assert_visible, and done
+        // should all now fast-path (assert_visible resolves unambiguously
+        // by structural match, same discipline as click/fill), so this
+        // should be the *only* LLM call the whole run makes.
+        return JSON.stringify({
+          steps: [
+            { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+            { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed' },
+            { action: 'done', outcome: 'goal-reached', reason: 'done' },
+          ],
+        })
       },
     }
 
@@ -1359,13 +1419,122 @@ test('runAgent with useStructuredPlan fast-paths a click plan step, skipping the
     assert.equal(run.outcome, 'goal-reached')
     assert.equal(run.steps.length, 2)
     assert.ok(run.steps[0].ok, 'the fast-pathed click must have actually executed for real, not just been assumed')
+    assert.ok(run.steps[1].ok, 'the fast-pathed assert_visible must have actually, genuinely checked the real page, not been assumed')
     assert.equal(run.planStats?.plannedSteps, 3)
-    // click and done both fast-path (fully deterministic: a click resolved
-    // unambiguously by structural match, a done with no target at all); the
-    // assertion is the one action type that always decides live, matching
-    // self-healing's own permanent assertion exclusion.
+    // click, assert_visible, and done all fast-path now: a click/assertion
+    // resolved unambiguously by structural match, and a done with no target
+    // at all.
+    assert.equal(run.planStats?.fastPathedSteps, 3)
+    assert.equal(turn, 1, 'only the upfront planning call — zero live per-step decisions, including for the assertion')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with useStructuredPlan falls back to a live decision when a planned assert_visible target resolves ambiguously', async (t) => {
+  // The counterpart to the click/fill ambiguity test below: an
+  // assert_visible plan step whose target matches zero or multiple real
+  // elements must refuse to guess and fall back to a live decision, exactly
+  // like click/fill fast-pathing already does — never silently pick one and
+  // risk converting a real regression into a false pass.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) {
+          return JSON.stringify({
+            steps: [
+              { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+              // No real element has role "status" with a name containing
+              // this nonsense string — zero candidates, must fall back live.
+              { action: 'assert_visible', target: { role: 'status', nameContains: 'this text matches nothing real' }, reason: 'confirm revealed' },
+              { action: 'done', outcome: 'goal-reached', reason: 'done' },
+            ],
+          })
+        }
+        return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed, live decision' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 2, 'the plan call plus exactly one live call for the ambiguous assertion')
+    // click and the final done both fast-path; only the ambiguous
+    // assertion needed a live decision.
     assert.equal(run.planStats?.fastPathedSteps, 2)
-    assert.equal(turn, 2, 'plan + live assert only — neither the click nor the final done made its own LLM call')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with useStructuredPlan never fast-paths assert_text or assert_page_text, even when they would resolve unambiguously', async (t) => {
+  // Regression guard: this pass deliberately widened fast-pathing to
+  // assert_visible only. assert_text/assert_page_text predict an exact
+  // expected *text value* for a page the plan never saw — a categorically
+  // bigger risk than predicting an element's role+name — and must remain
+  // permanently live, full stop, regardless of how cleanly their target
+  // would resolve.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) {
+          return JSON.stringify({
+            steps: [
+              { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+              // Resolves unambiguously (exactly one real "status" element),
+              // same as the assert_visible fast-path test above — but
+              // assert_text must still never fast-path.
+              { action: 'assert_text', target: { role: 'status', nameContains: 'agentic testing works' }, expectedText: 'agentic testing works', reason: 'confirm revealed' },
+              { action: 'done', outcome: 'goal-reached', reason: 'done' },
+            ],
+          })
+        }
+        if (turn === 2) return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'agentic testing works'), expectedText: 'agentic testing works', reason: 'confirm revealed, live decision' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm the text is correct',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 2, 'the plan call plus exactly one live call for the assert_text step — it must never fast-path')
+    assert.equal(run.planStats?.fastPathedSteps, 2, 'click and the final done fast-path; assert_text does not')
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })
@@ -1498,6 +1667,13 @@ test('runAgent with useStructuredPlan falls back to a live decision when a plann
           })
         }
         if (turn === 2) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        // The plan's own `done` step still fast-paths after this (fully
+        // deterministic — see fastPathedSteps below) but is now rejected as
+        // an unverified success (the goal has no confirm-language, so the
+        // default floor of 1 applies) — the plan is exhausted at that point,
+        // so a further live decision is needed to actually assert something
+        // before `done` can be accepted.
+        if (turn === 3) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
         return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
       },
     }
@@ -1514,10 +1690,11 @@ test('runAgent with useStructuredPlan falls back to a live decision when a plann
 
     assert.equal(run.outcome, 'goal-reached')
     // The ambiguous click must not fast-path — but the plan's final `done`
-    // step still does, since it's fully deterministic regardless of what
-    // happened to the step before it.
+    // step still attempts to (fully deterministic regardless of what
+    // happened to the step before it), incrementing fastPathedSteps even
+    // though it's then rejected for lacking a real assertion.
     assert.equal(run.planStats?.fastPathedSteps, 1)
-    assert.equal(turn, 2, 'plan + live click (ambiguous fallback) only — done still fast-pathed')
+    assert.equal(turn, 4, 'plan + live click (ambiguous fallback) + live assertion + live done, since the plan itself never asserted anything')
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })

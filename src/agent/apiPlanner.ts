@@ -1,6 +1,7 @@
 import type { ApiAction, ApiHistoryEntry, ApiPlan, HttpMethod, SafetyMode } from './apiTypes'
 import { isMethodAllowed, isHostAllowed, effectiveMethod, VALID_METHODS } from './apiTypes'
 import { extractPlaceholderNames } from './apiExecutor'
+import { countConfirmationClauses } from './planner'
 
 const MAX_HISTORY = 10
 
@@ -53,25 +54,52 @@ const ACTION_SCHEMA_EXAMPLE = `{"action":"request","method":"POST","url":"/users
  * same single-shot-JSON-per-step shape as `planner.ts`'s
  * `buildActionPrompt`, for the identical reason (`LlmProvider.complete()`
  * has no tool-calling/JSON-mode hook). Tells the model the allowed
- * methods/hosts and the currently-available `{{var}}` names up front,
- * rather than only rejecting a disallowed attempt after the fact — more
- * turn/token-efficient, matching how `buildActionPrompt` already discloses
- * the confirmation-gating requirement up front instead of only after a
- * rejection. */
+ * methods/hosts, the currently-available `{{var}}` names, and the
+ * assertion-count requirement up front, rather than only rejecting a
+ * disallowed/premature attempt after the fact — more turn/token-efficient
+ * than only discovering either after a rejection. */
 export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], validVarNames: ReadonlySet<string>, safety: SafetyMode): string {
+  // Unconditional — not gated on the goal's own wording containing
+  // confirm/verify/etc. language. Mirrors planner.ts's buildActionPrompt
+  // exactly (added at the same time, for the same live-found reason — see
+  // countConfirmationClauses' own doc comment): apiRunner.ts requires this
+  // many successful assert_status/assert_json_path_exists/
+  // assert_json_path_equals actions before accepting goal-reached,
+  // regardless of whether the goal text says "confirm"/"verify" at all.
+  const requiredAssertionCount = Math.max(1, countConfirmationClauses(goal))
+  const confirmationNote = [
+    ``,
+    `You must perform at least ${requiredAssertionCount} successful assert_status, assert_json_path_exists, or assert_json_path_equals action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
+  ]
+  // API-engine mirror of planner.ts's identical guard — see its own doc
+  // comment for the live-found reasoning (the browser-engine version of
+  // this exact gap: a persistent, always-true page element satisfying the
+  // confirmation requirement above without proving anything). The API
+  // analog is asserting against the wrong *response* — e.g. a generic
+  // health-check-style endpoint, or a read that happened before the
+  // request the goal is actually about — rather than the one response
+  // that would only look this way if the goal's real action succeeded.
+  // Guidance only, same as planner.ts's version: nothing here rejects a
+  // technically-valid-but-unhelpful assertion mechanically.
+  const assertionQualityNote = [
+    ``,
+    `When choosing what to assert, check the response from the request that actually reflects the goal's own outcome — not an unrelated or incidental response (e.g. a generic health-check-style endpoint, or an earlier read that happened before the action you're trying to verify) that would look the same regardless of whether your real action succeeded.`,
+  ]
   const varsNote =
     validVarNames.size > 0
       ? [``, `Values saved so far, referenceable as {{name}} in a request's url/headers/body: ${[...validVarNames].join(', ')}`]
       : []
   // Same cache-friendly ordering as planner.ts's buildActionPrompt (see its
   // own doc comment for the full reasoning): static-across-every-turn
-  // content (opener, goal, describeSafetyMode) first, per-turn-dynamic
-  // content (varsNote, history) last, with a short closing reminder to
-  // recover the "recency effect" the reordering trades away.
+  // content (opener, goal, describeSafetyMode, confirmationNote) first,
+  // per-turn-dynamic content (varsNote, history) last, with a short closing
+  // reminder to recover the "recency effect" the reordering trades away.
   return [
     `You are an API testing agent driving real HTTP requests toward one goal, one request/check at a time.`,
     ``,
     `Goal: ${goal}`,
+    ...confirmationNote,
+    ...assertionQualityNote,
     ``,
     describeSafetyMode(safety),
     ``,

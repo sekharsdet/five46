@@ -62,6 +62,30 @@ test('buildApiActionPrompt lists currently-saved variable names, only when there
   assert.ok(!noVars.includes('Values saved so far'))
 })
 
+test('buildApiActionPrompt always discloses the assertion requirement upfront, unconditionally, regardless of the goal\'s own wording', () => {
+  // Mirrors planner.ts's identical buildActionPrompt test — added at the
+  // same time, for the same live-found reason (a goal with zero confirm/
+  // verify language used to get zero forced verification at all, since
+  // apiRunner.ts's requiredConfirmationCount used to be plain
+  // countConfirmationClauses(goal), which is 0 for such a goal). This
+  // function previously had no confirmationNote at all, despite an old doc
+  // comment incorrectly claiming it did.
+  const plainGoal = buildApiActionPrompt('create a widget', [], new Set(), READ_ONLY)
+  assert.ok(plainGoal.includes('at least 1 successful'), 'the note must appear even when the goal has no confirm/verify wording at all')
+  assert.ok(plainGoal.includes('assert_status, assert_json_path_exists, or assert_json_path_equals'))
+
+  const twoConfirmClauses = buildApiActionPrompt('confirm the item exists, create it, then confirm it is retrievable', [], new Set(), READ_ONLY)
+  assert.ok(twoConfirmClauses.includes('at least 2 successful'), 'a compound goal with two confirm-clauses must require 2, not just 1')
+})
+
+test('buildApiActionPrompt warns against asserting an unrelated/incidental response that would look the same regardless of whether the real action succeeded', () => {
+  // API-engine mirror of planner.ts's identical guard — see its own test's
+  // doc comment for the live-found browser-engine analog of this exact gap.
+  const prompt = buildApiActionPrompt('create a widget', [], new Set(), READ_ONLY)
+  assert.ok(prompt.includes('health-check-style endpoint'))
+  assert.ok(prompt.includes('the request that actually reflects the goal\'s own outcome'))
+})
+
 test('parseApiAction parses a real request action with saveAs', () => {
   const raw = JSON.stringify({
     action: 'request',

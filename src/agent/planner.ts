@@ -77,32 +77,26 @@ const ACTION_SCHEMA_EXAMPLE = `{"action":"click","ref":"e2","reason":"the goal r
 const CONFIRMATION_PATTERN = /\b(confirm|verify|ensure|make sure|check that)\b/i
 const CONFIRMATION_PATTERN_GLOBAL = new RegExp(CONFIRMATION_PATTERN.source, 'gi')
 
-/** Naming-heuristic detection of "this goal asks for verification," not
- * real NLP — a goal phrased with confirm/verify/ensure/etc. language is
- * asking to be *checked*, not just *done*. Found via a real, live run
- * (a Shopify demo store, goal: "...then confirm the cart shows an item"):
- * the model added a real item to the cart, then declared `goal-reached`
- * without ever calling `assert_visible`/`assert_text` — the outcome
- * happened to be correct, but nothing in the run actually verified it, and
- * the goal explicitly asked for verification. `runner.ts` uses this to
- * require at least one successful assertion before accepting a
- * `goal-reached` claim for a goal shaped this way — same "don't accept an
- * unverified confident claim" posture as everywhere else in this project. */
-export function requiresConfirmation(goal: string): boolean {
-  return countConfirmationClauses(goal) > 0
-}
-
 /** How many confirm/verify/ensure/etc. occurrences the goal's own text
- * contains — the same heuristic `requiresConfirmation` uses, just counted
- * instead of merely tested for. Found via a real, live run
+ * contains — a naming-heuristic, not real NLP. Originally only used to
+ * detect "this goal asks for verification" (via a `requiresConfirmation()`
+ * boolean wrapper, since removed) and gate the assertion requirement on
+ * that; `runner.ts`/`apiRunner.ts` now use `Math.max(1, ...)` of this count
+ * as an *unconditional* floor instead — found via a real, live run (a
+ * Shopify demo store, goal: "...then confirm the cart shows an item") that
+ * a goal explicitly asking for verification could still have its
+ * `goal-reached` claim accepted with zero assertions ever performed, and
+ * later, via live testing against real production sites (Flipkart,
+ * Amazon.in), that a goal with *no* confirm-language at all got the exact
+ * same false-success failure mode, since the count was simply 0 for it —
+ * see DEVELOPMENT.md's "Known limitations" section for the full evidence.
+ * Also used as a *multi*-clause floor: found via a real, live run
  * (automationintesting.online: "...confirm the price is shown, then click
  * Next, confirm the calendar changed") that `hasSucceededAssertion`'s own
- * "reset when stale" fix (see runner.ts) did not catch: the model jumped
- * straight to one, perfectly *fresh* assertion for the *second* clause and
- * never attempted the first at all. A single boolean has no way to know
- * the goal asked for two checks, not one — `runner.ts`/`apiRunner.ts` use
- * this count as a required minimum number of successful assertions across
- * the whole run, on top of (not instead of) the existing freshness check. */
+ * "reset when stale" fix (see runner.ts) did not catch a model jumping
+ * straight to one, perfectly *fresh* assertion for only the *second*
+ * clause, skipping the first entirely — a single required-count-of-1 has
+ * no way to know the goal asked for two checks, not one. */
 export function countConfirmationClauses(goal: string): number {
   return (goal.match(CONFIRMATION_PATTERN_GLOBAL) || []).length
 }
@@ -139,7 +133,7 @@ const DESTRUCTIVE_CLICK_PHRASES = [
 /** True if `name` (an `OutlineElement.name` — the clicked element's
  * accessible name) matches one of `DESTRUCTIVE_CLICK_PHRASES`. Substring
  * match, case-insensitive — same "documented, honest, imperfect proxy" class
- * of heuristic as `requiresConfirmation`, not real NLP. */
+ * of heuristic as `countConfirmationClauses`, not real NLP. */
 export function isDestructiveClickTarget(name: string): boolean {
   const lower = name.toLowerCase()
   return DESTRUCTIVE_CLICK_PHRASES.some((phrase) => lower.includes(phrase))
@@ -196,15 +190,33 @@ export function buildActionPrompt(
         `The plan's prediction for this step didn't resolve cleanly against the real page, so decide the actual next action yourself from the real elements below — you are not required to follow the plan exactly.`,
       ]
     : []
-  const confirmationNote = requiresConfirmation(goal)
-    ? [
-        ``,
-        `This goal asks you to confirm/verify something — you must perform at least one`,
-        `successful assert_visible, assert_text, or assert_page_text action before you're`,
-        `allowed to declare "done" with outcome "goal-reached". Declaring done without one`,
-        `will be rejected.`,
-      ]
-    : []
+  // Unconditional — not gated on the goal's own wording containing
+  // confirm/verify/etc. language. Disclosed up front for the same reason
+  // as deleteNote below: telling the model before it wastes a turn is
+  // more efficient than only rejecting a blind attempt after the fact. See
+  // countConfirmationClauses' own doc comment for the live evidence this
+  // floor-of-1 default closes (a goal with zero confirm-language used to
+  // get zero forced verification at all).
+  const requiredAssertionCount = Math.max(1, countConfirmationClauses(goal))
+  const confirmationNote = [
+    ``,
+    `You must perform at least ${requiredAssertionCount} successful assert_visible, assert_text, or assert_page_text action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
+  ]
+  // Generalizes the existing tautology guard (never re-assert the exact
+  // element you just clicked/filled, in the assert_visible schema line
+  // below) to the broader case a real live run against a production site
+  // (Flipkart) exposed: the model satisfied the confirmation requirement
+  // above by asserting a completely unrelated, always-present element (a
+  // site-wide header link reading "Login," true on every single page
+  // regardless of whether any of its prior actions actually worked), then
+  // never completed the rest of the goal. Nothing rejects this
+  // mechanically (unlike the confirmationNote count above) — this is
+  // guidance only, since "was this assertion meaningful" is a real
+  // semantic judgment, not something a simple rule can verify.
+  const assertionQualityNote = [
+    ``,
+    `When choosing what to assert, avoid a persistent/ambient element that would already be visible or true regardless of whether your actions actually worked — a site-wide header/nav/footer label, a page title, a generic link that's present on every page. That kind of assertion can pass even when nothing you did actually mattered. Prefer something that specifically changed, newly appeared, or only exists because of the actions you just took.`,
+  ]
   // Disclosed up front, same reasoning as apiPlanner.ts's describeSafetyMode:
   // telling the model before it wastes a turn is more efficient than only
   // rejecting a blind attempt after the fact.
@@ -245,6 +257,7 @@ export function buildActionPrompt(
     ``,
     `Goal: ${goal}`,
     ...confirmationNote,
+    ...assertionQualityNote,
     ...deleteNote,
     ...credentialNote,
     ``,
@@ -414,7 +427,7 @@ export function parsePlan(raw: string): ParsePlanResult {
   // real progress on the identical goal before reaching its own honest
   // conclusion). Applies to both outcomes, not just goal-unreachable: an
   // immediate goal-reached with zero real actions is the same category of
-  // ungrounded claim the live loop's own requiresConfirmation/
+  // ungrounded claim the live loop's own countConfirmationClauses/
   // hasSucceededAssertion check already refuses to accept.
   if (steps.every((s) => s.action === 'done')) {
     return { ok: false, error: 'plan consists only of an immediate "done" step, with no real action ever attempted — falling back to a live decision so the model has to gather real evidence first', raw }

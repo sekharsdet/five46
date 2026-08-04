@@ -1,5 +1,5 @@
 import type { LlmProvider } from '../llm/types'
-import { launchAgentBrowser, snapshot, executeAction } from './browser'
+import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders } from './browser'
 import type { LoginCredentials, StorageState } from './browser'
 import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, resolvePlannedTarget } from './planner'
 import type { AgentAction, AgentPlan, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
@@ -23,13 +23,6 @@ export interface RunAgentOptions {
    * `browser.ts`'s `substitutePlaceholders`) — never logged, never recorded
    * into `history`/`steps`/`TestRun`. */
   credentials?: LoginCredentials
-  /** Forces the same unverified-success gating `requiresConfirmation(goal)`
-   * would trigger, regardless of the goal's exact wording — used by
-   * `five46 login`, where an unverified false success is worse than the
-   * original bug this gating was built for: it produces a *reusable*
-   * session file that would silently mislead every future `test
-   * --storage-state` run, not just this one. */
-  forceConfirmation?: boolean
   /** Invoked once, only on an accepted `goal-reached` outcome, before the
    * browser closes — given the real `BrowserContext` and the storageState
    * captured immediately after the initial navigation (before any actions),
@@ -130,26 +123,34 @@ function actionSignature(action: AgentAction): string {
  * verdict about the app, matching how a real test's assertions (not its
  * incidental navigation steps) are what a test is actually for.
  *
- * When `requiresConfirmation(goal)` is true, a `done`/`goal-reached` claim
- * is rejected (fed back into history, loop continues) unless at least one
- * `assert_visible`/`assert_text` has already succeeded — found via a real,
- * live run (a Shopify demo store, "...then confirm the cart shows an
- * item"): the model added a real item to the cart, then declared
- * goal-reached without ever calling an assertion. The end state happened to
- * be correct, but nothing in the run actually verified it, despite the
- * goal explicitly asking for verification — the same "don't accept an
- * unverified confident claim" posture as everywhere else in this project,
- * applied to the model's own self-reported success. */
+ * A `done`/`goal-reached` claim is always rejected (fed back into history,
+ * loop continues) unless at least one `assert_visible`/`assert_text`/
+ * `assert_page_text` has already succeeded — found via a real, live run (a
+ * Shopify demo store, "...then confirm the cart shows an item"): the model
+ * added a real item to the cart, then declared goal-reached without ever
+ * calling an assertion. The end state happened to be correct, but nothing
+ * in the run actually verified it, despite the goal explicitly asking for
+ * verification — the same "don't accept an unverified confident claim"
+ * posture as everywhere else in this project, applied to the model's own
+ * self-reported success.
+ *
+ * The required count is `Math.max(1, countConfirmationClauses(goal))` —
+ * an unconditional floor of 1, not just when the goal's own wording asks
+ * for it. Originally this only applied when `requiresConfirmation(goal)`
+ * matched confirm/verify/ensure/etc. language in the goal text; found via
+ * live testing against real production sites (Flipkart, Amazon.in) that a
+ * goal phrased as plain procedure ("add to cart, then open login," no
+ * confirm/verify wording at all) got a false `goal-reached` claim after a
+ * single incidental click (closing an unrelated popup), since the old
+ * clause-count-only threshold computed 0 for it — zero forced
+ * verification, by design, for exactly the kind of natural task
+ * description a real user is likely to write. `countConfirmationClauses`
+ * still raises the floor above 1 when the goal explicitly asks for more
+ * than one check — this only changed the *minimum*, never the ceiling. */
 export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
   const runId = makeRunId()
   const maxSteps = Math.min(options.maxSteps ?? DEFAULT_MAX_STEPS, HARD_MAX_STEPS)
-  // forceConfirmation (five46 login only) needs the floor of 1: a login
-  // goal's own text may contain zero confirm-language, yet a real
-  // assertion must still be unconditionally required — deriving the
-  // threshold purely from clause-count would silently compute 0 here and
-  // defeat the whole point of forceConfirmation.
-  const requiredConfirmationCount = options.forceConfirmation ? Math.max(1, countConfirmationClauses(options.goal)) : countConfirmationClauses(options.goal)
-  const needsConfirmation = requiredConfirmationCount > 0
+  const requiredConfirmationCount = Math.max(1, countConfirmationClauses(options.goal))
   const credentialsAvailable = options.credentials
     ? { username: Boolean(options.credentials.username), password: Boolean(options.credentials.password) }
     : undefined
@@ -183,6 +184,17 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
   try {
     await browser.page.goto(options.url)
     const baselineState = await browser.context.storageState()
+    // Captured once, before any action ever runs — the mechanical basis
+    // for the assert_page_text tautology guard below (see its own doc
+    // comment). Best-effort: an unreadable/not-yet-settled body at this
+    // exact moment degrades to an empty baseline, not a thrown error —
+    // the guard simply can't flag anything against an empty baseline,
+    // which is the same "fail open, never fail the whole run" posture
+    // every other best-effort capture in this codebase already uses.
+    const baselineBodyText = await browser.page
+      .locator('body')
+      .innerText()
+      .catch(() => '')
 
     // One extra, independent LLM call — the same second-`complete()`-call
     // pattern `rootCause.ts` already uses, not a change to `LlmProvider`
@@ -288,16 +300,20 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         outline = { elements: [], truncated: false, totalFound: 0 }
         fastPathedSteps++
       } else if (plannedStep && (plannedStep.action === 'click' || plannedStep.action === 'fill' || plannedStep.action === 'assert_visible' || plannedStep.action === 'assert_text')) {
-        // assert_visible/assert_text never fast-path, full stop — matches
-        // self-healing's own explicit, permanent exclusion of assertions
-        // exactly, for the identical reason: those are the run's actual
-        // verdict, and a structurally-matched-but-wrong target could
-        // convert a genuine app regression into a false pass. Only
-        // click/fill are attempted below. A planned `assert_page_text` step
-        // isn't listed in either branch condition above, so it falls
-        // through to the live decision below by construction — the same
-        // permanent exclusion, for the same reason.
-        if (plannedStep.action === 'click' || plannedStep.action === 'fill') {
+        // assert_text never fast-paths, full stop — predicting an exact
+        // expected *text value* for a page the plan never actually saw is a
+        // categorically bigger risk than predicting an element's role+name:
+        // a wrong prediction here can silently produce a false pass or a
+        // false assertion-failed, not just "picked a plausible element."
+        // assert_visible carries only the resolution-ambiguity risk
+        // click/fill fast-pathing already accepts (see below) — no expected
+        // *value* to get wrong, only "does this resolved element genuinely
+        // exist and is it visible," which the real execution path still
+        // checks for real. A planned `assert_page_text` step isn't listed in
+        // either branch condition above, so it falls through to the live
+        // decision below by construction — same reasoning as assert_text,
+        // since it also requires predicting an exact expected substring.
+        if (plannedStep.action === 'click' || plannedStep.action === 'fill' || plannedStep.action === 'assert_visible') {
           // prioritizeViewport: false — matches self-healing's own
           // re-match call, not the live loop's per-turn one just below.
           // Both this fast path and self-healing are "resolve-and-refuse-
@@ -333,7 +349,9 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
             action =
               plannedStep.action === 'click'
                 ? { action: 'click', ref: candidate.ref, reason: plannedStep.reason }
-                : { action: 'fill', ref: candidate.ref, value: plannedStep.value, submit: plannedStep.submit, reason: plannedStep.reason }
+                : plannedStep.action === 'fill'
+                  ? { action: 'fill', ref: candidate.ref, value: plannedStep.value, submit: plannedStep.submit, reason: plannedStep.reason }
+                  : { action: 'assert_visible', ref: candidate.ref, reason: plannedStep.reason }
             outline = freshOutline
             fastPathedSteps++
           }
@@ -344,9 +362,10 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
 
       if (!action || !outline) {
         // Reached when there's no plan, the plan is exhausted, this step
-        // was an assertion (always live), or a click/fill target didn't
-        // resolve to exactly one candidate — the exact, unmodified live
-        // flow that exists regardless of `useStructuredPlan`.
+        // was an assert_text/assert_page_text (always live), or a
+        // click/fill/assert_visible target didn't resolve to exactly one
+        // candidate — the exact, unmodified live flow that exists
+        // regardless of `useStructuredPlan`.
         //
         // prioritizeViewport: true here (and only here) — self-healing's
         // own re-snapshot call in browser.ts deliberately leaves this off.
@@ -429,7 +448,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
 
       if (action.action === 'done') {
         lastActionMadeProgress = false
-        const unverifiedSuccess = action.outcome === 'goal-reached' && needsConfirmation && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
+        const unverifiedSuccess = action.outcome === 'goal-reached' && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
         if (unverifiedSuccess) {
           history.push({
             action,
@@ -476,6 +495,24 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         (action.action === 'click' || action.action === 'fill') && result.ok
           ? outline.elements.find((el) => el.ref === action.ref)
           : undefined
+      // assert_page_text against text that was ALREADY present before any
+      // actions ran proves nothing — found via a real, live run (Flipkart,
+      // reproduced twice): the model satisfied the confirmation requirement
+      // by asserting a persistent header link ("Login") true on every page
+      // regardless of state, then never completed the rest of the goal.
+      // Prompt guidance alone (buildActionPrompt's assertionQualityNote)
+      // was live-retested and did NOT change this — same "wording alone
+      // doesn't reliably work" lesson as parsePlan's immediate-done
+      // rejection — so this closes the gap mechanically instead. Scoped to
+      // assert_page_text only (the exact reproduced vector): assert_visible/
+      // assert_text are ref-based and already covered by the narrower
+      // `recentlyInteracted` tautology guard at parse time. Still recorded
+      // as a real, correctly-executed `ok: true` step below — the check
+      // genuinely passed, and the generated spec should faithfully replay
+      // it — only withheld from the confirmation-gate credit.
+      const isTautologicalPageText =
+        action.action === 'assert_page_text' && result.ok && baselineBodyText.includes(substitutePlaceholders(action.expectedText, options.credentials))
+
       steps.push({
         step: stepNumber,
         action,
@@ -497,11 +534,17 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         // value here would leak to the third-party LLM provider on every
         // future turn, the same class of concern already disclosed for API
         // response bodies.
-        detail: result.ok ? (result.healed ? 'succeeded after healing a stale selector' : '') : (result.failureDetail ?? 'failed'),
+        detail: isTautologicalPageText
+          ? 'succeeded, but this exact text was already present before any actions ran this run — does not count as confirmation of anything'
+          : result.ok
+            ? result.healed
+              ? 'succeeded after healing a stale selector'
+              : ''
+            : (result.failureDetail ?? 'failed'),
       })
 
       const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text'
-      if (isAssertion && result.ok) {
+      if (isAssertion && result.ok && !isTautologicalPageText) {
         hasSucceededAssertion = true
         succeededAssertionCount++
       }

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { serializeOutline, buildActionPrompt, parseAgentAction, requiresConfirmation, countConfirmationClauses, isDestructiveClickTarget, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
+import { serializeOutline, buildActionPrompt, parseAgentAction, countConfirmationClauses, isDestructiveClickTarget, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
 import { USERNAME_PLACEHOLDER } from './browser'
 import type { PageOutline } from './types'
 import { PLAN_MAX_OUTPUT_TOKENS, HARD_MAX_STEPS } from './runLoop'
@@ -73,7 +73,7 @@ test('buildActionPrompt tells the model to declare goal-unreachable honestly ins
   // Regression test: found via real live testing that the model would pick
   // the nearest plausible element (e.g. an unrelated footer link) and
   // assert against it instead of admitting the real target wasn't present
-  // — this instruction is unconditional (unlike confirmationNote/
+  // — this instruction is unconditional (like confirmationNote, unlike
   // deleteNote), so it must appear regardless of goal phrasing.
   const withConfirmation = buildActionPrompt('reveal the secret and confirm it is visible', [], OUTLINE)
   const withoutConfirmation = buildActionPrompt('reveal the secret message', [], OUTLINE)
@@ -254,22 +254,6 @@ test('buildActionPrompt discloses the delete-gating up front when allowDeletes i
   assert.ok(defaulted.includes('--allow-deletes'))
 })
 
-test('requiresConfirmation recognizes confirm/verify/ensure/check-that/make-sure language', () => {
-  // Regression test for a real, live finding: a goal phrased "...then
-  // confirm the cart shows an item" let the model declare goal-reached
-  // without ever asserting anything.
-  assert.equal(requiresConfirmation('reveal the secret message and confirm it becomes visible'), true)
-  assert.equal(requiresConfirmation('add an item and verify the cart total updates'), true)
-  assert.equal(requiresConfirmation('log in and ensure the dashboard loads'), true)
-  assert.equal(requiresConfirmation('check that the error message appears'), true)
-  assert.equal(requiresConfirmation('submit the form and make sure it succeeds'), true)
-})
-
-test('requiresConfirmation does not flag a goal with no verification language', () => {
-  assert.equal(requiresConfirmation('add a product to the cart'), false)
-  assert.equal(requiresConfirmation('log in as a test user'), false)
-})
-
 test('countConfirmationClauses counts occurrences, not just presence, of confirm/verify/etc. language', () => {
   // Real, live-found gap this enables the fix for: a compound goal with
   // two confirm-clauses ("...confirm the price is shown, then click Next,
@@ -285,13 +269,35 @@ test('countConfirmationClauses counts occurrences, not just presence, of confirm
   assert.equal(countConfirmationClauses('confirm X, verify Y, and ensure Z'), 3)
 })
 
-test('buildActionPrompt tells the model upfront when a goal requires verification, not just after rejecting it', () => {
-  const prompt = buildActionPrompt('reveal the secret and confirm it is visible', [], OUTLINE)
-  assert.ok(prompt.includes('must perform at least one'))
-  assert.ok(prompt.includes('assert_visible, assert_text, or assert_page_text'))
+test('buildActionPrompt always discloses the assertion requirement upfront, not just after rejecting a done claim — unconditionally, regardless of the goal\'s own wording', () => {
+  // Found via live testing against real production sites (Flipkart,
+  // Amazon.in): a goal with zero confirm/verify language used to get zero
+  // forced verification at all, since this note (and the enforcement in
+  // runner.ts/apiRunner.ts) only used to fire when requiresConfirmation()
+  // matched. Now unconditional — see countConfirmationClauses' own doc
+  // comment and DEVELOPMENT.md's "Known limitations" section.
+  const withConfirmWording = buildActionPrompt('reveal the secret and confirm it is visible', [], OUTLINE)
+  assert.ok(withConfirmWording.includes('at least 1 successful'))
+  assert.ok(withConfirmWording.includes('assert_visible, assert_text, or assert_page_text'))
 
-  const plainPrompt = buildActionPrompt('reveal the secret', [], OUTLINE)
-  assert.ok(!plainPrompt.includes('must perform at least one'))
+  const plainGoal = buildActionPrompt('reveal the secret', [], OUTLINE)
+  assert.ok(plainGoal.includes('at least 1 successful'), 'the note must still appear even when the goal has no confirm/verify wording at all')
+
+  const twoConfirmClauses = buildActionPrompt('confirm the price is shown, then click Next, and confirm the calendar changed', [], OUTLINE)
+  assert.ok(twoConfirmClauses.includes('at least 2 successful'), 'a compound goal with two confirm-clauses must require 2, not just 1')
+})
+
+test('buildActionPrompt warns against asserting a persistent/ambient element that would be true regardless of whether the actions worked', () => {
+  // Found via live testing against a real production site (Flipkart): the
+  // model satisfied the confirmation requirement above by asserting a
+  // site-wide header link ("Login") that's visible on every page
+  // regardless of state, proving nothing, then never completed the rest
+  // of the goal. Guidance only — nothing mechanically rejects this the way
+  // the confirmation-count check does, since "was this meaningful" is a
+  // real semantic judgment.
+  const prompt = buildActionPrompt('reveal the secret message', [], OUTLINE)
+  assert.ok(prompt.includes('persistent/ambient element'))
+  assert.ok(prompt.includes('specifically changed, newly appeared, or only exists because of the actions you just took'))
 })
 
 test('buildActionPrompt tells the model about the placeholder tokens only when credentials are actually configured', () => {
