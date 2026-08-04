@@ -420,6 +420,16 @@ for a `story` call) alongside the existing free-text report, so a calling
 coding agent can branch on a real field instead of parsing prose out of the
 report to decide whether to rework or move on.
 
+## Known limitations
+
+- **No iframe or shadow DOM traversal** — elements inside an `<iframe>` or
+  a closed/open shadow root aren't visible to the agent's page snapshot
+  today. Works fine on pages that don't rely on either.
+- **Chromium only** for browser mode — no Firefox/WebKit yet.
+- A run itself is not deterministic (the same goal against the same page
+  can take a different path next time) — the generated spec is the frozen,
+  repeatable artifact; see "Quick start" above.
+
 ## Development
 
 ```bash
