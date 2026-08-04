@@ -18,6 +18,24 @@ function selectorFor(step: ExecutedStep): string | undefined {
   return step.outline.elements.find((el) => el.ref === action.ref)?.selector
 }
 
+/** The Playwright locator expression a generated step should use — prefers
+ * `page.getByRole(role, { name })` when `browser.ts`'s `verifyRoleLocator()`
+ * confirmed live, during the actual run, that it resolves uniquely to the
+ * exact element this step acted on (see `ExecutedStep.verifiedRoleLocator`'s
+ * own doc comment for the full reasoning); falls back to the raw, always-
+ * correct `page.locator(selector)` otherwise — the exact, unchanged
+ * behavior from before this feature. A `getByRole` locator is far more
+ * resilient to future DOM restructuring than a positional CSS path, since
+ * the whole point of a generated spec is to be re-run standalone, for a
+ * long time, with no five46 involved. */
+function locatorExprFor(step: ExecutedStep, selector: string): string {
+  if (step.verifiedRoleLocator) {
+    const { role, name } = step.verifiedRoleLocator
+    return `page.getByRole(${JSON.stringify(role)}, { name: ${JSON.stringify(name)} })`
+  }
+  return `page.locator(${JSON.stringify(selector)})`
+}
+
 // `%` has no special meaning in a regex, so the placeholder tokens
 // (`%%USERNAME%%`/`%%PASSWORD%%`) need no escaping to be used literally here.
 const PLACEHOLDER_SPLIT_PATTERN = new RegExp(`(${USERNAME_PLACEHOLDER}|${PASSWORD_PLACEHOLDER})`, 'g')
@@ -76,20 +94,20 @@ function renderStep(step: ExecutedStep): string | undefined {
   const selector = selectorFor(step)
   if (!selector) return undefined
   const action = step.action as Exclude<AgentAction, { action: 'done' | 'scroll' | 'wait' | 'assert_page_text' }>
-  const sel = JSON.stringify(selector)
+  const locatorExpr = locatorExprFor(step, selector)
 
   switch (action.action) {
     case 'click':
-      return `  await page.locator(${sel}).click()`
+      return `  await ${locatorExpr}.click()`
     case 'fill': {
-      const lines = [`  await page.locator(${sel}).fill(${renderCredentialAwareExpression(action.value)})`]
-      if (action.submit) lines.push(`  await page.locator(${sel}).press('Enter')`)
+      const lines = [`  await ${locatorExpr}.fill(${renderCredentialAwareExpression(action.value)})`]
+      if (action.submit) lines.push(`  await ${locatorExpr}.press('Enter')`)
       return lines.join('\n')
     }
     case 'assert_visible':
-      return `  await expect(page.locator(${sel})).toBeVisible()`
+      return `  await expect(${locatorExpr}).toBeVisible()`
     case 'assert_text':
-      return `  await expect(page.locator(${sel})).toContainText(${renderCredentialAwareExpression(action.expectedText)})`
+      return `  await expect(${locatorExpr}).toContainText(${renderCredentialAwareExpression(action.expectedText)})`
   }
 }
 

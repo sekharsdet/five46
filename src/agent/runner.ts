@@ -524,6 +524,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         visibleTextPath: result.visibleTextPath,
         healed: result.healed,
         resolvedSelector: result.healedSelector,
+        verifiedRoleLocator: result.verifiedRoleLocator,
       })
       history.push({
         action,
@@ -568,10 +569,27 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
 
     return done({ runId, url: options.url, goal: options.goal, steps, outcome: 'stopped-by-cap' })
   } finally {
-    const { videoPath } = await browser.close()
-    // `result` is `undefined` only if something above threw rather than
-    // returning normally — in that case there's no TestRun to attach a
-    // video path to, and this is skipped entirely (no new failure mode).
-    if (result && videoPath) result.videoPath = videoPath
+    // A teardown failure (`context.close()`/`browser.close()` throwing
+    // inside `AgentBrowser.close()` — a real, if uncommon, possibility: a
+    // crashed browser process, an OS-level resource issue) must never
+    // overwrite the `result` already computed above. An exception thrown
+    // inside a `finally` block silently *replaces* whatever the `try` was
+    // about to return — found via a deliberate review of this exact risk
+    // (an untested edge case, not a live incident), the same class of bug
+    // the story-mode batch-robustness fix closed elsewhere: a run that
+    // genuinely reached `goal-reached` could have that entire, hard-won
+    // result discarded and replaced with an uncaught exception, purely
+    // because browser teardown — completely unrelated to whether the
+    // actual goal was achieved — happened to fail. Best-effort here, same
+    // posture as `video.path()`'s own try/catch inside `close()` itself.
+    try {
+      const { videoPath } = await browser.close()
+      // `result` is `undefined` only if something above threw rather than
+      // returning normally — in that case there's no TestRun to attach a
+      // video path to, and this is skipped entirely (no new failure mode).
+      if (result && videoPath) result.videoPath = videoPath
+    } catch {
+      // Teardown failing must never mask the real run outcome above.
+    }
   }
 }

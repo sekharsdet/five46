@@ -721,6 +721,112 @@ test('executeAction never heals an assert_visible/assert_text, even when an unam
   }
 })
 
+test('executeAction records a live-verified getByRole locator when it resolves uniquely to the real target element', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    const revealRef = outline.elements.find((el) => el.name.includes('Show secret message'))!.ref
+
+    const result = await executeAction(
+      browser.page,
+      { action: 'click', ref: revealRef, reason: 'test' },
+      outline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      1
+    )
+    assert.equal(result.ok, true)
+    assert.deepEqual(result.verifiedRoleLocator, { role: 'button', name: 'Show secret message' })
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+test('executeAction does not record a verified getByRole locator when two elements share the same role and name', async (t) => {
+  // A real, live risk this guards against: `getByRole` would resolve
+  // ambiguously (matching both), so preferring it in the generated spec
+  // would produce a broken, strict-mode-violating standalone test —
+  // falling back to the raw, always-unique positional selector instead.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<button id="a">Delete</button><button id="b">Delete</button>`)
+    const outline = await snapshot(browser.page)
+    const ref = outline.elements.find((el) => el.selector.includes('"a"'))!.ref
+
+    const result = await executeAction(
+      browser.page,
+      { action: 'click', ref, reason: 'test' },
+      outline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      1
+    )
+    assert.equal(result.ok, true)
+    assert.equal(result.verifiedRoleLocator, undefined)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('executeAction still records a verified getByRole locator when the accessible name was truncated to 80 chars, via substring (not exact) matching', async (t) => {
+  // `accessibleName()` truncates textContent to 80 chars — an exact-match
+  // getByRole call against that truncated name would never resolve against
+  // the real, untruncated element, silently defeating the feature on
+  // exactly the long product-title links it exists for on real sites.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    const longText = 'A'.repeat(120)
+    await browser.page.setContent(`<a href="#" id="long-link">${longText}</a>`)
+    const outline = await snapshot(browser.page)
+    const ref = outline.elements[0].ref
+    assert.equal(outline.elements[0].name.length, 80, 'test setup: the outline name must actually be the truncated 80-char version')
+
+    const result = await executeAction(
+      browser.page,
+      { action: 'click', ref, reason: 'test' },
+      outline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      1
+    )
+    assert.equal(result.ok, true)
+    assert.ok(result.verifiedRoleLocator, 'must still verify via substring match against the truncated name')
+    assert.equal(result.verifiedRoleLocator!.role, 'link')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('executeAction re-verifies against the healed candidate, not the original stale element, after healing a stale selector', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<div id="container"><button id="original-btn" onclick="window.__clickedId=this.id">Delete</button></div>`)
+    const outline = await snapshot(browser.page)
+    const ref = outline.elements.find((el) => el.name === 'Delete')!.ref
+
+    await browser.page.evaluate(
+      `document.getElementById('original-btn').outerHTML = '<button id="rerendered-btn" onclick="window.__clickedId=this.id">Delete</button>'`
+    )
+
+    const result = await executeAction(
+      browser.page,
+      { action: 'click', ref, reason: 'test' },
+      outline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      1
+    )
+    assert.equal(result.ok, true)
+    assert.equal(result.healed, true)
+    assert.deepEqual(result.verifiedRoleLocator, { role: 'button', name: 'Delete' })
+  } finally {
+    await browser.close()
+  }
+})
+
 test('substitutePlaceholders replaces the exact tokens with real values, without mutating anything', () => {
   const original = `user: ${USERNAME_PLACEHOLDER}, pass: ${PASSWORD_PLACEHOLDER}`
   const result = substitutePlaceholders(original, { username: 'ada', password: 'hunter2' })

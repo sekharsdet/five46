@@ -11,6 +11,15 @@ import { launchAgentBrowser } from '../agent/browser'
 import { startFixtureServer } from '../agent/testServer'
 import type { LlmProvider } from '../llm/types'
 import { HARD_MAX_CONCURRENCY } from '../agent/runLoop'
+import type { StructuredToolOutput } from './tools'
+
+// The MCP client SDK's own `CallToolResult` type declares `structuredContent`
+// generically (it has no way to know this server's specific per-tool output
+// shape) — this narrows it back to the real shape `tools.ts` actually
+// returns, for test assertions only.
+function structured(result: unknown): StructuredToolOutput | undefined {
+  return (result as { structuredContent?: StructuredToolOutput }).structuredContent
+}
 
 /** Real protocol-level tests: a real `Client` talking to a real
  * `McpServer` over `InMemoryTransport.createLinkedPair()` — real tool
@@ -79,6 +88,38 @@ test('five46_api tool call returns a real, redacted report and writes a real gen
       const text = (result.content as { type: string; text: string }[])[0].text
       assert.match(text, /succeeded: goal reached/)
       assert.match(text, /Wrote \d+ confirmed-working step\(s\) to/)
+      // structuredContent is strictly validated by the MCP SDK itself
+      // against the tool's outputSchema on every non-error result — reaching
+      // this line at all is already real evidence the shape is valid; these
+      // assertions confirm its actual *content* is correct too.
+      assert.equal(structured(result)?.passed, true)
+      assert.equal(structured(result)?.outcome, 'goal-reached')
+      assert.equal(typeof structured(result)?.specPath, 'string')
+      assert.equal(structured(result)?.acceptanceCriteria, undefined, 'a plain goal call must never carry acceptanceCriteria')
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool call returns structuredContent reflecting a real failure, on a real assertion-failed outcome', async () => {
+  const server = await startApiTestServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const provider = scriptedProvider([
+      JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' }),
+      JSON.stringify({ action: 'assert_status', expected: 999, reason: 'deliberately wrong' }),
+    ])
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, goal: 'confirm the items endpoint returns 999' } })
+      assert.equal(result.isError, true)
+      assert.equal(structured(result)?.passed, false)
+      assert.equal(structured(result)?.outcome, 'assertion-failed')
+      assert.equal(typeof structured(result)?.specPath, 'string', 'a partial spec is still written and its path still reported, even on failure')
     } finally {
       await close()
     }
@@ -599,6 +640,20 @@ test('five46_api tool with story splits a raw story into independent goals and a
       assert.match(text, /2\/2 acceptance criteria reached goal-reached/)
       assert.match(text, /AC1: PASS/)
       assert.match(text, /AC2: PASS/)
+      // structuredContent — same strict-SDK-validation reasoning as the
+      // plain-goal test above, for the story shape specifically.
+      assert.equal(structured(result)?.passed, true)
+      assert.equal(structured(result)?.outcome, undefined, 'a story call must never carry a single top-level outcome')
+      const acs = structured(result)?.acceptanceCriteria as { index: number; goal: string; outcome: string; passed: boolean; specPath?: string }[]
+      assert.equal(acs.length, 2)
+      assert.deepEqual(
+        acs.map((ac) => [ac.index, ac.passed, ac.outcome]),
+        [
+          [1, true, 'goal-reached'],
+          [2, true, 'goal-reached'],
+        ]
+      )
+      assert.ok(acs.every((ac) => typeof ac.specPath === 'string'))
     } finally {
       await close()
     }
@@ -638,6 +693,18 @@ test('five46_api tool with story reports a mixed pass/fail per-AC breakdown, isE
       assert.match(text, /1\/2 acceptance criteria reached goal-reached/)
       assert.match(text, /AC1: PASS/)
       assert.match(text, /AC2: FAIL \(goal-unreachable\)/)
+      // The SDK does not require/validate structuredContent on an isError
+      // result, but this tool still returns it voluntarily — confirm the
+      // aggregate and per-AC detail are both correct even on a mixed batch.
+      assert.equal(structured(result)?.passed, false)
+      const acs = structured(result)?.acceptanceCriteria as { index: number; goal: string; outcome: string; passed: boolean }[]
+      assert.deepEqual(
+        acs.map((ac) => [ac.index, ac.passed, ac.outcome]),
+        [
+          [1, true, 'goal-reached'],
+          [2, false, 'goal-unreachable'],
+        ]
+      )
     } finally {
       await close()
     }

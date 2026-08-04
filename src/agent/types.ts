@@ -175,6 +175,16 @@ export interface ExecutedStep {
    * the printed report can key off intent rather than an implementation
    * detail of which field happens to be populated. */
   healed?: boolean
+  /** Present only when `browser.ts`'s `verifyRoleLocator()` confirmed,
+   * live, that `page.getByRole(role, { name })` resolves uniquely to the
+   * exact same element this step actually acted on — mirrors
+   * `StepExecutionResult.verifiedRoleLocator` (`browser.ts`) exactly.
+   * `generateSpec.ts` prefers this over the raw `selector`/
+   * `resolvedSelector` above when present, since a `getByRole` locator is
+   * far more resilient to future DOM restructuring than a positional CSS
+   * path — never used for anything during the live run itself, which
+   * always already used the guaranteed-correct selector regardless. */
+  verifiedRoleLocator?: { role: string; name: string }
 }
 
 /** The full record of one `runAgent()` call — the single source of truth

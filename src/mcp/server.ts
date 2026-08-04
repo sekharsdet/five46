@@ -1,5 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { testToolInputSchema, apiToolInputSchema } from './schemas'
+import { testToolInputSchema, apiToolInputSchema, testToolOutputSchema, apiToolOutputSchema } from './schemas'
 import { runTestTool, runApiTool } from './tools'
 import type { McpToolContext } from './tools'
 import type { LlmProvider } from '../llm/types'
@@ -56,6 +56,7 @@ export function createFive46McpServer(options?: {
         'On a real assertion failure (a genuine finding about the app, not a tooling issue), one additional LLM call analyzes the failure for a root-cause hypothesis — built only from information already visible to the agent during the run (never a new disclosure), always on for this tool, and included in the returned report as a hypothesis, not a confirmed diagnosis.',
       ].join(' '),
       inputSchema: testToolInputSchema,
+      outputSchema: testToolOutputSchema,
     },
     async (params) => runTestTool(params, context)
   )
@@ -73,6 +74,7 @@ export function createFive46McpServer(options?: {
         'On a real assertion failure, one additional LLM call analyzes the failure for a root-cause hypothesis — built only from information already visible to the agent during the run, always on for this tool, and included in the returned report as a hypothesis, not a confirmed diagnosis.',
       ].join(' '),
       inputSchema: apiToolInputSchema,
+      outputSchema: apiToolOutputSchema,
     },
     async (params) => runApiTool(params, context)
   )

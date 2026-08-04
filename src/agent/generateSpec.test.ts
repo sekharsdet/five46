@@ -191,3 +191,56 @@ test('generateAgentSpec uses a healed step\'s resolvedSelector, never the stale 
   assert.ok(spec.includes('page.locator("[id=\\"rerendered-btn\\"]").click()'), spec)
   assert.ok(!spec.includes('original-btn'), 'must never bake in the selector already known to be stale')
 })
+
+test('generateAgentSpec prefers a live-verified getByRole locator over the raw selector, for click/fill/assert_visible/assert_text alike', () => {
+  const steps: ExecutedStep[] = [
+    {
+      step: 1,
+      action: { action: 'click', ref: 'e1', reason: 'open the menu' },
+      outline: outlineWith('e1', 'body > div:nth-of-type(3) > a:nth-of-type(2)'),
+      ok: true,
+      verifiedRoleLocator: { role: 'link', name: 'Show secret message' },
+    },
+    {
+      step: 2,
+      action: { action: 'assert_visible', ref: 'e2', reason: 'confirm revealed' },
+      outline: outlineWith('e2', 'body > p:nth-of-type(4)'),
+      ok: true,
+      verifiedRoleLocator: { role: 'status', name: 'agentic testing works' },
+    },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('page.getByRole("link", { name: "Show secret message" }).click()'), spec)
+  assert.ok(spec.includes('expect(page.getByRole("status", { name: "agentic testing works" })).toBeVisible()'), spec)
+  assert.ok(!spec.includes('nth-of-type'), 'must never fall back to the raw positional selector once verified')
+})
+
+test('generateAgentSpec falls back to the raw selector, completely unchanged, when a step has no verifiedRoleLocator', () => {
+  // The exact production case this feature exists for: a real, unlabeled
+  // production site where no meaningful role/name round-trip is possible —
+  // must degrade to today's existing, always-correct behavior, never break.
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'click', ref: 'e1', reason: 'click it' }, outline: outlineWith('e1', 'body > div:nth-of-type(1) > a:nth-of-type(1)'), ok: true },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('page.locator("body > div:nth-of-type(1) > a:nth-of-type(1)").click()'), spec)
+  assert.ok(!spec.includes('getByRole'))
+})
+
+test('generateAgentSpec prefers getByRole for a fill action too, on both the fill and the submit press', () => {
+  const steps: ExecutedStep[] = [
+    {
+      step: 1,
+      action: { action: 'fill', ref: 'e1', value: 'hello', submit: true, reason: 'search' },
+      outline: outlineWith('e1', 'body > div:nth-of-type(1) > input:nth-of-type(1)'),
+      ok: true,
+      verifiedRoleLocator: { role: 'textbox', name: 'Search' },
+    },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('page.getByRole("textbox", { name: "Search" }).fill("hello")'), spec)
+  assert.ok(spec.includes('page.getByRole("textbox", { name: "Search" }).press(\'Enter\')'), spec)
+})

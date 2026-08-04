@@ -54,21 +54,43 @@ export interface McpToolContext {
   apiKey?: string
 }
 
+/** Mirrors `schemas.ts`'s `toolOutputSchema` exactly — the MCP SDK
+ * (`@modelcontextprotocol/sdk@^1.30.0`) strictly validates a non-error
+ * result's `structuredContent` against that Zod shape, so this TS type and
+ * that schema must never drift apart. */
+export interface StructuredToolOutput {
+  passed: boolean
+  outcome?: string
+  specPath?: string
+  acceptanceCriteria?: { index: number; goal: string; outcome: string; passed: boolean; specPath?: string }[]
+  // Matches the MCP SDK's own expected shape for `structuredContent`
+  // (a plain JSON object, index-signature-compatible) — same reasoning as
+  // `McpToolResult`'s identical escape hatch just above.
+  [key: string]: unknown
+}
+
 export interface McpToolResult {
   content: { type: 'text'; text: string }[]
   isError?: boolean
+  /** Additive, machine-parseable parallel channel alongside `content`'s
+   * free text — see `StructuredToolOutput`'s own doc comment. Omitted
+   * entirely on an early validation error (a missing goal/story, a bad
+   * baseUrl, ...) — nothing ever ran, so there's honestly nothing
+   * structural to report; the MCP SDK only requires it on a non-error
+   * result anyway. */
+  structuredContent?: StructuredToolOutput
   // Matches the MCP SDK's own CallToolResult shape, which allows arbitrary
   // extra fields per the JSON-RPC spec's extensibility — required for this
   // type to satisfy registerTool's handler return type structurally.
   [key: string]: unknown
 }
 
-function textResult(text: string): McpToolResult {
-  return { content: [{ type: 'text', text }] }
+function textResult(text: string, structuredContent?: StructuredToolOutput): McpToolResult {
+  return { content: [{ type: 'text', text }], ...(structuredContent ? { structuredContent } : {}) }
 }
 
-function errorResult(text: string): McpToolResult {
-  return { content: [{ type: 'text', text }], isError: true }
+function errorResult(text: string, structuredContent?: StructuredToolOutput): McpToolResult {
+  return { content: [{ type: 'text', text }], isError: true, ...(structuredContent ? { structuredContent } : {}) }
 }
 
 export interface TestToolParams {
@@ -141,7 +163,7 @@ async function runOneTestScenario(
   allowDeletes: boolean,
   projectRoot: string,
   artifactSuffix: string
-): Promise<{ outcome: string; text: string }> {
+): Promise<{ outcome: string; text: string; specPath?: string }> {
   const artifactDir = join(projectRoot, `five46-mcp-agent-${artifactSuffix}`)
   const destructiveClicks: string[] = []
   let run
@@ -175,7 +197,7 @@ async function runOneTestScenario(
     const outPath = join(projectRoot, `five46-agent-${run.runId}.spec.ts`)
     writeFileSync(outPath, redactSecrets(generateAgentSpec(run), [llmApiKey]), 'utf8')
 
-    return { outcome: run.outcome, text: `${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}` }
+    return { outcome: run.outcome, text: `${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`, specPath: outPath }
   } catch (err) {
     return {
       outcome: 'tooling-error',
@@ -252,25 +274,41 @@ export async function runTestTool(params: TestToolParams, context: McpToolContex
 
       let allPassed = true
       let passedCount = 0
+      const acceptanceCriteria: StructuredToolOutput['acceptanceCriteria'] = []
       const lines = outcomes.map(({ goal, result }, i) => {
         const passed = result.outcome === 'goal-reached'
         if (passed) passedCount++
         else allPassed = false
+        acceptanceCriteria!.push({ index: i + 1, goal, outcome: result.outcome, passed, specPath: result.specPath })
         const header = `AC${i + 1}: ${passed ? 'PASS' : `FAIL (${result.outcome})`} — ${goal}`
         return passed ? header : `${header}\n${result.text}`
       })
       const finalText = `${clampNote}Split into ${goals.length} scenario(s). ${passedCount}/${goals.length} acceptance criteria reached goal-reached.\n\n${lines.join('\n\n')}`
-      return allPassed ? textResult(finalText) : errorResult(finalText)
+      const structuredContent: StructuredToolOutput = { passed: allPassed, acceptanceCriteria }
+      return allPassed ? textResult(finalText, structuredContent) : errorResult(finalText, structuredContent)
     }
 
     const runId = Date.now().toString(36)
-    const { outcome, text } = await runOneTestScenario(params.url, params.goal!, params.maxSteps, params.headed, storageState, provider, llmApiKey, context.allowDeletes, context.projectRoot, runId)
+    const { outcome, text, specPath } = await runOneTestScenario(
+      params.url,
+      params.goal!,
+      params.maxSteps,
+      params.headed,
+      storageState,
+      provider,
+      llmApiKey,
+      context.allowDeletes,
+      context.projectRoot,
+      runId
+    )
     // isError mirrors the CLI's CI-gating exit-code rule exactly (see
     // DEVELOPMENT.md's "CI gating: exit codes" section): the calling IDE
     // AI is exactly the kind of automated consumer that feature was built
     // for, and needs the same one clear signal a human reading exit codes
     // gets — not just report text it has to parse to learn the run failed.
-    return outcome === 'goal-reached' ? textResult(text) : errorResult(text)
+    const passed = outcome === 'goal-reached'
+    const structuredContent: StructuredToolOutput = { passed, outcome, specPath }
+    return passed ? textResult(text, structuredContent) : errorResult(text, structuredContent)
   } catch (err) {
     return errorResult(redactSecrets(err instanceof Error ? err.message : String(err), [llmApiKey]))
   }
@@ -303,7 +341,7 @@ async function runOneApiScenario(
   llmApiKey: string,
   projectRoot: string,
   secrets: (string | undefined)[]
-): Promise<{ outcome: string; text: string }> {
+): Promise<{ outcome: string; text: string; specPath?: string }> {
   try {
     const writes: string[] = []
     const run = await runApiTest({
@@ -324,7 +362,7 @@ async function runOneApiScenario(
     const outPath = join(projectRoot, `five46-api-${run.runId}.test.mjs`)
     writeFileSync(outPath, redactSecrets(generateApiSpec(run), secrets), 'utf8')
 
-    return { outcome: run.outcome, text: `${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}` }
+    return { outcome: run.outcome, text: `${reportText}\n\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`, specPath: outPath }
   } catch (err) {
     return { outcome: 'tooling-error', text: redactSecrets(err instanceof Error ? err.message : String(err), secrets) }
   }
@@ -398,20 +436,25 @@ export async function runApiTool(params: ApiToolParams, context: McpToolContext)
 
       let allPassed = true
       let passedCount = 0
+      const acceptanceCriteria: StructuredToolOutput['acceptanceCriteria'] = []
       const lines = outcomes.map(({ goal, result }, i) => {
         const passed = result.outcome === 'goal-reached'
         if (passed) passedCount++
         else allPassed = false
+        acceptanceCriteria!.push({ index: i + 1, goal, outcome: result.outcome, passed, specPath: result.specPath })
         const header = `AC${i + 1}: ${passed ? 'PASS' : `FAIL (${result.outcome})`} — ${goal}`
         return passed ? header : `${header}\n${result.text}`
       })
       const finalText = `${clampNote}Split into ${goals.length} scenario(s). ${passedCount}/${goals.length} acceptance criteria reached goal-reached.\n\n${lines.join('\n\n')}`
-      return allPassed ? textResult(finalText) : errorResult(finalText)
+      const structuredContent: StructuredToolOutput = { passed: allPassed, acceptanceCriteria }
+      return allPassed ? textResult(finalText, structuredContent) : errorResult(finalText, structuredContent)
     }
 
-    const { outcome, text } = await runOneApiScenario(params.baseUrl, params.goal!, params.maxSteps, safety, authHeaders, provider, llmApiKey, context.projectRoot, secrets)
+    const { outcome, text, specPath } = await runOneApiScenario(params.baseUrl, params.goal!, params.maxSteps, safety, authHeaders, provider, llmApiKey, context.projectRoot, secrets)
     // Same isError-mirrors-CI-gating rule as runTestTool — see its comment.
-    return outcome === 'goal-reached' ? textResult(text) : errorResult(text)
+    const passed = outcome === 'goal-reached'
+    const structuredContent: StructuredToolOutput = { passed, outcome, specPath }
+    return passed ? textResult(text, structuredContent) : errorResult(text, structuredContent)
   } catch (err) {
     return errorResult(redactSecrets(err instanceof Error ? err.message : String(err), secrets))
   }

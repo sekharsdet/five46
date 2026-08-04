@@ -37,3 +37,54 @@ export const apiToolInputSchema = {
   story: z.string().optional().describe(storyDescribe),
   maxSteps: z.number().int().positive().optional().describe('Step budget (default 15, hard-capped at 50 regardless of what is passed)'),
 }
+
+// Shared by both tools' output schemas — `RunOutcome`/`ApiTestRun`'s own
+// outcome union (agent/types.ts, agent/apiTypes.ts), plus a synthetic
+// `tooling-error` value used only here, for an MCP-layer failure with no
+// real run outcome behind it at all (e.g. Playwright unavailable, or a
+// write failure after a run already completed — see `runOneTestScenario`/
+// `runOneApiScenario` in tools.ts).
+const outcomeEnum = z.enum([
+  'goal-reached',
+  'goal-unreachable',
+  'stuck-repeating',
+  'stopped-by-cap',
+  'unparseable-response',
+  'assertion-failed',
+  'provider-unavailable',
+  'tooling-error',
+])
+
+const acceptanceCriterionOutputSchema = z.object({
+  index: z.number().int().positive().describe('1-based position, matching the "ACn" label in the free-text report'),
+  goal: z.string().describe('The independent goal this scenario was split into'),
+  outcome: outcomeEnum,
+  passed: z.boolean(),
+  specPath: z.string().optional().describe('Absolute path to this scenario\'s own generated spec file, when one was written'),
+})
+
+/** The MCP SDK (`@modelcontextprotocol/sdk@^1.30.0`) strictly validates
+ * `structuredContent` against this shape on every non-error result — see
+ * its own `validateToolOutput()` — so this must exactly describe what
+ * `runTestTool`/`runApiTool` actually return. `outcome`/`specPath` are for
+ * a plain `goal` call; `acceptanceCriteria` is for a `story` call — never
+ * both at once. `passed` is always present regardless of which shape:
+ * the one universal field a calling agent can branch on immediately,
+ * mirroring the result's own `isError` exactly (`passed === !isError`).
+ * This is a purely additive, machine-parseable *parallel* channel — the
+ * existing free-text report in `content` is unchanged, still the right
+ * format for a human reading raw MCP output. */
+const toolOutputSchema = {
+  passed: z
+    .boolean()
+    .describe('Whether this call fully succeeded — for a plain goal, outcome === "goal-reached"; for a story, every acceptance criterion reached goal-reached.'),
+  outcome: outcomeEnum.optional().describe('Present only for a plain `goal` call (never a `story` call — see acceptanceCriteria instead).'),
+  specPath: z.string().optional().describe('Absolute path to the generated spec file — present only for a plain `goal` call.'),
+  acceptanceCriteria: z
+    .array(acceptanceCriterionOutputSchema)
+    .optional()
+    .describe('Present only for a `story` call — one entry per split acceptance criterion, in the order they were run.'),
+}
+
+export const testToolOutputSchema = toolOutputSchema
+export const apiToolOutputSchema = toolOutputSchema

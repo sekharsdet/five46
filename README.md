@@ -38,6 +38,12 @@ It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` fil
   runs without paying the LLM cost of logging in every time.
 - **Self-healing selectors** — a stale selector gets one bounded, disclosed
   recovery attempt instead of just failing the step.
+- **Resilient generated specs** — when a real, live check confirms
+  Playwright's own `getByRole()` resolves uniquely to the exact element a
+  step acted on, the generated spec prefers it over a positional CSS
+  selector, since it's far more resistant to future DOM changes. Falls back
+  to the always-correct selector automatically wherever that check can't be
+  made — never changes what the live run itself does.
 - **Root-cause hypotheses** — a failed assertion gets an LLM-generated
   hypothesis for what likely went wrong and what to check next.
 - **MCP server** — expose `five46_test`/`five46_api` as tools an
@@ -407,6 +413,12 @@ implemented a feature against and get back a per-AC pass/fail. Concurrency
 is set via `FIVE46_MCP_CONCURRENCY` in the server's own environment
 (default 3, hard-capped at 5) — never a per-call tool argument, the same
 posture as `allowWrites`/`allowDeletes`.
+
+Both tools also return `structuredContent` — a machine-parseable
+`{ passed, outcome, specPath }` (or `{ passed, acceptanceCriteria: [...] }`
+for a `story` call) alongside the existing free-text report, so a calling
+coding agent can branch on a real field instead of parsing prose out of the
+report to decide whether to rework or move on.
 
 ## Development
 

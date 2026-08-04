@@ -92,6 +92,17 @@ export interface StepExecutionResult {
    * healing logic. */
   healed?: boolean
   healedSelector?: string
+  /** Present only when `verifyRoleLocator()` confirmed, live, that
+   * `page.getByRole(role, { name })` resolves uniquely to the exact same
+   * element the (guaranteed-correct) `selector`/`healedSelector` above
+   * targeted — never used for the live action itself (which always uses
+   * `selector`/`healedSelector`, completely unchanged by this field's
+   * presence), only as `generateSpec.ts`'s preferred choice for what to
+   * emit in the *exported* spec, since `getByRole` is far more resilient
+   * to future DOM restructuring than a positional CSS path. See
+   * `verifyRoleLocator`'s own doc comment for why this needs a real,
+   * live check rather than a static assumption. */
+  verifiedRoleLocator?: { role: string; name: string }
   /** Present only for a `scroll` action — whether the page's scroll
    * position actually changed. `runner.ts` uses this (not just `ok`) to
    * decide whether a scroll counts as progress for stuck-repeating
@@ -482,6 +493,67 @@ export const WAIT_ACTION_MS = 3000
  * would have passed. */
 const ASSERT_WAIT_MS = 5000
 
+/** Live verification, not a static assumption, that `page.getByRole(role,
+ * { name })` resolves — uniquely — to the *exact same* element already
+ * resolved via `computeSelector()`'s guaranteed-correct preference order
+ * (testId → id → positional CSS path, completely unchanged by this
+ * function). Only ever changes what `generateSpec.ts` *prefers to emit*
+ * in the exported spec — never the live run's own action, which always
+ * continues to use the already-resolved selector regardless of this
+ * function's result.
+ *
+ * Exists because a *computed* role/name pair can't always round-trip back
+ * into a valid `getByRole` call (`accessibleName()`'s computation has real
+ * edge cases this codebase doesn't fully reimplement — see its own doc
+ * comment) — rather than assume it round-trips, this checks it for real,
+ * against the real page, at the exact moment it matters, closing that
+ * exact gap instead of guessing around it.
+ *
+ * `includeHidden: true` is deliberately broader than a plain `getByRole`
+ * call (which excludes elements outside the accessibility tree) — this
+ * makes the uniqueness check *stricter* than what a later replay will
+ * actually see (a hidden sibling with the same role/name that a real
+ * replay, without `includeHidden: true`, would never even consider), so
+ * this can only ever under-use the feature (fall back to the existing
+ * selector) on an edge case, never produce a false positive. It also means
+ * this can run
+ * once, uniformly, right after the target element is resolved — before
+ * any assert_visible poll or click/fill mutation — without needing to
+ * wait for a not-yet-visible element to become visible first.
+ *
+ * Substring match (`exact: false`), not exact — `accessibleName()` (above)
+ * truncates `textContent` to 80 chars, so an exact match would silently
+ * fail on exactly the long product-title links this feature exists for.
+ * Uniqueness is still enforced via `count() === 1`. Identity is confirmed
+ * via Playwright's own documented handle-equality pattern
+ * (`page.evaluate(([a, b]) => a === b, [...])`), not a DOM-mutation marker
+ * — writing a temporary attribute to verify identity risks tripping a
+ * real site's own analytics/MutationObserver, an unacceptable side effect
+ * for a verification-only check that must never alter the page.
+ *
+ * Never throws, and never more than ~1s of real cost — any failure here
+ * (an unrecognized role string, a detached handle, a timeout) must never
+ * be mistaken for a failure of the actual action; always resolves to
+ * `undefined` on anything but a clean, unique, confirmed match. */
+async function verifyRoleLocator(
+  page: import('playwright').Page,
+  role: string,
+  name: string,
+  targetHandle: import('playwright').ElementHandle
+): Promise<{ role: string; name: string } | undefined> {
+  if (!name) return undefined
+  try {
+    const candidate = page.getByRole(role as Parameters<import('playwright').Page['getByRole']>[0], { name, exact: false, includeHidden: true })
+    if ((await candidate.count()) !== 1) return undefined
+    const candidateHandle = await candidate.elementHandle({ timeout: 1000 })
+    if (!candidateHandle) return undefined
+    const same = await page.evaluate(([a, b]) => a === b, [targetHandle, candidateHandle] as const)
+    return same ? { role, name } : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** Executes one already-parsed, already-ref-validated action against the
  * real page. Any Playwright-level failure (element detached, navigation
  * mid-action, timeout) is caught here and turned into an honest `ok: false`
@@ -606,6 +678,18 @@ export async function executeAction(
   const el = resolve(outline, action.ref)
   if (!el) return fail(`ref "${action.ref}" not found in this turn's outline`)
   const locator = page.locator(el.selector).first()
+  // Computed once, here, before any type-specific logic below (including
+  // click/fill's own mutation) — see `verifyRoleLocator`'s own doc comment
+  // for why `includeHidden: true` makes this safe to do uniformly for
+  // every action type, regardless of whether the target is visible yet.
+  // Best-effort: an element that isn't attached at all yet (a legitimate,
+  // common state for assert_visible/assert_text, whose own polling below
+  // is what's responsible for waiting it out) just resolves to `undefined`
+  // here, same as any other "can't verify" case.
+  const verifiedRoleLocator = await locator
+    .elementHandle({ timeout: 2000 })
+    .then((handle) => (handle ? verifyRoleLocator(page, el.role, el.name, handle) : undefined))
+    .catch(() => undefined)
 
   if (action.action === 'assert_visible') {
     // Polls, rather than a single instantaneous check — matches
@@ -617,7 +701,7 @@ export async function executeAction(
     // though the recorded spec, re-run later, would pass.
     try {
       await locator.waitFor({ state: 'visible', timeout: ASSERT_WAIT_MS })
-      return { ok: true }
+      return { ok: true, verifiedRoleLocator }
     } catch {
       return await fail(`element "${el.name}" (ref ${el.ref}) is not visible`)
     }
@@ -639,7 +723,7 @@ export async function executeAction(
       const remaining = deadline - Date.now()
       try {
         lastText = (await locator.textContent({ timeout: Math.max(remaining, 1) })) ?? ''
-        if (lastText.includes(expected)) return { ok: true }
+        if (lastText.includes(expected)) return { ok: true, verifiedRoleLocator }
       } catch {
         // Not attached yet, or this iteration's own timeout elapsed — keep
         // polling until the outer deadline rather than failing on one miss.
@@ -683,7 +767,7 @@ export async function executeAction(
 
   try {
     await attempt(el.selector)
-    return { ok: true }
+    return { ok: true, verifiedRoleLocator }
   } catch (err) {
     const originalDetail = err instanceof Error ? err.message.split('\n')[0] : String(err)
 
@@ -730,7 +814,21 @@ export async function executeAction(
     const healedSelector = candidates[0].selector
     try {
       await attempt(healedSelector)
-      return { ok: true, healed: true, healedSelector }
+      // Re-verified against the healed candidate specifically — the
+      // original `verifiedRoleLocator` above was computed against the now-
+      // stale element (0 matches), so it says nothing about this different,
+      // freshly re-matched DOM node. `candidates[0]`'s role/name are
+      // identical to `el`'s by construction (the healing filter above only
+      // accepts a candidate with the exact same tag/role/name), but the
+      // *element* itself is different, so the identity check must be redone
+      // against a real handle for it.
+      const healedVerifiedRoleLocator = await page
+        .locator(healedSelector)
+        .first()
+        .elementHandle({ timeout: 2000 })
+        .then((handle) => (handle ? verifyRoleLocator(page, candidates[0].role, candidates[0].name, handle) : undefined))
+        .catch(() => undefined)
+      return { ok: true, healed: true, healedSelector, verifiedRoleLocator: healedVerifiedRoleLocator }
     } catch (healErr) {
       return fail(
         `selector went stale (0 matches): ${originalDetail} — healed to a re-matched element, but the retry also failed: ${
