@@ -23,7 +23,7 @@ import { generateApiRootCauseHypothesis } from './agent/apiRootCause'
 import { diffSpecFiles, formatDiff } from './agent/diffSpecs'
 import { classifyRepeatResults } from './agent/flaky'
 import type { RepeatIterationResult } from './agent/flaky'
-import { HARD_MAX_REPEAT, HARD_MAX_SCENARIOS, DEFAULT_CONCURRENCY, HARD_MAX_CONCURRENCY } from './agent/runLoop'
+import { HARD_MAX_REPEAT, HARD_MAX_SCENARIOS, DEFAULT_CONCURRENCY, DEFAULT_BROWSER_CONCURRENCY, HARD_MAX_CONCURRENCY } from './agent/runLoop'
 import { splitUserStory } from './agent/storySplitter'
 import { runWithConcurrency } from './agent/concurrencyPool'
 import type { RunOutcome } from './agent/types'
@@ -704,7 +704,7 @@ async function runStoryScenarios(
   console.log(`\nSplit into ${goals.length} scenario(s):`)
   goals.forEach((g, i) => console.log(`  AC${i + 1}: ${g}`))
 
-  const effectiveConcurrency = Math.max(1, Math.min(concurrency ?? DEFAULT_CONCURRENCY, HARD_MAX_CONCURRENCY))
+  const effectiveConcurrency = Math.max(1, Math.min(concurrency ?? DEFAULT_BROWSER_CONCURRENCY, HARD_MAX_CONCURRENCY))
   if (concurrency !== undefined && concurrency > effectiveConcurrency) {
     console.log(`\nNote: --concurrency ${concurrency} exceeds the cap of ${HARD_MAX_CONCURRENCY} — running ${effectiveConcurrency} at once instead.`)
   }

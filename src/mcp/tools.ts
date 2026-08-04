@@ -19,7 +19,7 @@ import { generateRootCauseHypothesis } from '../agent/rootCause'
 import { generateApiRootCauseHypothesis } from '../agent/apiRootCause'
 import { splitUserStory } from '../agent/storySplitter'
 import { runWithConcurrency } from '../agent/concurrencyPool'
-import { HARD_MAX_SCENARIOS } from '../agent/runLoop'
+import { HARD_MAX_SCENARIOS, DEFAULT_CONCURRENCY, DEFAULT_BROWSER_CONCURRENCY } from '../agent/runLoop'
 
 /** Read once at server construction (see `server.ts`) — never re-derived
  * from a tool call's own arguments. `allowWrites`/`allowDeletes` are only
@@ -42,14 +42,19 @@ export interface McpToolContext {
   allowWrites: boolean
   allowDeletes: boolean
   /** Bounded-concurrency cap for `story` mode — see `DEFAULT_CONCURRENCY`/
-   * `HARD_MAX_CONCURRENCY` (runLoop.ts). Sourced only from
-   * `FIVE46_MCP_CONCURRENCY` at server construction (`server.ts`), never a
-   * per-call tool argument — same "cost/rate-limit-affecting parameter stays
-   * off the calling AI's side" precedent as `allowWrites`/`allowDeletes`.
-   * Always a resolved number by the time a tool handler sees it (`server.ts`
-   * applies the default before constructing this context), unlike those two
-   * only in that there's no meaningful "unset" state to preserve here. */
-  concurrency: number
+   * `DEFAULT_BROWSER_CONCURRENCY`/`HARD_MAX_CONCURRENCY` (runLoop.ts).
+   * Sourced only from `FIVE46_MCP_CONCURRENCY` at server construction
+   * (`server.ts`), never a per-call tool argument — same "cost/rate-limit-
+   * affecting parameter stays off the calling AI's side" precedent as
+   * `allowWrites`/`allowDeletes`. `undefined` when the env var wasn't set
+   * (or was invalid) — unlike `allowWrites`/`allowDeletes`, an explicit
+   * value here must still win over either tool's own default, so `server.ts`
+   * deliberately does NOT resolve a default before constructing this
+   * context; each tool handler applies its own (`runTestTool` uses the
+   * lower `DEFAULT_BROWSER_CONCURRENCY`, `runApiTool` uses
+   * `DEFAULT_CONCURRENCY`) only when this is `undefined`. Already clamped to
+   * `HARD_MAX_CONCURRENCY` by `server.ts` when it IS a number. */
+  concurrency: number | undefined
   provider?: LlmProvider
   apiKey?: string
 }
@@ -270,7 +275,7 @@ export async function runTestTool(params: TestToolParams, context: McpToolContex
         const result = await runOneTestScenario(params.url, goal, params.maxSteps, params.headed, storageState, provider, llmApiKey!, context.allowDeletes, context.projectRoot, `${batchId}-ac${i + 1}`)
         return { goal, result }
       })
-      const outcomes = await runWithConcurrency(tasks, Math.max(1, context.concurrency))
+      const outcomes = await runWithConcurrency(tasks, Math.max(1, context.concurrency ?? DEFAULT_BROWSER_CONCURRENCY))
 
       let allPassed = true
       let passedCount = 0
@@ -432,7 +437,7 @@ export async function runApiTool(params: ApiToolParams, context: McpToolContext)
         const result = await runOneApiScenario(params.baseUrl, goal, params.maxSteps, safety, authHeaders, provider, llmApiKey!, context.projectRoot, secrets)
         return { goal, result }
       })
-      const outcomes = await runWithConcurrency(tasks, Math.max(1, context.concurrency))
+      const outcomes = await runWithConcurrency(tasks, Math.max(1, context.concurrency ?? DEFAULT_CONCURRENCY))
 
       let allPassed = true
       let passedCount = 0

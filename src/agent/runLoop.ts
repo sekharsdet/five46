@@ -24,11 +24,18 @@ export const HARD_MAX_REPEAT = 10
 export const HARD_MAX_SCENARIOS = 10
 
 /** Bounded-concurrency defaults for running a `--story`'s split-out scenarios.
- * Default 3 is faster in aggregate than `--repeat`'s strict sequencing without
- * risking a live-LLM rate-limit storm or exhausting local resources (many real
- * headless browser instances at once); hard-capped at 5 regardless of what a
- * caller passes, mirroring `HARD_MAX_STEPS`/`HARD_MAX_REPEAT`'s own clamps. */
+ * `DEFAULT_CONCURRENCY` (API engine) is faster in aggregate than `--repeat`'s
+ * strict sequencing without risking a live-LLM rate-limit storm; several
+ * concurrent plain HTTP requests carry a much smaller footprint against a
+ * live site than several concurrent real browser sessions do, so
+ * `DEFAULT_BROWSER_CONCURRENCY` defaults lower — real live testing this
+ * project has done showed multiple concurrent headless-Chromium sessions
+ * hitting one origin at once reads as more bot-like than one. Both are only
+ * *defaults*: an explicit `--concurrency`/`FIVE46_MCP_CONCURRENCY` still
+ * wins, hard-capped at `HARD_MAX_CONCURRENCY` regardless of engine, mirroring
+ * `HARD_MAX_STEPS`/`HARD_MAX_REPEAT`'s own clamps. */
 export const DEFAULT_CONCURRENCY = 3
+export const DEFAULT_BROWSER_CONCURRENCY = 2
 export const HARD_MAX_CONCURRENCY = 5
 
 /** Output-token caps per LLM call type — see DEVELOPMENT.md's "Bounding LLM

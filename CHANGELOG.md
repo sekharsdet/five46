@@ -1,0 +1,62 @@
+# Changelog
+
+All notable changes to this project are documented here. Format loosely
+follows [Keep a Changelog](https://keepachangelog.com/).
+
+## 0.2.0
+
+### Added
+- **Story mode** (`--story`) — split a raw, multi-AC user story into
+  independent goals and run them with bounded concurrency, reporting a
+  clear pass/fail per acceptance criterion. Available on `five46 test`,
+  `five46 api`, and both MCP tools.
+- **Resilient generated specs** — when a live check confirms Playwright's
+  own `getByRole()` resolves uniquely to the exact element a step acted
+  on, the generated spec prefers it over a positional CSS selector.
+  Never changes what the live run itself does.
+- **Structured MCP output** — `five46_test`/`five46_api` now return a
+  `structuredContent` field (`{ passed, outcome, specPath }` or
+  `{ passed, acceptanceCriteria }` for a story call) alongside the
+  existing free-text report, so a calling coding agent can branch on a
+  real field instead of parsing prose.
+- **`--fast-steps`** (opt-in) — on Groq/Gemini, swaps in a faster model
+  tier for the high-frequency per-step decision call only.
+
+### Fixed
+- A goal is no longer reported as reached without at least one real
+  assertion having actually run.
+- A browser-teardown failure in `runAgent`'s cleanup path could
+  previously mask an already-computed, genuinely correct run result;
+  teardown failures are now isolated and can never overwrite the real
+  outcome.
+
+### Changed
+- Prompts reordered so static content leads, unlocking provider prompt
+  caching and cutting per-step LLM cost/latency.
+
+### Docs
+- Disclosed known limitations (no iframe/shadow-DOM traversal,
+  Chromium-only) in the public README — previously noted only in
+  internal dev notes.
+
+## 0.1.1
+
+No functional changes — version bump only.
+
+## 0.1.0
+
+Initial public release.
+
+- BYOK agentic testing engine (OpenAI, Anthropic, Gemini, Groq, AWS
+  Bedrock) driving a real Chromium browser or real HTTP requests toward
+  a plain-English goal.
+- Every successful run writes a real, standalone Playwright `.spec.ts`
+  (or `node:test` script for API tests).
+- Session reuse (`five46 login` + `--storage-state`), self-healing
+  selectors, root-cause hypotheses on failed assertions.
+- Safe by default: read-only API testing unless writes/deletes are
+  explicitly unlocked; destructive-looking browser clicks blocked by
+  default.
+- `five46 diff`, `--repeat` flaky-test detection, `five46.config.json`
+  project management, CI-friendly exit codes.
+- MCP server (`five46 mcp`) exposing `five46_test`/`five46_api`.

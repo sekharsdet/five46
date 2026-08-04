@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, existsSync, statSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders, USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
+import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders, evaluateWithNavigationRaceRetry, USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
 import { startFixtureServer, startScrollFixtureServer } from './testServer'
 import { startLoginFixtureServer, LOGIN_FIXTURE_USERNAME, LOGIN_FIXTURE_PASSWORD } from './loginTestServer'
 import type { AgentBrowser } from './browser'
@@ -971,6 +971,118 @@ test('launchAgentBrowser without recordVideoDir returns no videoPath on close �
     const { videoPath } = await browser.close()
     assert.equal(videoPath, undefined)
   } finally {
+    await server.close()
+  }
+})
+
+test('evaluateWithNavigationRaceRetry retries exactly once on the specific "Execution context was destroyed" error, then returns the real result', async () => {
+  let calls = 0
+  let settled = false
+  const result = await evaluateWithNavigationRaceRetry(
+    async () => {
+      calls++
+      if (calls === 1) throw new Error('page.evaluate: Execution context was destroyed, most likely because of a navigation')
+      return 'ok'
+    },
+    async () => {
+      settled = true
+    }
+  )
+  assert.equal(result, 'ok')
+  assert.equal(calls, 2)
+  assert.ok(settled, 'expected settle() to be awaited before the retry')
+})
+
+test('evaluateWithNavigationRaceRetry lets a second consecutive failure propagate — only one retry, never a loop', async () => {
+  let calls = 0
+  await assert.rejects(
+    () =>
+      evaluateWithNavigationRaceRetry(
+        async () => {
+          calls++
+          throw new Error('Execution context was destroyed, most likely because of a navigation')
+        },
+        async () => {}
+      ),
+    /Execution context was destroyed/
+  )
+  assert.equal(calls, 2, 'expected exactly one retry (two total attempts), not an unbounded loop')
+})
+
+test('evaluateWithNavigationRaceRetry does not retry an unrelated error — only this exact transient race is special-cased', async () => {
+  let calls = 0
+  let settleCalled = false
+  await assert.rejects(
+    () =>
+      evaluateWithNavigationRaceRetry(
+        async () => {
+          calls++
+          throw new Error('some genuine script error')
+        },
+        async () => {
+          settleCalled = true
+        }
+      ),
+    /genuine script error/
+  )
+  assert.equal(calls, 1, 'a real, unrelated error must fail immediately, not be retried')
+  assert.equal(settleCalled, false)
+})
+
+test('evaluateWithNavigationRaceRetry never calls settle() or retries when the first attempt already succeeds', async () => {
+  let calls = 0
+  let settleCalled = false
+  const result = await evaluateWithNavigationRaceRetry(
+    async () => {
+      calls++
+      return 'first-try'
+    },
+    async () => {
+      settleCalled = true
+    }
+  )
+  assert.equal(result, 'first-try')
+  assert.equal(calls, 1)
+  assert.equal(settleCalled, false)
+})
+
+test('evaluateWithNavigationRaceRetry survives a settle() that itself throws — the retry still runs', async () => {
+  let calls = 0
+  const result = await evaluateWithNavigationRaceRetry(
+    async () => {
+      calls++
+      if (calls === 1) throw new Error('Execution context was destroyed, most likely because of a navigation')
+      return 'recovered'
+    },
+    async () => {
+      throw new Error('waitForLoadState timed out')
+    }
+  )
+  assert.equal(result, 'recovered')
+  assert.equal(calls, 2)
+})
+
+test('snapshot() genuinely recovers from a real navigation race against a real browser, not just the isolated retry helper', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    // Fires a real navigation without awaiting it, then immediately calls
+    // snapshot() so it genuinely races the frame's context teardown — the
+    // same shape of race that produced the live-caught exception this fix
+    // targets, not a mocked stand-in. Whether this particular run actually
+    // wins the race is inherently timing-dependent (that's what makes it
+    // "transient"), so this asserts the one thing that must always be true
+    // either way: snapshot() still returns a real, usable outline afterward
+    // instead of throwing — the deterministic tests above already cover the
+    // retry policy itself precisely.
+    const navigation = browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    await navigation
+    assert.ok(outline.elements.length > 0, 'expected a real outline back, whether or not this run actually hit the race')
+  } finally {
+    await browser.close()
     await server.close()
   }
 })

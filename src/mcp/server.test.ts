@@ -10,7 +10,7 @@ import { startApiTestServer } from '../agent/apiTestServer'
 import { launchAgentBrowser } from '../agent/browser'
 import { startFixtureServer } from '../agent/testServer'
 import type { LlmProvider } from '../llm/types'
-import { HARD_MAX_CONCURRENCY } from '../agent/runLoop'
+import { HARD_MAX_CONCURRENCY, DEFAULT_BROWSER_CONCURRENCY, DEFAULT_CONCURRENCY } from '../agent/runLoop'
 import type { StructuredToolOutput } from './tools'
 
 // The MCP client SDK's own `CallToolResult` type declares `structuredContent`
@@ -851,6 +851,49 @@ test('five46_api tool with story falls back to DEFAULT_CONCURRENCY when FIVE46_M
   }
 })
 
+test('five46_api tool with story defaults to DEFAULT_CONCURRENCY when FIVE46_MCP_CONCURRENCY is truly unset (not just out-of-range)', async () => {
+  const server = await startApiTestServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  const original = process.env.FIVE46_MCP_CONCURRENCY
+  delete process.env.FIVE46_MCP_CONCURRENCY
+  try {
+    let inFlight = 0
+    let maxInFlight = 0
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: ['scenario one', 'scenario two', 'scenario three', 'scenario four', 'scenario five'] })
+        }
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        inFlight--
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_api', arguments: { baseUrl: server.url, story: 'a five-scenario story' } })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.equal(maxInFlight, DEFAULT_CONCURRENCY, `five46_api's true unset default should be DEFAULT_CONCURRENCY (${DEFAULT_CONCURRENCY}), saw ${maxInFlight}`)
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+    if (original === undefined) delete process.env.FIVE46_MCP_CONCURRENCY
+    else process.env.FIVE46_MCP_CONCURRENCY = original
+  }
+})
+
 test('five46_test tool with story splits a raw story into independent goals, driving a real browser per scenario', async (t) => {
   if (!(await playwrightAvailable())) {
     t.skip('playwright unavailable in this environment')
@@ -895,5 +938,62 @@ test('five46_test tool with story splits a raw story into independent goals, dri
   } finally {
     await server.close()
     rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_test tool with story defaults to the lower DEFAULT_BROWSER_CONCURRENCY (not DEFAULT_CONCURRENCY) when FIVE46_MCP_CONCURRENCY is unset', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  const original = process.env.FIVE46_MCP_CONCURRENCY
+  delete process.env.FIVE46_MCP_CONCURRENCY
+  try {
+    let inFlight = 0
+    let maxInFlight = 0
+    const turnsByGoal = new Map<string, number>()
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('Story:')) {
+          return JSON.stringify({ goals: ['reveal message A', 'reveal message B', 'reveal message C', 'reveal message D'] })
+        }
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        inFlight--
+        const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
+        const turn = (turnsByGoal.get(goal) ?? 0) + 1
+        turnsByGoal.set(goal, turn)
+        if (turn === 1) {
+          const match = prompt.match(/\[(e\d+)\][^\n]*Show secret message/)
+          return JSON.stringify({ action: 'click', ref: match![1], reason: 'reveal it' })
+        }
+        if (turn === 2) {
+          const match = prompt.match(/\[(e\d+)\][^\n]*agentic testing works/)
+          return JSON.stringify({ action: 'assert_visible', ref: match![1], reason: 'confirm revealed' })
+        }
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({ name: 'five46_test', arguments: { url: server.url, story: 'four reveal-message scenarios', maxSteps: 5 } })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.equal(
+        maxInFlight,
+        DEFAULT_BROWSER_CONCURRENCY,
+        `five46_test's true unset default should be DEFAULT_BROWSER_CONCURRENCY (${DEFAULT_BROWSER_CONCURRENCY}), not DEFAULT_CONCURRENCY (${DEFAULT_CONCURRENCY}) — saw ${maxInFlight}`
+      )
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+    if (original === undefined) delete process.env.FIVE46_MCP_CONCURRENCY
+    else process.env.FIVE46_MCP_CONCURRENCY = original
   }
 })

@@ -419,6 +419,37 @@ function computeSelector(el: RawSnapshotElement): string {
   return el.positionalSelector
 }
 
+/** Live-caught (during a real story-mode run against a real production
+ * site): an ordinary Playwright timing race, not a real run failure — a
+ * `page.evaluate()` that happens to be in flight exactly when a navigation
+ * commits throws `"Execution context was destroyed, most likely because of
+ * a navigation"`, because the frame it was querying no longer exists. This
+ * has nothing to do with the app being tested; retrying once, after giving
+ * the new page a moment to settle, is the correct response — not treating
+ * it as a genuine tooling/run failure. Scoped to this *exact* error message
+ * only (never a blanket retry-on-any-evaluate-failure): a real failure
+ * (a page that genuinely never loads, a real script error) must still
+ * surface honestly on the first attempt, matching this codebase's "never
+ * paper over a real problem" posture everywhere else. Exactly one retry —
+ * if the second attempt also throws (even the same error, e.g. a page stuck
+ * in a genuine navigation loop), that failure propagates normally. `op`/
+ * `settle` are injected (rather than calling `page.evaluate`/
+ * `waitForLoadState` directly) so this retry policy itself is directly,
+ * deterministically unit-testable without needing to force a real,
+ * inherently timing-dependent race in a live browser. */
+export async function evaluateWithNavigationRaceRetry<T>(op: () => Promise<T>, settle: () => Promise<void>): Promise<T> {
+  try {
+    return await op()
+  } catch (err) {
+    if (!(err instanceof Error) || !err.message.includes('Execution context was destroyed')) throw err
+    await settle().catch(() => {
+      // Best-effort — if the page never settles, the retry below will
+      // simply fail honestly on its own, same as any other real failure.
+    })
+    return await op()
+  }
+}
+
 /** One `page.evaluate()` round trip to find every visible interactive
  * element, then ref-assignment/selector-computation happens here in Node —
  * never inside the page, and never authored by an LLM. Caps at
@@ -439,7 +470,10 @@ function computeSelector(el: RawSnapshotElement): string {
  * purely because the second match scrolled off-screen — the caller driving
  * the agentic loop (`runner.ts`) opts in; healing never does. */
 export async function snapshot(page: import('playwright').Page, maxElements = 40, prioritizeViewport = false): Promise<PageOutline> {
-  const raw = (await page.evaluate(SNAPSHOT_SCRIPT)) as RawSnapshotElement[]
+  const raw = await evaluateWithNavigationRaceRetry(
+    () => page.evaluate(SNAPSHOT_SCRIPT) as Promise<RawSnapshotElement[]>,
+    () => page.waitForLoadState('load', { timeout: 5000 })
+  )
 
   const withSelectors = raw.map((el) => ({ ...el, selector: computeSelector(el) }))
   const ordered = prioritizeViewport

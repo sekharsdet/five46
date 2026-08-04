@@ -369,9 +369,11 @@ raw story text, splits it into independent goals with one extra upfront LLM
 call, then runs each one exactly like an ordinary `--goal` run — same
 safety gating, same structured planning/`--fast-steps` speed path, its own
 fresh browser session/artifact directory, its own generated spec file —
-with up to `--concurrency` (default 3, hard-capped at 5) running at once.
-Mutually exclusive with `--goal` — pass exactly one. Works the same way on
-`five46 api`.
+with up to `--concurrency` running at once (default 2 for `five46 test`,
+3 for `five46 api` — a real browser session against one origin carries a
+heavier, more bot-like footprint than a plain HTTP request, so the browser
+default is lower; both are hard-capped at 5). Mutually exclusive with
+`--goal` — pass exactly one. Works the same way on `five46 api`.
 
 ```
 Split into 2 scenario(s):
@@ -410,9 +412,11 @@ Both tools also accept an optional `story` field alongside `goal` (exactly
 one required) — the same story-mode splitting/bounded-concurrency described
 above, letting a coding agent hand over a whole multi-AC story it just
 implemented a feature against and get back a per-AC pass/fail. Concurrency
-is set via `FIVE46_MCP_CONCURRENCY` in the server's own environment
-(default 3, hard-capped at 5) — never a per-call tool argument, the same
-posture as `allowWrites`/`allowDeletes`.
+is set via `FIVE46_MCP_CONCURRENCY` in the server's own environment —
+never a per-call tool argument, the same posture as
+`allowWrites`/`allowDeletes` — with the same per-tool defaults as the CLI
+(2 for `five46_test`, 3 for `five46_api`) when left unset, both hard-capped
+at 5.
 
 Both tools also return `structuredContent` — a machine-parseable
 `{ passed, outcome, specPath }` (or `{ passed, acceptanceCriteria: [...] }`
