@@ -3,6 +3,29 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.2.1
+
+### Added
+- CI (GitHub Actions): build + full test suite on every push/PR, across
+  Node 18/20/22.
+
+### Fixed
+- The transient Playwright `"Execution context was destroyed, most likely
+  because of a navigation"` error — an ordinary timing race, not a real
+  app failure — is now retried once instead of failing the step.
+- Resolved two transitive-dependency advisories (`fast-uri`, `hono`, both
+  pulled in via the optional MCP SDK dependency) via `npm audit fix`.
+
+### Changed
+- Story mode's default concurrency is now lower for browser runs than API
+  runs (2 vs 3) — several concurrent full browser sessions against one
+  origin carry a heavier, more bot-like footprint than concurrent plain
+  HTTP requests. Both remain overridable via `--concurrency`/
+  `FIVE46_MCP_CONCURRENCY`, hard-capped at 5.
+
+### Docs
+- Added `CHANGELOG.md`.
+
 ## 0.2.0
 
 ### Added
