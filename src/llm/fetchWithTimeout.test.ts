@@ -33,7 +33,21 @@ test('fetchWithTimeout aborts and rejects with a retryable TimeoutError once the
   const originalFetch = global.fetch
   global.fetch = ((_url: string, init?: RequestInit) => {
     return new Promise((_resolve, reject) => {
-      init?.signal?.addEventListener('abort', () => reject((init.signal as AbortSignal).reason))
+      // `AbortSignal.timeout()`'s own internal timer is deliberately unref'd
+      // (so a real, in-production pending timeout never keeps a process
+      // alive on its own) — with nothing else ref'd in this test process,
+      // that's a known Node test-runner false positive on Node 20.12+
+      // through at least 22.x (nodejs/node#49952, #52304): the runner can
+      // decide the event loop is idle and report "Promise resolution is
+      // still pending" before the unref'd timer ever gets to fire, even
+      // though it reliably would have. A trivial ref'd keepalive, cleared
+      // the moment abort actually fires, sidesteps it without touching the
+      // real 10ms timeout behavior under test.
+      const keepAlive = setInterval(() => {}, 1000)
+      init?.signal?.addEventListener('abort', () => {
+        clearInterval(keepAlive)
+        reject((init.signal as AbortSignal).reason)
+      })
     })
   }) as typeof fetch
 

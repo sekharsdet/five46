@@ -27,7 +27,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "ts-node src/cli.ts",
-    "test": "npm run build && node --test 'dist/**/*.test.js'",
+    "test": "npm run build && node --test $(find dist -name '*.test.js')",
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
