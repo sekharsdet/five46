@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.2.3
+
+### Added
+- `mcpName` field in `package.json`, required for publishing to the
+  official [MCP Registry](https://registry.modelcontextprotocol.io) —
+  no functional change to the CLI/MCP server itself.
+
 ## 0.2.2
 
 ### Fixed
