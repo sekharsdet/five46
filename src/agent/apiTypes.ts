@@ -101,7 +101,11 @@ export function isHostAllowed(url: string, safety: SafetyMode): boolean {
  * named variable later steps can reference as `{{name}}` in `url`/
  * `headers`/`body` — resolved by `apiExecutor.ts`'s `resolvePlaceholders`
  * on a local copy only, exactly like `browser.ts`'s `substitutePlaceholders`
- * for credentials; this action object itself is never mutated with a
+ * for credentials. An assertion's optional `clauseIndex` mirrors
+ * `AgentAction`'s identical field exactly — see its own doc comment
+ * (types.ts) for the full reasoning; only ever present/consulted when
+ * `apiRunner.ts` split the goal into 2+ confirm-clauses. This action
+ * object itself is never mutated with a
  * resolved value. */
 export type ApiAction =
   | {
@@ -113,9 +117,9 @@ export type ApiAction =
       saveAs?: { name: string; path: string }
       reason: string
     }
-  | { action: 'assert_status'; expected: number; reason: string }
-  | { action: 'assert_json_path_exists'; path: string; reason: string }
-  | { action: 'assert_json_path_equals'; path: string; expected: string; reason: string }
+  | { action: 'assert_status'; expected: number; reason: string; clauseIndex?: number }
+  | { action: 'assert_json_path_exists'; path: string; reason: string; clauseIndex?: number }
+  | { action: 'assert_json_path_equals'; path: string; expected: string; reason: string; clauseIndex?: number }
   | { action: 'done'; outcome: 'goal-reached' | 'goal-unreachable'; reason: string }
 
 export interface ApiHistoryEntry {

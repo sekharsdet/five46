@@ -977,6 +977,17 @@ test('runAgent requires a fresh assertion for EACH confirm-clause in a compound 
   // entirely and declare done on the strength of one, perfectly fresh
   // assertion for only the second. See countConfirmationClauses' own doc
   // comment for the full reasoning.
+  //
+  // Dispatches by prompt shape (which real call is being answered), not a
+  // blind turn counter — a 2+-confirm-clause goal now also triggers one
+  // upfront splitConfirmationClauses() call (clauseSplitter.ts) before the
+  // per-step loop even starts, so a fixed turn-index script would silently
+  // answer the wrong call. This directly exercises the real fix for
+  // DEVELOPMENT.md's documented gap #3: without it, a single assertion
+  // about the *second* clause alone would have cleared the old scalar
+  // count-of-2 floor, identical to the real Amazon.in failure (a "confirm
+  // login field visible" assertion alone satisfying a goal that also
+  // required "add to cart").
   if (!(await playwrightAvailable())) {
     t.skip('playwright unavailable in this environment')
     return
@@ -984,20 +995,32 @@ test('runAgent requires a fresh assertion for EACH confirm-clause in a compound 
   const server = await startFixtureServer()
   const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
   try {
-    let turn = 0
+    let stepTurn = 0
     const fakeProvider: LlmProvider = {
       id: 'fake',
       async complete(prompt) {
-        turn++
-        // Only ONE fresh assertion before the first done attempt — the
-        // goal below asks for two.
-        if (turn === 1) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Show secret message'), reason: 'confirm the button is there' })
-        if (turn === 2) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, one check is enough' })
-        // Only reached if turn 2 was correctly rejected: a second, real
-        // assertion, satisfying the count this time.
-        if (turn === 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
-        if (turn === 4) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed' })
-        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both things confirmed now' })
+        if (prompt.includes('"clauses"')) {
+          // Deliberately phrased to share real vocabulary with the
+          // fixture's actual accessible names ("Show secret message" the
+          // button, "...agentic testing works" the revealed text) — a
+          // clause split degrading to something with zero textual
+          // relationship to the elements actually being asserted about
+          // would trip the Tier-2 clauseLikelyMatches backstop this test
+          // isn't exercising (see the dedicated mismatch test below).
+          return JSON.stringify({ clauses: ['the Show secret message button is present', 'the secret message text is shown'] })
+        }
+        stepTurn++
+        // Only a fresh assertion for clause 1 (the secret message) before
+        // the first done attempt — clause 0 (the button) is never touched.
+        if (stepTurn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        if (stepTurn === 2)
+          return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'agentic testing works'), reason: 'confirm revealed', clauseIndex: 1 })
+        if (stepTurn === 3) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, one clause is enough' })
+        // Only reached if turn 3 was correctly rejected: a real assertion
+        // for the still-missing clause 0, satisfying coverage this time.
+        if (stepTurn === 4)
+          return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Show secret message'), reason: 'confirm the button is there', clauseIndex: 0 })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both clauses confirmed now' })
       },
     }
 
@@ -1012,7 +1035,135 @@ test('runAgent requires a fresh assertion for EACH confirm-clause in a compound 
     })
 
     assert.equal(run.outcome, 'goal-reached')
-    assert.equal(turn, 5, 'the turn-2 done attempt (only 1 of 2 required confirmations) must have been rejected, forcing a real second assertion')
+    assert.equal(stepTurn, 5, 'the turn-3 done attempt (only clause 1 of 2 verified) must have been rejected, forcing a real assertion for the still-missing clause 0')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent does not credit an assertion toward a clause it has no real textual relationship to, even when the model self-declares that clauseIndex', async (t) => {
+  // Tier-2 mechanical backstop (clauseLikelyMatches, planner.ts) — the
+  // model's own self-declared clauseIndex is never trusted blindly, same
+  // "don't trust self-report alone" lesson the assert_page_text tautology
+  // guard already established one level up. Without this backstop, a
+  // model could clear per-clause coverage by asserting anything at all and
+  // just claiming whichever clauseIndex it still needs credit for.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let stepTurn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"clauses"')) {
+          return JSON.stringify({ clauses: ['the Show secret message button is present', 'the Greet me button is visible'] })
+        }
+        stepTurn++
+        // A real, successful assertion about the reveal button — but
+        // falsely self-declared as satisfying clause 1 (the greeting),
+        // which it has no textual relationship to at all. Must not be
+        // credited toward EITHER clause: not clause 1 (textual mismatch)
+        // and not clause 0 either (that's not what it declared).
+        if (stepTurn === 1)
+          return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Show secret message'), reason: 'confirm the button is there', clauseIndex: 1 })
+        if (stepTurn === 2) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'clause 1 done, trust me' })
+        // Only reached if turn 2 was correctly rejected: a genuinely
+        // matching assertion for clause 1, then the still-unsatisfied
+        // clause 0 (the mismatched turn-1 assertion never counted toward
+        // it either).
+        if (stepTurn === 3) return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Greet me'), reason: 'confirm the greeting button is there', clauseIndex: 1 })
+        if (stepTurn === 4) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'clause 1 for real now, clause 0 still trust me' })
+        if (stepTurn === 5)
+          return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Show secret message'), reason: 'confirm the button is there', clauseIndex: 0 })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both clauses genuinely confirmed now' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'confirm the reveal button is present, and confirm the greeting message is shown',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(
+      stepTurn,
+      6,
+      'the mismatched clauseIndex:1 claim on the button assertion must not have been credited toward either clause, forcing real, matching assertions for both'
+    )
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with useStructuredPlan refuses to fast-path a planned assert_visible with no usable clauseIndex once clause tracking is active', async (t) => {
+  // The plan fast-path's own "exactly one candidate or refuse" discipline,
+  // applied to clause coverage too — a plan-predicted assert_visible with
+  // a missing/out-of-range clauseIndex would otherwise execute a real
+  // assertion that can never count toward any clause, silently identical
+  // to the model quietly skipping a milestone it was supposed to verify.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let liveDecisionCalls = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"clauses"')) {
+          return JSON.stringify({ clauses: ['the Show secret message button is present', 'the secret message text is shown'] })
+        }
+        if (prompt.includes('"steps"')) {
+          // A well-formed plan, but the assert_visible step omits
+          // clauseIndex entirely — must not be allowed to fast-path, even
+          // though it would otherwise resolve unambiguously.
+          return JSON.stringify({
+            steps: [
+              { action: 'assert_visible', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'confirm the button is there' },
+              { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+              { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed', clauseIndex: 1 },
+              { action: 'done', outcome: 'goal-reached', reason: 'confirmed' },
+            ],
+          })
+        }
+        liveDecisionCalls++
+        // Reached only if the first plan step correctly refused to
+        // fast-path — a real live decision must supply the clauseIndex
+        // instead, satisfying clause 0.
+        return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Show secret message'), reason: 'confirm the button is there', clauseIndex: 0 })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'confirm the reveal button is present, then click it, and confirm the secret message appears',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(liveDecisionCalls >= 1, 'expected the clause-0 assertion to fall back to a real live decision instead of fast-pathing')
+    // The remaining 3 plan steps (click, the clause-1 assertion, done) all
+    // carry a usable clauseIndex or need none at all, so they fast-path
+    // normally — only the clauseIndex-less step is forced live.
+    assert.equal(run.planStats?.fastPathedSteps, 3, 'expected exactly the 3 clause-safe plan steps to fast-path, and only the clauseIndex-less one to fall back live')
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })

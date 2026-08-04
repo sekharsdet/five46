@@ -58,7 +58,8 @@ const ACTION_SCHEMA_EXAMPLE = `{"action":"request","method":"POST","url":"/users
  * assertion-count requirement up front, rather than only rejecting a
  * disallowed/premature attempt after the fact — more turn/token-efficient
  * than only discovering either after a rejection. */
-export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], validVarNames: ReadonlySet<string>, safety: SafetyMode): string {
+export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], validVarNames: ReadonlySet<string>, safety: SafetyMode, clauses?: string[]): string {
+  const clauseTrackingActive = !!clauses && clauses.length > 1
   // Unconditional — not gated on the goal's own wording containing
   // confirm/verify/etc. language. Mirrors planner.ts's buildActionPrompt
   // exactly (added at the same time, for the same live-found reason — see
@@ -66,11 +67,21 @@ export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], v
   // many successful assert_status/assert_json_path_exists/
   // assert_json_path_equals actions before accepting goal-reached,
   // regardless of whether the goal text says "confirm"/"verify" at all.
+  //
+  // When `clauseTrackingActive` (mirrors planner.ts's buildActionPrompt's
+  // identical switch exactly), this switches from a total count to
+  // per-clause coverage — see DEVELOPMENT.md's gap #3.
   const requiredAssertionCount = Math.max(1, countConfirmationClauses(goal))
-  const confirmationNote = [
-    ``,
-    `You must perform at least ${requiredAssertionCount} successful assert_status, assert_json_path_exists, or assert_json_path_equals action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
-  ]
+  const confirmationNote = clauseTrackingActive
+    ? [
+        ``,
+        `This goal has ${clauses!.length} distinct things to confirm, listed below with their 0-based index. You must get a successful assert_status, assert_json_path_exists, or assert_json_path_equals for EACH one before you're allowed to declare "done" with outcome "goal-reached" — one clause's assertion does not count toward another; each needs its own real, matching check. When performing an assertion meant to satisfy one of these, include "clauseIndex": <its index> in that action's JSON. Declaring done with any clause unverified, or asserting something unrelated to the clause index you claim, will be rejected.`,
+        ...clauses!.map((c, i) => `  ${i}. ${c}`),
+      ]
+    : [
+        ``,
+        `You must perform at least ${requiredAssertionCount} successful assert_status, assert_json_path_exists, or assert_json_path_equals action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
+      ]
   // API-engine mirror of planner.ts's identical guard — see its own doc
   // comment for the live-found reasoning (the browser-engine version of
   // this exact gap: a persistent, always-true page element satisfying the
@@ -94,6 +105,7 @@ export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], v
   // content (opener, goal, describeSafetyMode, confirmationNote) first,
   // per-turn-dynamic content (varsNote, history) last, with a short closing
   // reminder to recover the "recency effect" the reordering trades away.
+  const clauseIndexHint = clauseTrackingActive ? `,"clauseIndex":<0-based index of the clause above this satisfies>` : ''
   return [
     `You are an API testing agent driving real HTTP requests toward one goal, one request/check at a time.`,
     ``,
@@ -105,9 +117,9 @@ export function buildApiActionPrompt(goal: string, history: ApiHistoryEntry[], v
     ``,
     `Respond with exactly one JSON object describing the next single action to take, one of:`,
     `- {"action":"request","method":"<GET|HEAD|OPTIONS|POST|PUT|PATCH|DELETE>","url":"<url>","headers":{...},"body":"<text>","saveAs":{"name":"<var>","path":"<json.path>"},"reason":"<why>"} ("headers"/"body"/"saveAs" are all optional)`,
-    `- {"action":"assert_status","expected":<number>,"reason":"<why>"}`,
-    `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"}`,
-    `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"}`,
+    `- {"action":"assert_status","expected":<number>,"reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"${clauseIndexHint}}`,
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely does not exist in any response seen so far, and no further request implied by the goal is likely to surface it — never guess a field/path name that looks plausible instead of checking what is actually there)`,
     ``,
     `Example: ${ACTION_SCHEMA_EXAMPLE}`,
@@ -124,6 +136,16 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0
 }
 
+/** Mirrors `planner.ts`'s identical `clauseIndexField` exactly (see its own
+ * doc comment) — duplicated rather than imported, matching this file's
+ * existing "each engine's parse layer is fully independent" convention
+ * (this file already duplicates `isNonEmptyString` itself rather than
+ * importing planner.ts's copy). Never an explicit `clauseIndex: undefined`,
+ * which would break an exact-shape `assert.deepStrictEqual` test. */
+function clauseIndexField(v: unknown): { clauseIndex: number } | Record<string, never> {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? { clauseIndex: v } : {}
+}
+
 const API_PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"request","method":"POST","url":"/users","body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user"},{"action":"request","method":"GET","url":"/users/{{userId}}","reason":"fetch it back"},{"action":"assert_json_path_equals","path":"name","expected":"Ada","reason":"confirm the name matches"},{"action":"done","outcome":"goal-reached","reason":"confirmed"}]}`
 
 /** Builds the upfront "plan the whole goal" prompt for the API engine —
@@ -131,20 +153,36 @@ const API_PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"request","method":"POST","
  * uses for the browser engine, made once before the main loop, only when
  * `RunApiTestOptions.useStructuredPlan` is set (see `apiRunner.ts`). No
  * `PageOutline`-equivalent input is needed: unlike a DOM element, a planned
- * request's `url`/`method` has no structural ambiguity to predict around. */
-export function buildApiPlanPrompt(goal: string, safety: SafetyMode): string {
+ * request's `url`/`method` has no structural ambiguity to predict around.
+ *
+ * `clauses`, when passed (only ever 2+ entries — mirrors
+ * `buildApiActionPrompt`'s identical gate), asks the plan itself to predict
+ * each assertion step's `clauseIndex` upfront — necessary since the fast
+ * path never calls this file's per-step schema at all; see `apiRunner.ts`'s
+ * fast-path clauseIndex refusal rule. */
+export function buildApiPlanPrompt(goal: string, safety: SafetyMode, clauses?: string[]): string {
+  const clauseNote =
+    clauses && clauses.length > 1
+      ? [
+          ``,
+          `This goal has ${clauses.length} distinct things to confirm, listed below with their 0-based index. Every assert_status/assert_json_path_exists/assert_json_path_equals step in your plan must include "clauseIndex": <the index of the clause it's meant to satisfy>, and the plan must cover all of them before its final "done" step.`,
+          ...clauses.map((c, i) => `  ${i}. ${c}`),
+        ]
+      : []
+  const clauseIndexHint = clauses && clauses.length > 1 ? `,"clauseIndex":<0-based index of the clause above this satisfies>` : ''
   return [
     `You are an API testing agent. Before making any requests, plan out the whole sequence of steps needed to accomplish this goal.`,
     ``,
     `Goal: ${goal}`,
+    ...clauseNote,
     ``,
     describeSafetyMode(safety),
     ``,
     `Respond with exactly one JSON object: {"steps": [...]}, where each step is one of:`,
     `- {"action":"request","method":"<GET|HEAD|OPTIONS|POST|PUT|PATCH|DELETE>","url":"<url>","headers":{...},"body":"<text>","saveAs":{"name":"<var>","path":"<json.path>"},"reason":"<why>"}`,
-    `- {"action":"assert_status","expected":<number>,"reason":"<why>"}`,
-    `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"}`,
-    `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"}`,
+    `- {"action":"assert_status","expected":<number>,"reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_json_path_exists","path":"<json.path>","reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_json_path_equals","path":"<json.path>","expected":"<text>","reason":"<why>"${clauseIndexHint}}`,
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (a plan is made BEFORE any request has actually been sent — you have no real response yet to judge "unreachable" against, only your own assumptions about how this API probably behaves. Only plan a "goal-unreachable" done step here if the goal itself is genuinely impossible to express as a sequence of requests (e.g. it asks for an operation no reasonable API of this kind would expose at all). If you are just unsure whether the API will actually behave as expected — including a well-known public API you assume you already know — plan the real requests anyway; a live decision later, made against real responses, is what should determine reachability, not a guess made now)`,
     ``,
     `A later step can reference a value an earlier step saved via "saveAs" as {{name}} in its own url/headers/body — plan the chain in order. Keep the plan as short as the goal genuinely requires, and end it with a "done" step.`,
@@ -185,11 +223,13 @@ function parsePlannedApiStep(raw: unknown): ApiAction | undefined {
       return { action: 'request', method, url: obj.url, headers, body, saveAs, reason }
     }
     case 'assert_status':
-      return typeof obj.expected === 'number' ? { action: 'assert_status', expected: obj.expected, reason } : undefined
+      return typeof obj.expected === 'number' ? { action: 'assert_status', expected: obj.expected, reason, ...clauseIndexField(obj.clauseIndex) } : undefined
     case 'assert_json_path_exists':
-      return isNonEmptyString(obj.path) ? { action: 'assert_json_path_exists', path: obj.path, reason } : undefined
+      return isNonEmptyString(obj.path) ? { action: 'assert_json_path_exists', path: obj.path, reason, ...clauseIndexField(obj.clauseIndex) } : undefined
     case 'assert_json_path_equals':
-      return isNonEmptyString(obj.path) && isNonEmptyString(obj.expected) ? { action: 'assert_json_path_equals', path: obj.path, expected: obj.expected, reason } : undefined
+      return isNonEmptyString(obj.path) && isNonEmptyString(obj.expected)
+        ? { action: 'assert_json_path_equals', path: obj.path, expected: obj.expected, reason, ...clauseIndexField(obj.clauseIndex) }
+        : undefined
     case 'done': {
       const outcome = obj.outcome === 'goal-reached' || obj.outcome === 'goal-unreachable' ? obj.outcome : undefined
       return outcome ? { action: 'done', outcome, reason } : undefined
@@ -354,16 +394,16 @@ export function parseApiAction(raw: string, validVarNames: ReadonlySet<string>, 
     }
     case 'assert_status': {
       if (typeof obj.expected !== 'number') return { ok: false, error: '"expected" must be a number for assert_status', raw, recoverable: false }
-      return { ok: true, action: { action: 'assert_status', expected: obj.expected, reason } }
+      return { ok: true, action: { action: 'assert_status', expected: obj.expected, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
     case 'assert_json_path_exists': {
       if (!isNonEmptyString(obj.path)) return { ok: false, error: '"path" is missing for assert_json_path_exists', raw, recoverable: false }
-      return { ok: true, action: { action: 'assert_json_path_exists', path: obj.path, reason } }
+      return { ok: true, action: { action: 'assert_json_path_exists', path: obj.path, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
     case 'assert_json_path_equals': {
       if (!isNonEmptyString(obj.path)) return { ok: false, error: '"path" is missing for assert_json_path_equals', raw, recoverable: false }
       if (!isNonEmptyString(obj.expected)) return { ok: false, error: '"expected" is missing for assert_json_path_equals', raw, recoverable: false }
-      return { ok: true, action: { action: 'assert_json_path_equals', path: obj.path, expected: obj.expected, reason } }
+      return { ok: true, action: { action: 'assert_json_path_equals', path: obj.path, expected: obj.expected, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
     case 'done': {
       const outcome = obj.outcome === 'goal-reached' || obj.outcome === 'goal-unreachable' ? obj.outcome : undefined

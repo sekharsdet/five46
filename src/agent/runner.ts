@@ -1,7 +1,8 @@
 import type { LlmProvider } from '../llm/types'
 import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders } from './browser'
 import type { LoginCredentials, StorageState } from './browser'
-import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, resolvePlannedTarget } from './planner'
+import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, resolvePlannedTarget, clauseLikelyMatches } from './planner'
+import { splitConfirmationClauses } from './clauseSplitter'
 import type { AgentAction, AgentPlan, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId, ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
@@ -109,6 +110,42 @@ function actionSignature(action: AgentAction): string {
   }
 }
 
+/** The text an assertion's self-declared `clauseIndex` is checked against
+ * via `clauseLikelyMatches` (planner.ts) — the target element's accessible
+ * name for `assert_visible` (no expected value to compare), name +
+ * expected text for `assert_text`, and just the expected text for
+ * `assert_page_text` (no ref/name at all). Returns `''` for any other
+ * action, which `clauseLikelyMatches` already treats as inconclusive
+ * (passes) since it has nothing to compare — this function is only ever
+ * called on an already-confirmed assertion action, so that case never
+ * actually arises in practice. */
+/** Narrows `AgentAction`'s union before reading `clauseIndex` — TypeScript
+ * can't narrow through a separately-computed `isAssertion` boolean, only a
+ * direct `action.action === '...'` check in the same expression, so this
+ * exists purely to keep the call site (a dense, already-nested block)
+ * readable rather than repeating a three-way `action.action === ...` check
+ * inline. Returns `undefined` for any non-assertion action, which the
+ * caller already only calls this for real assertions in practice. */
+function getClauseIndex(action: AgentAction): number | undefined {
+  if (action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text') return action.clauseIndex
+  return undefined
+}
+
+function clauseComparisonText(action: AgentAction, outline: PageOutline): string {
+  switch (action.action) {
+    case 'assert_visible':
+      return outline.elements.find((el) => el.ref === action.ref)?.name ?? ''
+    case 'assert_text': {
+      const name = outline.elements.find((el) => el.ref === action.ref)?.name ?? ''
+      return `${name} ${action.expectedText}`
+    }
+    case 'assert_page_text':
+      return action.expectedText
+    default:
+      return ''
+  }
+}
+
 /** Orchestrates the full agentic loop: launch the browser (before any paid
  * LLM call, so a missing-setup environment fails fast and cheap — see
  * `AgentBrowserUnavailableError`), then repeatedly snapshot the page, ask
@@ -196,6 +233,29 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       .innerText()
       .catch(() => '')
 
+    // Only ever attempted when the goal already shows 2+ confirm-language
+    // occurrences (`countConfirmationClauses`) — keeps this feature at zero
+    // extra LLM calls for the overwhelming majority of goals (single/zero-
+    // clause), which keep today's unchanged scalar `requiredConfirmationCount`
+    // gate below untouched. Never fatal: any failure (network, malformed
+    // response) degrades `clauses` to `[options.goal]`, which
+    // `clauseTrackingActive` then treats identically to "no compound
+    // structure worth tracking," same posture as `parsePlan`'s own
+    // never-fatal degrade. Closes DEVELOPMENT.md's documented gap #3: a
+    // scalar count of successful assertions couldn't tell "verified
+    // milestone A twice" apart from "verified A once, B once" — see
+    // `splitConfirmationClauses`/`clauseLikelyMatches` (planner.ts) for the
+    // rest of the mechanism.
+    let clauses: string[] = [options.goal]
+    if (countConfirmationClauses(options.goal) >= 2) {
+      try {
+        clauses = (await splitConfirmationClauses(options.goal, options.provider, options.apiKey)).clauses
+      } catch {
+        // Never fatal — matches splitConfirmationClauses' own posture.
+      }
+    }
+    const clauseTrackingActive = clauses.length > 1
+
     // One extra, independent LLM call — the same second-`complete()`-call
     // pattern `rootCause.ts` already uses, not a change to `LlmProvider`
     // itself. A malformed/truncated plan response, or a thrown error making
@@ -208,7 +268,11 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     if (options.useStructuredPlan) {
       try {
         const initialOutline = await snapshot(browser.page, undefined, true)
-        const planRaw = await options.provider.complete(buildPlanPrompt(options.goal, initialOutline), options.apiKey, { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS })
+        const planRaw = await options.provider.complete(
+          buildPlanPrompt(options.goal, initialOutline, clauseTrackingActive ? clauses : undefined),
+          options.apiKey,
+          { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS }
+        )
         const parsedPlan = parsePlan(planRaw)
         if (parsedPlan.ok) plan = parsedPlan.plan
       } catch {
@@ -243,6 +307,20 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     // countConfirmationClauses' own doc comment for the real bug this
     // closes (a compound goal skipping an earlier confirm-clause entirely).
     let succeededAssertionCount = 0
+    // Only consulted when `clauseTrackingActive` — the per-clause
+    // replacement for `succeededAssertionCount`'s scalar total, closing
+    // DEVELOPMENT.md's documented gap #3 (a count couldn't tell "verified
+    // milestone A twice" apart from "verified A once, B once"). Unlike
+    // `hasSucceededAssertion` below, this deliberately does NOT reset on a
+    // later click/fill: a `Set` keyed by clause index has no staleness
+    // ambiguity the way a bare scalar count does — clause 0 being satisfied
+    // says nothing about clause 1, so a later state change can't silently
+    // invalidate it the way it can a scalar "some assertion succeeded
+    // recently enough" flag. If a later action genuinely invalidates an
+    // earlier clause's evidence, that's only expressible by the goal naming
+    // it as its own distinct clause, same limit `clauseSplitter.ts` itself
+    // already has (it only identifies what the goal already describes).
+    const satisfiedClauses = new Set<number>()
     // Catches a real gap the signature-repeat guard above misses: a model
     // that keeps re-verifying the same still-unchanged element by
     // alternating assertion types (assert_visible, assert_text,
@@ -346,14 +424,29 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
               history.push({ action: attempted, result: 'failed', detail: 'blocked: destructive-looking click' })
               continue
             }
-            action =
-              plannedStep.action === 'click'
-                ? { action: 'click', ref: candidate.ref, reason: plannedStep.reason }
-                : plannedStep.action === 'fill'
-                  ? { action: 'fill', ref: candidate.ref, value: plannedStep.value, submit: plannedStep.submit, reason: plannedStep.reason }
-                  : { action: 'assert_visible', ref: candidate.ref, reason: plannedStep.reason }
-            outline = freshOutline
-            fastPathedSteps++
+            // When clause tracking is active, an assert_visible plan step
+            // with no usable clauseIndex (missing, or out of range for
+            // this run's actual clause list — e.g. a plan made before
+            // splitting settled on a different count) refuses to fast-path,
+            // matching "exactly one candidate or refuse" applied to clause
+            // coverage too, not just structural ambiguity: fast-pathing it
+            // anyway would silently execute a real assertion that can never
+            // count toward any clause, no different from the model quietly
+            // skipping a milestone it was supposed to verify.
+            const clauseIndexUsable =
+              plannedStep.action !== 'assert_visible' ||
+              !clauseTrackingActive ||
+              (plannedStep.clauseIndex !== undefined && plannedStep.clauseIndex >= 0 && plannedStep.clauseIndex < clauses.length)
+            if (clauseIndexUsable) {
+              action =
+                plannedStep.action === 'click'
+                  ? { action: 'click', ref: candidate.ref, reason: plannedStep.reason }
+                  : plannedStep.action === 'fill'
+                    ? { action: 'fill', ref: candidate.ref, value: plannedStep.value, submit: plannedStep.submit, reason: plannedStep.reason }
+                    : { action: 'assert_visible', ref: candidate.ref, reason: plannedStep.reason, ...(plannedStep.clauseIndex !== undefined ? { clauseIndex: plannedStep.clauseIndex } : {}) }
+              outline = freshOutline
+              fastPathedSteps++
+            }
           }
           // Zero or multiple candidates: refuse to guess, same as
           // self-healing — falls through to the live decision below.
@@ -372,7 +465,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         // See snapshot()'s doc comment for why the two must not share this.
         outline = await snapshot(browser.page, undefined, true)
         const planStepNote = plannedStep && plan ? { index: planStepIndex - 1, total: plan.steps.length, step: plannedStep } : undefined
-        const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes, planStepNote)
+        const prompt = buildActionPrompt(options.goal, history, outline, credentialsAvailable, options.allowDeletes, planStepNote, clauseTrackingActive ? clauses : undefined)
         let raw: string
         try {
           raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: ACTION_MAX_OUTPUT_TOKENS, fastPath: options.useFastSteps })
@@ -448,13 +541,16 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
 
       if (action.action === 'done') {
         lastActionMadeProgress = false
-        const unverifiedSuccess = action.outcome === 'goal-reached' && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
+        const unverifiedSuccess =
+          action.outcome === 'goal-reached' &&
+          (clauseTrackingActive ? satisfiedClauses.size < clauses.length : !hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
         if (unverifiedSuccess) {
           history.push({
             action,
             result: 'failed',
-            detail:
-              succeededAssertionCount < requiredConfirmationCount
+            detail: clauseTrackingActive
+              ? `rejected: this goal asks to confirm ${clauses.length} distinct thing(s), but only ${satisfiedClauses.size} of them have been verified so far — perform the rest before declaring done`
+              : succeededAssertionCount < requiredConfirmationCount
                 ? `rejected: this goal asks to confirm/verify ${requiredConfirmationCount} thing(s), but only ${succeededAssertionCount} assertion(s) have succeeded so far — perform another before declaring done`
                 : 'rejected: this goal asks to confirm/verify something, but no assert_visible/assert_text has succeeded yet — perform one before declaring done',
           })
@@ -546,8 +642,27 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
 
       const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text'
       if (isAssertion && result.ok && !isTautologicalPageText) {
-        hasSucceededAssertion = true
-        succeededAssertionCount++
+        if (clauseTrackingActive) {
+          // Never trusted blindly — `action.clauseIndex` is the model's own
+          // self-declared claim (see `AgentAction`'s doc comment). Requires
+          // both a valid in-range index AND `clauseLikelyMatches`'s
+          // mechanical keyword-overlap backstop before crediting it, the
+          // same "don't trust self-report alone" lesson `isTautologicalPageText`
+          // above already applies to a structurally identical problem one
+          // level up (a whole compound goal vs. one specific clause of it).
+          const declaredIndex = getClauseIndex(action)
+          if (
+            declaredIndex !== undefined &&
+            declaredIndex >= 0 &&
+            declaredIndex < clauses.length &&
+            clauseLikelyMatches(clauses[declaredIndex], clauseComparisonText(action, outline))
+          ) {
+            satisfiedClauses.add(declaredIndex)
+          }
+        } else {
+          hasSucceededAssertion = true
+          succeededAssertionCount++
+        }
       }
       // A click/fill after the last succeeded assertion means the page may
       // have changed since — that assertion no longer necessarily reflects

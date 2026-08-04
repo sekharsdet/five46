@@ -23,6 +23,18 @@ export const HARD_MAX_REPEAT = 10
  * scenario is a whole extra LLM-driven run), disclosed explicitly when it clamps. */
 export const HARD_MAX_SCENARIOS = 10
 
+/** Hard cap on the number of confirm-clauses `clauseSplitter.ts` will split a
+ * single goal into, regardless of what the split-LLM-call returns —
+ * conceptually distinct from `HARD_MAX_SCENARIOS` (a whole extra run per
+ * scenario there; here it's just bookkeeping within one already-running
+ * run, so the cost/risk profile doesn't actually match `--repeat`/`--story`'s
+ * own reasoning closely enough to reuse the same constant), but the same
+ * "bound the worst case, disclose when clamped" posture. A real goal
+ * realistically names at most a handful of distinct milestones; a response
+ * naming far more than that is far more likely a malformed/hallucinated
+ * split than a genuinely enormous goal. */
+export const HARD_MAX_CLAUSES = 10
+
 /** Bounded-concurrency defaults for running a `--story`'s split-out scenarios.
  * `DEFAULT_CONCURRENCY` (API engine) is faster in aggregate than `--repeat`'s
  * strict sequencing without risking a live-LLM rate-limit storm; several

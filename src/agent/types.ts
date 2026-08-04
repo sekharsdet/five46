@@ -48,12 +48,21 @@ export type RunOutcome = 'goal-reached' | 'goal-unreachable' | 'stuck-repeating'
  * is responsible for validating this before execution (see
  * `parseAgentAction`). `fill`'s optional `submit` presses Enter afterward,
  * covering the extremely common "type into a field, hit enter" flow
- * without a whole separate action type. */
+ * without a whole separate action type. An assertion's optional
+ * `clauseIndex` is the model's own self-declared claim about which of the
+ * goal's confirm-clauses (see `clauseSplitter.ts`) this assertion is
+ * meant to satisfy — only ever present/consulted when the run actually
+ * split the goal into more than one clause (`runner.ts`/`apiRunner.ts`);
+ * absent or out-of-range simply means the step still executes for real
+ * but doesn't count toward per-clause coverage. Never trusted blindly —
+ * `planner.ts`'s `clauseLikelyMatches` is a mechanical backstop against a
+ * clearly mismatched claim, the same "never trust self-report alone"
+ * posture the `baselineBodyText` tautology guard already established. */
 export type AgentAction =
   | { action: 'click'; ref: string; reason: string }
   | { action: 'fill'; ref: string; value: string; submit?: boolean; reason: string }
-  | { action: 'assert_visible'; ref: string; reason: string }
-  | { action: 'assert_text'; ref: string; expectedText: string; reason: string }
+  | { action: 'assert_visible'; ref: string; reason: string; clauseIndex?: number }
+  | { action: 'assert_text'; ref: string; expectedText: string; reason: string; clauseIndex?: number }
   /** Checks the *whole rendered page*'s visible text for a substring — no
    * `ref`, unlike every other assertion. Added alongside `wait` after the
    * same real, live gap: `snapshot()`'s outline only ever includes
@@ -68,7 +77,7 @@ export type AgentAction =
    * `body` does in idiomatic Playwright, rather than requiring the target
    * to be one of the interactive elements the outline was built to list
    * for *acting on*, not for *reading*. */
-  | { action: 'assert_page_text'; expectedText: string; reason: string }
+  | { action: 'assert_page_text'; expectedText: string; reason: string; clauseIndex?: number }
   /** Scrolls the whole page (`window`) by one viewport height — never a
    * specific nested scroll container (a modal's internal `overflow:auto`
    * region, say). No `ref`: unlike every other action, this doesn't target
@@ -110,9 +119,9 @@ export interface PlannedStepTarget {
 export type PlannedStep =
   | { action: 'click'; target: PlannedStepTarget; reason: string }
   | { action: 'fill'; target: PlannedStepTarget; value: string; submit?: boolean; reason: string }
-  | { action: 'assert_visible'; target: PlannedStepTarget; reason: string }
-  | { action: 'assert_text'; target: PlannedStepTarget; expectedText: string; reason: string }
-  | { action: 'assert_page_text'; expectedText: string; reason: string }
+  | { action: 'assert_visible'; target: PlannedStepTarget; reason: string; clauseIndex?: number }
+  | { action: 'assert_text'; target: PlannedStepTarget; expectedText: string; reason: string; clauseIndex?: number }
+  | { action: 'assert_page_text'; expectedText: string; reason: string; clauseIndex?: number }
   | { action: 'scroll'; direction: 'up' | 'down'; reason: string }
   | { action: 'wait'; reason: string }
   | { action: 'done'; outcome: 'goal-reached' | 'goal-unreachable'; reason: string }

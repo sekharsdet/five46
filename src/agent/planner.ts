@@ -139,6 +139,69 @@ export function isDestructiveClickTarget(name: string): boolean {
   return DESTRUCTIVE_CLICK_PHRASES.some((phrase) => lower.includes(phrase))
 }
 
+const CLAUSE_MATCH_STOPWORDS = new Set([
+  'confirm',
+  'verify',
+  'ensure',
+  'check',
+  'that',
+  'the',
+  'a',
+  'an',
+  'is',
+  'are',
+  'was',
+  'were',
+  'shown',
+  'visible',
+  'displayed',
+  'appears',
+  'and',
+  'with',
+  'for',
+  'this',
+  'has',
+  'have',
+  'least',
+])
+
+function significantTokens(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length > 3 && !CLAUSE_MATCH_STOPWORDS.has(token))
+  )
+}
+
+/** A mechanical, imperfect backstop against a clearly mismatched self-
+ * declared `clauseIndex` (see `AgentAction`'s own doc comment) — same
+ * "documented, honest, imperfect proxy" class as `countConfirmationClauses`/
+ * `isDestructiveClickTarget`, keyword-overlap only, never real NLP. Exists
+ * because this codebase has already twice found that trusting the model's
+ * own wording/self-restraint alone doesn't reliably work for an adjacent
+ * problem (the `assertionQualityNote` prompt-only attempt above, and
+ * `parsePlan`'s immediate-`done` rejection both needed a code-level fix
+ * after a prompt-only attempt was live-tested and failed) — the same
+ * lesson applies here: an assertion claiming to satisfy a clause it has no
+ * real textual relationship to should not get silent credit for it.
+ * Deliberately permissive, not strict: this is a backstop against a CLEAR
+ * mismatch, not a similarity requirement — too little text to compare on
+ * either side (e.g. both boil down to zero significant tokens after
+ * stripping) is treated as inconclusive and passes, since a false
+ * rejection here would incorrectly block a genuinely correct assertion
+ * from ever satisfying its clause, which is worse than the rare case this
+ * backstop misses a genuine mismatch. */
+export function clauseLikelyMatches(clauseText: string, assertionText: string): boolean {
+  const clauseTokens = significantTokens(clauseText)
+  const assertionTokens = significantTokens(assertionText)
+  if (clauseTokens.size === 0 || assertionTokens.size === 0) return true
+  for (const token of clauseTokens) {
+    if (assertionTokens.has(token)) return true
+  }
+  return false
+}
+
 /** Builds the "what's the next single action" prompt — the only shape the
  * agentic loop can take given `LlmProvider.complete()` is single string
  * in/out with no tool-calling or JSON-mode hook (see the plan's reasoning).
@@ -181,7 +244,15 @@ export function buildActionPrompt(
    * to be, so the model has that context without being forced to follow
    * it: the plan is a scaffold, not a rigid contract (see `runner.ts`'s
    * "plan exhaustion degrades to the ordinary loop" reasoning). */
-  planStepNote?: { index: number; total: number; step: PlannedStep }
+  planStepNote?: { index: number; total: number; step: PlannedStep },
+  /** Only ever passed non-empty when `runner.ts`/`apiRunner.ts` already
+   * split the goal into 2+ genuinely distinct confirm-worthy milestones
+   * (`clauseSplitter.ts`, gated behind `countConfirmationClauses(goal) >= 2`
+   * — see its own doc comment for why this stays a zero-extra-call no-op
+   * for the overwhelming majority of goals). When present, switches the
+   * confirmation requirement from a total *count* to per-clause coverage —
+   * see `confirmationNote` below. */
+  clauses?: string[]
 ): string {
   const planNote = planStepNote
     ? [
@@ -190,6 +261,7 @@ export function buildActionPrompt(
         `The plan's prediction for this step didn't resolve cleanly against the real page, so decide the actual next action yourself from the real elements below — you are not required to follow the plan exactly.`,
       ]
     : []
+  const clauseTrackingActive = !!clauses && clauses.length > 1
   // Unconditional — not gated on the goal's own wording containing
   // confirm/verify/etc. language. Disclosed up front for the same reason
   // as deleteNote below: telling the model before it wastes a turn is
@@ -197,11 +269,28 @@ export function buildActionPrompt(
   // countConfirmationClauses' own doc comment for the live evidence this
   // floor-of-1 default closes (a goal with zero confirm-language used to
   // get zero forced verification at all).
+  //
+  // When `clauseTrackingActive`, this note switches from a total *count*
+  // to per-clause *coverage* — closes issue #3 in DEVELOPMENT.md's
+  // documented gap list: a scalar count of 2 couldn't tell "confirm A,
+  // confirm A again" apart from "confirm A, confirm B," so a compound goal
+  // could reach goal-reached having verified only one of its named
+  // milestones. Each clause is listed with its 0-based index so the model
+  // can self-declare which one a given assertion is meant to satisfy —
+  // never trusted blindly (see `clauseLikelyMatches`'s own doc comment for
+  // the mechanical backstop `runner.ts`/`apiRunner.ts` apply against a
+  // clearly mismatched claim).
   const requiredAssertionCount = Math.max(1, countConfirmationClauses(goal))
-  const confirmationNote = [
-    ``,
-    `You must perform at least ${requiredAssertionCount} successful assert_visible, assert_text, or assert_page_text action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
-  ]
+  const confirmationNote = clauseTrackingActive
+    ? [
+        ``,
+        `This goal has ${clauses!.length} distinct things to confirm, listed below with their 0-based index. You must get a successful assert_visible, assert_text, or assert_page_text for EACH one before you're allowed to declare "done" with outcome "goal-reached" — one clause's assertion does not count toward another; each needs its own real, matching check. When performing an assertion meant to satisfy one of these, include "clauseIndex": <its index> in that action's JSON. Declaring done with any clause unverified, or asserting something unrelated to the clause index you claim, will be rejected.`,
+        ...clauses!.map((c, i) => `  ${i}. ${c}`),
+      ]
+    : [
+        ``,
+        `You must perform at least ${requiredAssertionCount} successful assert_visible, assert_text, or assert_page_text action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
+      ]
   // Generalizes the existing tautology guard (never re-assert the exact
   // element you just clicked/filled, in the assert_visible schema line
   // below) to the broader case a real live run against a production site
@@ -252,6 +341,11 @@ export function buildActionPrompt(
   // See DEVELOPMENT.md's "Reordering prompts for provider-native caching"
   // section for the full reasoning, including why this isn't a free lunch
   // for instruction-following (see the closing reminder line below).
+  // Deliberately conditional, not always present — an assertion schema
+  // line with a clauseIndex placeholder would be actively misleading noise
+  // on the overwhelming majority of runs where clause tracking never
+  // activates (see clauseTrackingActive above).
+  const clauseIndexHint = clauseTrackingActive ? `,"clauseIndex":<0-based index of the clause above this satisfies>` : ''
   return [
     `You are a web testing agent driving a real browser toward one goal, one action at a time.`,
     ``,
@@ -264,9 +358,9 @@ export function buildActionPrompt(
     `Respond with exactly one JSON object describing the next single action to take, one of:`,
     `- {"action":"click","ref":"<ref>","reason":"<why>"}`,
     `- {"action":"fill","ref":"<ref>","value":"<text>","submit":<true|false>,"reason":"<why>"}`,
-    `- {"action":"assert_visible","ref":"<ref>","reason":"<why>"} (never assert visibility of the exact element you just clicked or filled — it was already visible in order to be interactable, so this proves nothing changed; assert something that actually reflects the outcome instead)`,
-    `- {"action":"assert_text","ref":"<ref>","expectedText":"<text>","reason":"<why>"}`,
-    `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"} (checks the WHOLE page's visible text, not just one ref — use this when the text you need to confirm isn't in the elements list above at all, e.g. a plain heading or message with no interactive role; this is the only assertion that doesn't need a ref)`,
+    `- {"action":"assert_visible","ref":"<ref>","reason":"<why>"${clauseIndexHint}} (never assert visibility of the exact element you just clicked or filled — it was already visible in order to be interactable, so this proves nothing changed; assert something that actually reflects the outcome instead)`,
+    `- {"action":"assert_text","ref":"<ref>","expectedText":"<text>","reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"${clauseIndexHint}} (checks the WHOLE page's visible text, not just one ref — use this when the text you need to confirm isn't in the elements list above at all, e.g. a plain heading or message with no interactive role; this is the only assertion that doesn't need a ref)`,
     `- {"action":"scroll","direction":"up"|"down","reason":"<why>"} (scrolls the whole page by one viewport height — use this if what you need isn't in the list above)`,
     `- {"action":"wait","reason":"<why>"} (pauses briefly, then re-reads the page — use this if the page looks like it's still loading: a spinner, a skeleton, a "loading..." message, or right after an action that plausibly triggers something async. Do not use it more than twice in a row without trying something else in between; if the content still hasn't appeared after that, it's more likely genuinely not there)`,
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely is not in the elements list above, an assert_page_text check for it hasn't found it anywhere on the page either, scrolling will not reveal it, waiting for it to load hasn't revealed it either, and no unopened menu/dropdown/tab/accordion visible on the page is likely to reveal it either — try clicking one such element first if one plausibly exists; never guess by acting on or asserting against the closest-looking element instead)`,
@@ -295,6 +389,22 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0
 }
 
+/** Captures an assertion's optional self-declared `clauseIndex` as a
+ * spreadable `{ clauseIndex: number }` (or `{}` when absent/invalid) —
+ * never an explicit `{ clauseIndex: undefined }`, which would give the
+ * resulting object an own `clauseIndex` key even when unset, breaking every
+ * exact-shape `assert.deepStrictEqual` test elsewhere in this codebase that
+ * predates this field. A plain non-negative integer only; anything else
+ * (missing, fractional, negative, wrong type) is dropped. Deliberately
+ * permissive at this parse layer: an out-of-range index (e.g.
+ * `>= clauses.length`) is a loop-level concern the caller checks once it
+ * actually knows how many clauses exist (`runner.ts`/`apiRunner.ts`), not a
+ * parse-time rejection — the assertion itself is still a fully valid,
+ * executable step either way. */
+function clauseIndexField(v: unknown): { clauseIndex: number } | Record<string, never> {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? { clauseIndex: v } : {}
+}
+
 const PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"click","target":{"role":"link","nameContains":"Rooms"},"reason":"open the room listing"},{"action":"assert_visible","target":{"role":"status","nameContains":"price"},"reason":"confirm the price is shown"},{"action":"done","outcome":"goal-reached","reason":"price confirmed"}]}`
 
 /** Builds the upfront "plan the whole goal" prompt — a separate, one-time
@@ -307,12 +417,30 @@ const PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"click","target":{"role":"link"
  * `PageOutline`'s own doc comment). This is still just a second,
  * independent `LlmProvider.complete()` call, the same pattern
  * `rootCause.ts` already uses for a different reason — the interface
- * itself doesn't need to grow for this. */
-export function buildPlanPrompt(goal: string, initialOutline: PageOutline): string {
+ * itself doesn't need to grow for this.
+ *
+ * `clauses`, when passed (only ever 2+ entries — see `buildActionPrompt`'s
+ * identical `clauseTrackingActive` gate), asks the plan itself to predict
+ * each assertion step's `clauseIndex` upfront — necessary so `runner.ts`'s
+ * fast path (which never calls this file's per-step schema at all) still
+ * has a clauseIndex to check before fast-pathing a planned assertion; see
+ * `runner.ts`'s "refuse to fast-path a clause-tracked assertion with no
+ * clauseIndex" rule. */
+export function buildPlanPrompt(goal: string, initialOutline: PageOutline, clauses?: string[]): string {
+  const clauseNote =
+    clauses && clauses.length > 1
+      ? [
+          ``,
+          `This goal has ${clauses.length} distinct things to confirm, listed below with their 0-based index. Every assert_visible/assert_text/assert_page_text step in your plan must include "clauseIndex": <the index of the clause it's meant to satisfy>, and the plan must cover all of them before its final "done" step.`,
+          ...clauses.map((c, i) => `  ${i}. ${c}`),
+        ]
+      : []
+  const clauseIndexHint = clauses && clauses.length > 1 ? `,"clauseIndex":<0-based index of the clause above this satisfies>` : ''
   return [
     `You are a web testing agent. Before taking any actions, plan out the whole sequence of steps needed to accomplish this goal on a real browser.`,
     ``,
     `Goal: ${goal}`,
+    ...clauseNote,
     ``,
     `Elements currently visible on the page (the very first page only — later steps will likely land on pages you cannot see yet, so predict each one's likely role/name rather than requiring it to be in this list):`,
     serializeOutline(initialOutline),
@@ -320,9 +448,9 @@ export function buildPlanPrompt(goal: string, initialOutline: PageOutline): stri
     `Respond with exactly one JSON object: {"steps": [...]}, where each step is one of:`,
     `- {"action":"click","target":{"role":"<expected ARIA role, e.g. link/button/checkbox>","nameContains":"<expected substring of its accessible name>"},"reason":"<why>"}`,
     `- {"action":"fill","target":{...},"value":"<text>","submit":<true|false>,"reason":"<why>"}`,
-    `- {"action":"assert_visible","target":{...},"reason":"<why>"}`,
-    `- {"action":"assert_text","target":{...},"expectedText":"<text>","reason":"<why>"}`,
-    `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"} (checks the whole page's visible text, no target needed — use for plain text/headings with no interactive role)`,
+    `- {"action":"assert_visible","target":{...},"reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_text","target":{...},"expectedText":"<text>","reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"${clauseIndexHint}} (checks the whole page's visible text, no target needed — use for plain text/headings with no interactive role)`,
     `- {"action":"scroll","direction":"up"|"down","reason":"<why>"}`,
     `- {"action":"wait","reason":"<why>"} (pauses briefly for content that loads asynchronously — a spinner, a skeleton, a delayed page)`,
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (a plan is made BEFORE most of the page has even been seen — you have no real evidence yet to judge "unreachable" against, only your own assumptions about how this site probably works. Only plan a "goal-unreachable" done step here if the goal itself is genuinely impossible to express as a sequence of steps at all. If you are just unsure whether a later page will actually contain what the goal needs, plan the steps anyway; a live decision later, made against the real rendered page, is what should determine reachability, not a guess made now)`,
@@ -351,12 +479,12 @@ function parsePlannedStep(raw: unknown): PlannedStep | undefined {
       if (!isValidTarget(obj.target) || typeof obj.value !== 'string') return undefined
       return { action: 'fill', target: obj.target, value: obj.value, submit: obj.submit === true, reason }
     case 'assert_visible':
-      return isValidTarget(obj.target) ? { action: 'assert_visible', target: obj.target, reason } : undefined
+      return isValidTarget(obj.target) ? { action: 'assert_visible', target: obj.target, reason, ...clauseIndexField(obj.clauseIndex) } : undefined
     case 'assert_text':
       if (!isValidTarget(obj.target) || !isNonEmptyString(obj.expectedText)) return undefined
-      return { action: 'assert_text', target: obj.target, expectedText: obj.expectedText, reason }
+      return { action: 'assert_text', target: obj.target, expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) }
     case 'assert_page_text':
-      return isNonEmptyString(obj.expectedText) ? { action: 'assert_page_text', expectedText: obj.expectedText, reason } : undefined
+      return isNonEmptyString(obj.expectedText) ? { action: 'assert_page_text', expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } : undefined
     case 'scroll': {
       const direction = obj.direction === 'up' || obj.direction === 'down' ? obj.direction : undefined
       return direction ? { action: 'scroll', direction, reason } : undefined
@@ -551,7 +679,7 @@ export function parseAgentAction(
           attemptedAction: attempted,
         }
       }
-      return { ok: true, action: { action: 'assert_visible', ref, reason } }
+      return { ok: true, action: { action: 'assert_visible', ref, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
     case 'assert_text': {
       const ref = checkRef()
@@ -559,13 +687,13 @@ export function parseAgentAction(
       if (!isNonEmptyString(obj.expectedText)) {
         return { ok: false, error: '"expectedText" is missing for an assert_text action', raw }
       }
-      return { ok: true, action: { action: 'assert_text', ref, expectedText: obj.expectedText, reason } }
+      return { ok: true, action: { action: 'assert_text', ref, expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
     case 'assert_page_text': {
       if (!isNonEmptyString(obj.expectedText)) {
         return { ok: false, error: '"expectedText" is missing for an assert_page_text action', raw }
       }
-      return { ok: true, action: { action: 'assert_page_text', expectedText: obj.expectedText, reason } }
+      return { ok: true, action: { action: 'assert_page_text', expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
     case 'scroll': {
       const direction = obj.direction === 'up' || obj.direction === 'down' ? obj.direction : undefined

@@ -196,6 +196,11 @@ test('runApiTest requires a fresh assertion for EACH confirm-clause in a compoun
   // doc comment for the real, live-found bug this closes (a compound goal
   // skipping an earlier confirm-clause entirely, satisfied by one fresh
   // assertion covering only the last clause).
+  //
+  // Dispatches by prompt shape, not `scriptedProvider`'s blind ordered
+  // list — a 2+-confirm-clause goal now also triggers one upfront
+  // splitConfirmationClauses() call before the per-step loop starts, which
+  // a fixed-index script would silently answer with the wrong response.
   const server = await startApiTestServer()
   try {
     const create = await fetch(server.url + '/items', {
@@ -205,17 +210,34 @@ test('runApiTest requires a fresh assertion for EACH confirm-clause in a compoun
     })
     const { id } = (await create.json()) as { id: number }
 
-    const provider = scriptedProvider([
-      JSON.stringify({ action: 'request', method: 'GET', url: `${server.url}/items/${id}`, reason: 'read it' }),
-      // Only ONE fresh assertion before the first done attempt — the goal
-      // below asks for two.
-      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm it exists' }),
-      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, one check is enough' }),
-      // Only reached if the done attempt above was correctly rejected.
-      JSON.stringify({ action: 'request', method: 'PUT', url: `${server.url}/items/${id}`, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'renamed' }), reason: 'update it' }),
-      JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm the update succeeded' }),
-      JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both things confirmed now' }),
-    ])
+    let stepTurn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"clauses"')) {
+          return JSON.stringify({ clauses: ['the item exists', 'the update succeeded'] })
+        }
+        stepTurn++
+        // Only a fresh assertion for clause 1 (the update) before the
+        // first done attempt — clause 0 (existence) is never touched.
+        if (stepTurn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: `${server.url}/items/${id}`, reason: 'read it' })
+        if (stepTurn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm it exists', clauseIndex: 1 })
+        if (stepTurn === 3) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, one clause is enough' })
+        // Only reached if turn 3 was correctly rejected: a real request +
+        // assertion for the still-missing clause 0.
+        if (stepTurn === 4)
+          return JSON.stringify({
+            action: 'request',
+            method: 'PUT',
+            url: `${server.url}/items/${id}`,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'renamed' }),
+            reason: 'update it',
+          })
+        if (stepTurn === 5) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm the update succeeded', clauseIndex: 0 })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both clauses confirmed now' })
+      },
+    }
 
     const run = await runApiTest({
       baseUrl: server.url,
@@ -228,8 +250,8 @@ test('runApiTest requires a fresh assertion for EACH confirm-clause in a compoun
 
     assert.equal(run.outcome, 'goal-reached')
     // Real steps only (done is never pushed): GET, assert, PUT, assert = 4.
-    // If the first done attempt (only 1 of 2 required confirmations) had
-    // been wrongly accepted, the run would have ended after only 2 steps.
+    // If the first done attempt (only 1 of 2 clauses verified) had been
+    // wrongly accepted, the run would have ended after only 2 steps.
     assert.equal(run.steps.length, 4)
   } finally {
     await server.close()

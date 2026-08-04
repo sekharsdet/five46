@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { serializeOutline, buildActionPrompt, parseAgentAction, countConfirmationClauses, isDestructiveClickTarget, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
+import { serializeOutline, buildActionPrompt, parseAgentAction, countConfirmationClauses, isDestructiveClickTarget, clauseLikelyMatches, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
 import { USERNAME_PLACEHOLDER } from './browser'
 import type { PageOutline } from './types'
 import { PLAN_MAX_OUTPUT_TOKENS, HARD_MAX_STEPS } from './runLoop'
@@ -493,4 +493,87 @@ test('a HARD_MAX_STEPS-sized plan response stays comfortably under PLAN_MAX_OUTP
     estimatedTokens < PLAN_MAX_OUTPUT_TOKENS,
     `estimated ${estimatedTokens} tokens for a ${HARD_MAX_STEPS}-step plan must stay under the ${PLAN_MAX_OUTPUT_TOKENS}-token cap`
   )
+})
+
+test('parseAgentAction captures a valid clauseIndex on an assertion', () => {
+  const visible = parseAgentAction(JSON.stringify({ action: 'assert_visible', ref: 'e1', reason: 'r', clauseIndex: 1 }), OUTLINE, false)
+  assert.ok(visible.ok)
+  if (visible.ok) assert.deepEqual(visible.action, { action: 'assert_visible', ref: 'e1', reason: 'r', clauseIndex: 1 })
+
+  const text = parseAgentAction(JSON.stringify({ action: 'assert_text', ref: 'e2', expectedText: 'hi', reason: 'r', clauseIndex: 0 }), OUTLINE, false)
+  assert.ok(text.ok)
+  if (text.ok) assert.deepEqual(text.action, { action: 'assert_text', ref: 'e2', expectedText: 'hi', reason: 'r', clauseIndex: 0 })
+
+  const pageText = parseAgentAction(JSON.stringify({ action: 'assert_page_text', expectedText: 'hi', reason: 'r', clauseIndex: 2 }), EMPTY_OUTLINE, false)
+  assert.ok(pageText.ok)
+  if (pageText.ok) assert.deepEqual(pageText.action, { action: 'assert_page_text', expectedText: 'hi', reason: 'r', clauseIndex: 2 })
+})
+
+test('parseAgentAction omits clauseIndex entirely (not clauseIndex: undefined) when absent or invalid, keeping every pre-existing exact-shape test unaffected', () => {
+  const missing = parseAgentAction(JSON.stringify({ action: 'assert_visible', ref: 'e1', reason: 'r' }), OUTLINE, false)
+  assert.ok(missing.ok)
+  if (missing.ok) {
+    assert.deepEqual(missing.action, { action: 'assert_visible', ref: 'e1', reason: 'r' })
+    assert.ok(!('clauseIndex' in missing.action), 'expected no own clauseIndex key at all when absent from the response')
+  }
+
+  for (const badValue of [-1, 1.5, 'zero', null, true]) {
+    const result = parseAgentAction(JSON.stringify({ action: 'assert_visible', ref: 'e1', reason: 'r', clauseIndex: badValue }), OUTLINE, false)
+    assert.ok(result.ok)
+    if (result.ok) assert.ok(!('clauseIndex' in result.action), `expected clauseIndex ${JSON.stringify(badValue)} to be dropped, not coerced`)
+  }
+})
+
+test('clauseLikelyMatches finds a shared significant token between a clause and an assertion\'s text', () => {
+  assert.equal(clauseLikelyMatches('the cart shows at least 1 item', 'Cart'), true)
+  assert.equal(clauseLikelyMatches('a login field is visible', 'Username'), false)
+})
+
+test('clauseLikelyMatches ignores confirm/verify/stopword language on both sides', () => {
+  assert.equal(clauseLikelyMatches('confirm the cart shows an item', 'the cart now has 1 item in it'), true)
+})
+
+test('clauseLikelyMatches treats too-little-text-to-compare as inconclusive and passes, never falsely blocking a genuine match', () => {
+  assert.equal(clauseLikelyMatches('confirm that is shown', 'the'), true)
+  assert.equal(clauseLikelyMatches('', 'anything at all here'), true)
+})
+
+test('clauseLikelyMatches rejects a clearly unrelated pairing', () => {
+  assert.equal(clauseLikelyMatches('the shipping address is saved', 'password reset email sent'), false)
+})
+
+test('buildActionPrompt renders per-clause coverage instructions and a clauseIndex schema hint only when 2+ clauses are passed', () => {
+  const clauses = ['the cart shows at least 1 item', 'a login field is visible']
+  const withClauses = buildActionPrompt('goal', [], EMPTY_OUTLINE, undefined, true, undefined, clauses)
+  assert.ok(withClauses.includes('This goal has 2 distinct things to confirm'))
+  assert.ok(withClauses.includes('0. the cart shows at least 1 item'))
+  assert.ok(withClauses.includes('1. a login field is visible'))
+  assert.ok(withClauses.includes('"clauseIndex"'))
+  // The old total-count wording must not also appear — the two notes are
+  // mutually exclusive, never both rendered.
+  assert.ok(!withClauses.includes('successful assert_visible, assert_text, or assert_page_text action(s) before'))
+
+  const withoutClauses = buildActionPrompt('goal', [], EMPTY_OUTLINE, undefined, true)
+  assert.ok(!withoutClauses.includes('distinct things to confirm'))
+  assert.ok(!withoutClauses.includes('"clauseIndex"'))
+})
+
+test('buildActionPrompt treats a single-element clauses array as no compound structure worth tracking — same as passing none at all', () => {
+  const prompt = buildActionPrompt('goal', [], EMPTY_OUTLINE, undefined, true, undefined, ['only one clause'])
+  assert.ok(!prompt.includes('distinct things to confirm'))
+  assert.ok(!prompt.includes('"clauseIndex"'))
+  assert.ok(prompt.includes('successful assert_visible, assert_text, or assert_page_text action(s) before'))
+})
+
+test('buildPlanPrompt renders per-clause coverage instructions and a clauseIndex schema hint only when 2+ clauses are passed', () => {
+  const clauses = ['the cart shows at least 1 item', 'a login field is visible']
+  const withClauses = buildPlanPrompt('goal', EMPTY_OUTLINE, clauses)
+  assert.ok(withClauses.includes('This goal has 2 distinct things to confirm'))
+  assert.ok(withClauses.includes('0. the cart shows at least 1 item'))
+  assert.ok(withClauses.includes('1. a login field is visible'))
+  assert.ok(withClauses.includes('"clauseIndex"'))
+
+  const withoutClauses = buildPlanPrompt('goal', EMPTY_OUTLINE)
+  assert.ok(!withoutClauses.includes('distinct things to confirm'))
+  assert.ok(!withoutClauses.includes('"clauseIndex"'))
 })

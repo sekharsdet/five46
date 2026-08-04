@@ -3,7 +3,8 @@ import type { StorageState } from './browser'
 import { CookieJar, executeApiAction, resolvePlaceholders } from './apiExecutor'
 import type { LastResponse, ApiExecutionContext } from './apiExecutor'
 import { buildApiActionPrompt, buildApiPlanPrompt, checkVarReferences, parseApiAction, parseApiPlan } from './apiPlanner'
-import { countConfirmationClauses } from './planner'
+import { countConfirmationClauses, clauseLikelyMatches } from './planner'
+import { splitConfirmationClauses } from './clauseSplitter'
 import { isHostAllowed, isMethodAllowed, effectiveMethod } from './apiTypes'
 import type { ApiAction, ApiHistoryEntry, ApiPlan, ApiTestRun, ExecutedApiStep, HttpMethod, SafetyMode } from './apiTypes'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId, API_ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
@@ -87,6 +88,38 @@ function assertionCheckKey(action: ApiAction): string | undefined {
   return undefined
 }
 
+/** Narrows `ApiAction`'s union before reading `clauseIndex` — mirrors
+ * `runner.ts`'s identical `getClauseIndex` exactly (TypeScript can't narrow
+ * through a separately-computed `isAssertion` boolean). */
+function getClauseIndex(action: ApiAction): number | undefined {
+  if (action.action === 'assert_status' || action.action === 'assert_json_path_exists' || action.action === 'assert_json_path_equals') return action.clauseIndex
+  return undefined
+}
+
+/** The text an assertion's self-declared `clauseIndex` is checked against
+ * via `clauseLikelyMatches` (planner.ts) — mirrors `runner.ts`'s identical
+ * `clauseComparisonText`. `assert_status` deliberately returns `''`: a bare
+ * HTTP status code carries no keyword semantics to compare against a
+ * clause's own text at all, and `clauseLikelyMatches` already treats an
+ * empty side as inconclusive (passes) — so this naturally reduces to
+ * "always trust a declared clauseIndex for assert_status outright," without
+ * a separate special case. `assert_json_path_exists`/`assert_json_path_equals`
+ * compare against their `path` (and `expected`, when present) — often
+ * genuinely meaningful (e.g. a path like "cart.items" sharing "cart" with
+ * a clause about the cart). */
+function clauseComparisonText(action: ApiAction): string {
+  switch (action.action) {
+    case 'assert_status':
+      return ''
+    case 'assert_json_path_exists':
+      return action.path
+    case 'assert_json_path_equals':
+      return `${action.path} ${action.expected}`
+    default:
+      return ''
+  }
+}
+
 function describeResultDetail(action: ApiAction, result: { responseStatus?: number; responseBodyExcerpt?: string; responseBodyTruncated?: boolean; savedVar?: { name: string; value: string } }): string {
   if (action.action !== 'request' || result.responseStatus === undefined) return ''
   const parts = [`status ${result.responseStatus}`]
@@ -122,6 +155,18 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   // countConfirmationClauses still raises the floor above 1 when the goal
   // explicitly asks for more than one check.
   const requiredConfirmationCount = Math.max(1, countConfirmationClauses(options.goal))
+  // Mirrors runner.ts's identical block exactly — see its own doc comment
+  // for the full reasoning (gated behind the cheap regex pre-filter, never
+  // fatal, closes DEVELOPMENT.md's documented gap #3).
+  let clauses: string[] = [options.goal]
+  if (countConfirmationClauses(options.goal) >= 2) {
+    try {
+      clauses = (await splitConfirmationClauses(options.goal, options.provider, options.apiKey)).clauses
+    } catch {
+      // Never fatal — matches splitConfirmationClauses' own posture.
+    }
+  }
+  const clauseTrackingActive = clauses.length > 1
 
   const cookieJar = new CookieJar()
   if (options.storageState) cookieJar.seedFromStorageState(options.storageState.cookies, options.safety.targetOrigin)
@@ -151,6 +196,11 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   // comment for the real bug this closes). Unlike hasSucceededAssertion,
   // never reset by a state change.
   let succeededAssertionCount = 0
+  // Only consulted when `clauseTrackingActive` — mirrors runner.ts's
+  // identical `satisfiedClauses` exactly, see its own doc comment for the
+  // full reasoning (why no staleness-reset is needed, unlike
+  // hasSucceededAssertion above).
+  const satisfiedClauses = new Set<number>()
   // Catches the API-engine analog of a real gap the signature-repeat guard
   // missed on the browser side (see `assertionCheckKey`'s doc comment).
   // Any `request` resets this, mirroring `runner.ts`'s "any click/fill/
@@ -168,7 +218,11 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   let fastPathedSteps = 0
   if (options.useStructuredPlan) {
     try {
-      const planRaw = await options.provider.complete(buildApiPlanPrompt(options.goal, options.safety), options.apiKey, { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS })
+      const planRaw = await options.provider.complete(
+        buildApiPlanPrompt(options.goal, options.safety, clauseTrackingActive ? clauses : undefined),
+        options.apiKey,
+        { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS }
+      )
       const parsedPlan = parseApiPlan(planRaw)
       if (parsedPlan.ok) plan = parsedPlan.plan
     } catch {
@@ -250,14 +304,25 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
       }
     } else if (plannedStep && precedingWasSuccessfulRequest) {
       // assert_status/assert_json_path_exists/assert_json_path_equals,
-      // only when the gate above holds — see its own doc comment.
-      action = plannedStep
-      fastPathedSteps++
+      // only when the gate above holds — see its own doc comment. When
+      // clause tracking is active, also requires a usable clauseIndex —
+      // mirrors runner.ts's identical fast-path refusal exactly: fast-
+      // pathing an assertion that can never count toward any clause would
+      // be silently identical to the model quietly skipping a milestone it
+      // was supposed to verify.
+      const plannedClauseIndex = getClauseIndex(plannedStep)
+      const clauseIndexUsable = !clauseTrackingActive || (plannedClauseIndex !== undefined && plannedClauseIndex >= 0 && plannedClauseIndex < clauses.length)
+      if (clauseIndexUsable) {
+        action = plannedStep
+        fastPathedSteps++
+      }
+      // else: refuses to fast-path this one step, falls through to a live
+      // decision below, same as an unresolved {{var}} reference above.
     }
 
     if (!action) {
       const validVarNames = new Set(vars.keys())
-      const prompt = buildApiActionPrompt(options.goal, history, validVarNames, options.safety)
+      const prompt = buildApiActionPrompt(options.goal, history, validVarNames, options.safety, clauseTrackingActive ? clauses : undefined)
       let raw: string
       try {
         raw = await options.provider.complete(prompt, options.apiKey, { maxOutputTokens: API_ACTION_MAX_OUTPUT_TOKENS, fastPath: options.useFastSteps })
@@ -326,13 +391,16 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
 
     if (action.action === 'done') {
       lastActionMadeProgress = false
-      const unverifiedSuccess = action.outcome === 'goal-reached' && (!hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
+      const unverifiedSuccess =
+        action.outcome === 'goal-reached' &&
+        (clauseTrackingActive ? satisfiedClauses.size < clauses.length : !hasSucceededAssertion || succeededAssertionCount < requiredConfirmationCount)
       if (unverifiedSuccess) {
         history.push({
           action,
           result: 'failed',
-          detail:
-            succeededAssertionCount < requiredConfirmationCount
+          detail: clauseTrackingActive
+            ? `rejected: this goal asks to confirm ${clauses.length} distinct thing(s), but only ${satisfiedClauses.size} of them have been verified so far — perform the rest before declaring done`
+            : succeededAssertionCount < requiredConfirmationCount
               ? `rejected: this goal asks to confirm/verify ${requiredConfirmationCount} thing(s), but only ${succeededAssertionCount} assertion(s) have succeeded so far — perform another before declaring done`
               : 'rejected: this goal asks to confirm/verify something, but no assert_status/assert_json_path_exists/assert_json_path_equals has succeeded yet — perform one before declaring done',
         })
@@ -374,8 +442,24 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
 
     const isAssertion = action.action === 'assert_status' || action.action === 'assert_json_path_exists' || action.action === 'assert_json_path_equals'
     if (isAssertion && result.ok) {
-      hasSucceededAssertion = true
-      succeededAssertionCount++
+      if (clauseTrackingActive) {
+        // Never trusted blindly — mirrors runner.ts's identical logic, see
+        // its own doc comment. assert_status always passes this check (see
+        // clauseComparisonText's own doc comment) since a bare HTTP code
+        // has no keyword semantics to compare against a clause's text.
+        const declaredIndex = getClauseIndex(action)
+        if (
+          declaredIndex !== undefined &&
+          declaredIndex >= 0 &&
+          declaredIndex < clauses.length &&
+          clauseLikelyMatches(clauses[declaredIndex], clauseComparisonText(action))
+        ) {
+          satisfiedClauses.add(declaredIndex)
+        }
+      } else {
+        hasSucceededAssertion = true
+        succeededAssertionCount++
+      }
     }
     // Mirrors runner.ts's identical fix — see its own doc comment for the
     // full reasoning and the real, live-found bug this closes. A successful
