@@ -566,7 +566,24 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         // own doc comment), so it's tracked by `expectedText` instead,
         // reusing the same "current assertion target" slot rather than a
         // second parallel counter.
-        const key = action.action === 'assert_page_text' ? `page-text:${action.expectedText}` : action.ref
+        const baseKey = action.action === 'assert_page_text' ? `page-text:${action.expectedText}` : action.ref
+        // When clause tracking is active, a self-declared clauseIndex is
+        // part of the repeat-identity too. Live-caught on GitHub: a model
+        // legitimately re-asserted the exact same ref via assert_text twice
+        // to claim two DIFFERENT, not-yet-satisfied clauses (valid — one
+        // piece of evidence can support two distinct claims, e.g.
+        // "microsoft/playwright" text satisfies both a "playwright" clause
+        // and a "microsoft" clause). This guard predates clause tracking
+        // and only ever compared the base ref/text, so it saw "the same
+        // check again" and could trip stuck-repeating before both clauses
+        // ever got credited — even though nothing was actually stuck.
+        // assert_page_text mostly evades this already (expectedText itself
+        // usually varies per clause), which is why the live repro used
+        // assert_text. A missing/out-of-range declared index still folds
+        // into one uniform key (not exempted per-attempt) — an unusable
+        // clauseIndex should still count as a genuine repeat of the base
+        // check, same as clause tracking being inactive entirely.
+        const key = clauseTrackingActive ? `${baseKey}::clause${getClauseIndex(action)}` : baseKey
         if (key === repeatedAssertionRef) {
           repeatedAssertionCount++
           if (repeatedAssertionCount >= 3) {

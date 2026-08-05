@@ -258,6 +258,117 @@ test('runApiTest requires a fresh assertion for EACH confirm-clause in a compoun
   }
 })
 
+test('runApiTest does not trip stuck-repeating when the same path is legitimately re-checked for two different clauses', async () => {
+  // Mirrors runner.ts's identical fix to `repeatedAssertionRef` — the API
+  // engine's own `assertionCheckKey`-based guard (keyed on `path` alone for
+  // assert_json_path_exists/equals) had the same gap: no awareness of a
+  // self-declared clauseIndex, so three checks of the same path in a row
+  // without an intervening request (the only thing that resets this guard)
+  // would count as three identical repeats, even when the third is
+  // legitimately verifying a completely different, not-yet-satisfied
+  // clause. Uses exists-then-equals-then-exists (real, all genuinely
+  // passing, on the same "id" path) so `actionSignature`'s own separate
+  // repeat guard — which already tolerates exactly this two-different-
+  // checks-in-a-row pattern (see the dedicated test above) — never
+  // confounds this test: an assert_status equivalent can't demonstrate
+  // this in isolation, since a real HTTP status has only one truthful
+  // value at a time, and any deliberately-wrong recheck would immediately
+  // end the run as a real assertion-failed rather than merely repeat.
+  const server = await startApiTestServer()
+  try {
+    const create = await fetch(server.url + '/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'widget' }),
+    })
+    const { id } = (await create.json()) as { id: number }
+
+    let stepTurn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"clauses"')) {
+          return JSON.stringify({ clauses: ['the item has an id', 'the item is reachable by id'] })
+        }
+        stepTurn++
+        if (stepTurn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: `${server.url}/items/${id}`, reason: 'read it' })
+        if (stepTurn === 2) return JSON.stringify({ action: 'assert_json_path_exists', path: 'id', reason: 'confirm clause 0', clauseIndex: 0 })
+        // A redundant recheck of clause 0, same path, different assertion
+        // type (real, genuinely passing) — same checkKey ('id') as above.
+        if (stepTurn === 3)
+          return JSON.stringify({ action: 'assert_json_path_equals', path: 'id', expected: String(id), reason: 'redundantly recheck clause 0', clauseIndex: 0 })
+        // A THIRD check of the same path in a row with no request in
+        // between — the old keying (checkKey alone) would count this as a
+        // third identical repeat and abort here. With the fix, a different
+        // clauseIndex resets the count instead.
+        if (stepTurn === 4) return JSON.stringify({ action: 'assert_json_path_exists', path: 'id', reason: 'confirm clause 1', clauseIndex: 1 })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both clauses confirmed' })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'confirm the item has an id, and confirm the item is reachable by id',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url, { allowWrites: true }),
+      maxSteps: 10,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(stepTurn, 5, 'expected all 3 assertion attempts plus the final done, with none of them tripping stuck-repeating')
+  } finally {
+    await server.close()
+  }
+})
+
+test('runApiTest still trips stuck-repeating when the same path is re-checked for the SAME clause repeatedly, clause tracking notwithstanding', async () => {
+  // The other half of the fix: folding clauseIndex into the checkKey must
+  // not exempt a genuinely stuck model that keeps re-declaring the *same*
+  // clauseIndex, never advancing to the still-unsatisfied clause.
+  const server = await startApiTestServer()
+  try {
+    const create = await fetch(server.url + '/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'widget' }),
+    })
+    const { id } = (await create.json()) as { id: number }
+
+    let stepTurn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"clauses"')) {
+          return JSON.stringify({ clauses: ['the item has an id', 'the item is reachable by id'] })
+        }
+        stepTurn++
+        if (stepTurn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: `${server.url}/items/${id}`, reason: 'read it' })
+        if (stepTurn === 2) return JSON.stringify({ action: 'assert_json_path_exists', path: 'id', reason: 'confirm clause 0', clauseIndex: 0 })
+        if (stepTurn === 3)
+          return JSON.stringify({ action: 'assert_json_path_equals', path: 'id', expected: String(id), reason: 'recheck clause 0 again', clauseIndex: 0 })
+        // Never advances to clause 1 — a genuinely indecisive model, still
+        // re-declaring clause 0 on the same path a third time in a row.
+        return JSON.stringify({ action: 'assert_json_path_exists', path: 'id', reason: 'recheck clause 0 yet again', clauseIndex: 0 })
+      },
+    }
+
+    const run = await runApiTest({
+      baseUrl: server.url,
+      goal: 'confirm the item has an id, and confirm the item is reachable by id',
+      provider,
+      apiKey: 'fake-key',
+      safety: safetyMode(server.url, { allowWrites: true }),
+      maxSteps: 10,
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 10, 'must trip well before exhausting the step budget')
+  } finally {
+    await server.close()
+  }
+})
+
 test('runApiTest blocks a write by default without ending the run, recording it as a failed non-fatal step', async () => {
   const server = await startApiTestServer()
   try {

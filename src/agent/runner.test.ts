@@ -1108,6 +1108,129 @@ test('runAgent does not credit an assertion toward a clause it has no real textu
   }
 })
 
+test('runAgent does not trip stuck-repeating when the same ref is legitimately re-asserted via assert_text to satisfy two different clauses', async (t) => {
+  // Regression test for a real, live-found gap in the repeat-detection
+  // guard itself (found via live debug instrumentation against a real
+  // GitHub run, not speculation): `repeatedAssertionRef`/`repeatedAssertionCount`
+  // predates clause tracking and only ever compared the base ref/text, with
+  // zero awareness of a self-declared `clauseIndex`. A model legitimately
+  // re-asserting the exact same ref via `assert_text` to claim two
+  // DIFFERENT, not-yet-satisfied clauses (one piece of text can be evidence
+  // for two distinct claims — "agentic testing works" satisfies both an
+  // "agentic" clause and a "testing works" clause) got no benefit from
+  // `assert_page_text`'s naturally-varying `expectedText` key, since
+  // `assert_text` is tracked by `ref` alone — so three same-ref attempts in
+  // a row (two redundant re-checks of clause 0, then one for clause 1)
+  // would have tripped `stuck-repeating` under the old keying, before
+  // clause 1 ever got credited. With the fix, the declared clauseIndex is
+  // folded into the repeat-identity, so the third attempt (a different
+  // clauseIndex) resets the count instead of extending it.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let stepTurn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"clauses"')) {
+          return JSON.stringify({ clauses: ['the revealed text mentions agentic', 'the revealed text mentions testing works'] })
+        }
+        stepTurn++
+        if (stepTurn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        // Two redundant re-checks of clause 0 on the same ref...
+        if (stepTurn === 2)
+          return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'agentic testing works'), expectedText: 'agentic', reason: 'confirm clause 0', clauseIndex: 0 })
+        if (stepTurn === 3)
+          return JSON.stringify({
+            action: 'assert_text',
+            ref: refFor(prompt, 'agentic testing works'),
+            expectedText: 'secret message',
+            reason: 'redundantly re-confirm clause 0',
+            clauseIndex: 0,
+          })
+        // ...then a THIRD same-ref assert_text in a row, but for clause 1 —
+        // this is the one the old keying would have miscounted as a third
+        // identical repeat and aborted the run on.
+        if (stepTurn === 4)
+          return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'agentic testing works'), expectedText: 'testing works', reason: 'confirm clause 1', clauseIndex: 1 })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both clauses confirmed' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message, then confirm the revealed text mentions agentic, and confirm the revealed text mentions testing works',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(stepTurn, 5, 'expected all 3 assertion attempts plus the final done, with none of them tripping stuck-repeating')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent still trips stuck-repeating when the same ref is re-asserted for the SAME clause repeatedly, clause tracking notwithstanding', async (t) => {
+  // The other half of the fix above: folding clauseIndex into the repeat
+  // key must not exempt a genuinely stuck model that keeps re-declaring the
+  // *same* clauseIndex against the same ref, never advancing to the
+  // still-unsatisfied clause. This must trip exactly as it did before
+  // clause tracking existed.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let stepTurn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"clauses"')) {
+          return JSON.stringify({ clauses: ['the revealed text mentions agentic', 'the Greet me button is present'] })
+        }
+        stepTurn++
+        if (stepTurn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it' })
+        // Keeps re-asserting clause 0 on the same ref, never touching
+        // clause 1 (the greet button) — a genuinely indecisive model.
+        return JSON.stringify({
+          action: 'assert_text',
+          ref: refFor(prompt, 'agentic testing works'),
+          expectedText: stepTurn % 2 === 0 ? 'agentic' : 'secret message',
+          reason: 'confirm clause 0 again',
+          clauseIndex: 0,
+        })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message, then confirm the revealed text mentions agentic, and confirm the Greet me button is present',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'stuck-repeating')
+    assert.ok(run.steps.length < 10, 'must trip well before exhausting the step budget')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
 test('runAgent with useStructuredPlan refuses to fast-path a planned assert_visible with no usable clauseIndex once clause tracking is active', async (t) => {
   // The plan fast-path's own "exactly one candidate or refuse" discipline,
   // applied to clause coverage too — a plan-predicted assert_visible with

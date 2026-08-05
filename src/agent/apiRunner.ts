@@ -375,13 +375,21 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
 
     const checkKey = assertionCheckKey(action)
     if (checkKey !== undefined) {
-      if (checkKey === repeatedCheckKey) {
+      // Mirrors runner.ts's identical fix to its `repeatedAssertionRef`
+      // guard: when clause tracking is active, fold the self-declared
+      // clauseIndex into the repeat-identity too, so re-checking the same
+      // status/path to legitimately claim a different, not-yet-satisfied
+      // clause isn't treated as "the same check again." A missing/
+      // out-of-range index still folds into one uniform key — see
+      // runner.ts's fuller comment on the same reasoning.
+      const key = clauseTrackingActive ? `${checkKey}::clause${getClauseIndex(action)}` : checkKey
+      if (key === repeatedCheckKey) {
         repeatedCheckCount++
         if (repeatedCheckCount >= 3) {
           return withPlanStats({ runId, baseUrl: options.baseUrl, goal: options.goal, steps, outcome: 'stuck-repeating' })
         }
       } else {
-        repeatedCheckKey = checkKey
+        repeatedCheckKey = key
         repeatedCheckCount = 1
       }
     } else if (action.action === 'request') {
