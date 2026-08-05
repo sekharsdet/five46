@@ -35,6 +35,16 @@ export const HARD_MAX_SCENARIOS = 10
  * split than a genuinely enormous goal. */
 export const HARD_MAX_CLAUSES = 10
 
+/** Hard cap on how many entries `~/.five46/cache.json` (`config/actionCache.ts`)
+ * ever holds — evicted oldest-`cachedAt`-first on write when exceeded (see
+ * `cli.ts`'s `--action-cache` handling). Unlike `HARD_MAX_STEPS`/
+ * `HARD_MAX_REPEAT`/`HARD_MAX_CLAUSES`, this doesn't bound a single run's
+ * worst-case BYOK cost — it bounds an unrelated, unbounded-by-default risk:
+ * a long-lived local file that would otherwise grow forever across every
+ * distinct (project, goal, url) combination ever run with `--action-cache`
+ * on the same machine. */
+export const HARD_MAX_CACHE_ENTRIES = 200
+
 /** Bounded-concurrency defaults for running a `--story`'s split-out scenarios.
  * `DEFAULT_CONCURRENCY` (API engine) is faster in aggregate than `--repeat`'s
  * strict sequencing without risking a live-LLM rate-limit storm; several

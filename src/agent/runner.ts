@@ -3,6 +3,7 @@ import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders } f
 import type { LoginCredentials, StorageState } from './browser'
 import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, resolvePlannedTarget, clauseLikelyMatches } from './planner'
 import { splitConfirmationClauses } from './clauseSplitter'
+import { domShapeSignature } from './actionCache'
 import type { AgentAction, AgentPlan, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId, ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
@@ -80,6 +81,21 @@ export interface RunAgentOptions {
    * model is a real, currently-unquantified risk to per-step decision
    * quality, which is exactly why this isn't the default. */
   useFastSteps?: boolean
+  /** Opt-in cross-run action cache (`--action-cache`, off by default — see
+   * `agent/actionCache.ts`/`config/actionCache.ts`). The caller (`cli.ts`)
+   * is responsible for all cache file I/O — looking up an entry keyed to
+   * this goal/URL/project scope before calling `runAgent`, and persisting
+   * a fresh one afterward using `TestRun.steps`/`domSignature` — `runner.ts`
+   * itself never touches the cache file, only consults whatever entry (if
+   * any) is handed to it here. Only ever consulted when `useStructuredPlan`
+   * is also set (the cache is an alternative *source* for the upfront plan,
+   * not a parallel mechanism — see the dedicated fast-path section). A
+   * `domSignature` mismatch against this run's own real initial outline
+   * (computed live, never trusted from the cache entry itself) means the
+   * page looks different than when the cache was written — degrades
+   * silently to a live plan call, the exact same "never worse off for
+   * having tried" posture a malformed live plan response already gets. */
+  cachedPlan?: { domSignature: string; steps: PlannedStep[] }
 }
 
 function actionSignature(action: AgentAction): string {
@@ -213,8 +229,11 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
   // used for `videoPath`.
   let plan: AgentPlan | undefined
   let fastPathedSteps = 0
+  let planSource: 'live' | 'cache' | undefined
+  let domSignature: string | undefined
   const done = (run: TestRun): TestRun => {
-    if (plan) run.planStats = { plannedSteps: plan.steps.length, fastPathedSteps }
+    if (plan) run.planStats = { plannedSteps: plan.steps.length, fastPathedSteps, source: planSource }
+    if (domSignature) run.domSignature = domSignature
     result = run
     return run
   }
@@ -266,17 +285,40 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
     // a strictly worse worst case than not opting in at all. See
     // `parsePlan`'s own doc comment for the full reasoning.
     if (options.useStructuredPlan) {
-      try {
-        const initialOutline = await snapshot(browser.page, undefined, true)
-        const planRaw = await options.provider.complete(
-          buildPlanPrompt(options.goal, initialOutline, clauseTrackingActive ? clauses : undefined),
-          options.apiKey,
-          { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS }
-        )
-        const parsedPlan = parsePlan(planRaw)
-        if (parsedPlan.ok) plan = parsedPlan.plan
-      } catch {
-        // Network failure, provider error, etc. — same "not fatal" posture.
+      const initialOutline = await snapshot(browser.page, undefined, true)
+      // Exposed on the returned TestRun regardless of whether a cache was
+      // consulted or hit — see TestRun.domSignature's own doc comment for
+      // why (`cli.ts` needs it to write a fresh entry after a real
+      // goal-reached outcome, without runner.ts itself doing cache I/O).
+      domSignature = domShapeSignature(initialOutline)
+      // A cache hit is an alternative SOURCE for `plan`, never a parallel
+      // execution mechanism — every downstream mechanism (resolvePlannedTarget's
+      // fresh-snapshot resolve-or-refuse, the inline safety-gate re-checks,
+      // assert_text/assert_page_text's permanent fast-path exclusion, the
+      // clause-tracking fast-path refusal above) applies completely
+      // unmodified regardless of whether `plan` came from here or the live
+      // call below. The signature comparison is always computed against
+      // THIS run's own real, live initial outline — never trusted from the
+      // cache entry itself — so a stale cache (the page genuinely changed)
+      // degrades to the live call below exactly like a cache miss would.
+      if (options.cachedPlan && options.cachedPlan.domSignature === domSignature) {
+        plan = { steps: options.cachedPlan.steps }
+        planSource = 'cache'
+      } else {
+        try {
+          const planRaw = await options.provider.complete(
+            buildPlanPrompt(options.goal, initialOutline, clauseTrackingActive ? clauses : undefined),
+            options.apiKey,
+            { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS }
+          )
+          const parsedPlan = parsePlan(planRaw)
+          if (parsedPlan.ok) {
+            plan = parsedPlan.plan
+            planSource = 'live'
+          }
+        } catch {
+          // Network failure, provider error, etc. — same "not fatal" posture.
+        }
       }
     }
     let planStepIndex = 0

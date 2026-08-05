@@ -4,7 +4,7 @@ import { spawnSync, spawn } from 'child_process'
 import { join } from 'path'
 import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { parseAgentArgs, parseApiArgs, parseDiffArgs, parseListArgs, withProjectHeaderLine, resolveStructuredPlan, performOneApiRun } from './cli'
+import { parseAgentArgs, parseApiArgs, parseDiffArgs, parseListArgs, withProjectHeaderLine, resolveStructuredPlan, resolveActionCache, performOneApiRun } from './cli'
 import { startApiTestServer } from './agent/apiTestServer'
 import type { SafetyMode } from './agent/apiTypes'
 import type { LlmProvider } from './llm/types'
@@ -86,6 +86,11 @@ test('parseAgentArgs recognizes --story and --concurrency, leaving them undefine
   const withoutEither = parseAgentArgs(['http://localhost:3000', '--goal', 'g'])
   assert.equal(withoutEither.story, undefined)
   assert.equal(withoutEither.concurrency, undefined)
+})
+
+test('parseAgentArgs recognizes --action-cache, leaving it undefined when not passed', () => {
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--action-cache']).actionCache, true)
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).actionCache, undefined)
 })
 
 test('parseListArgs takes a positional dir and a --project filter, in either order', () => {
@@ -181,6 +186,13 @@ test('resolveStructuredPlan defaults to true when --no-structured-plan was not p
 
 test('resolveStructuredPlan resolves to false when --no-structured-plan was passed', () => {
   assert.equal(resolveStructuredPlan({ noStructuredPlan: true }), false)
+})
+
+test('resolveActionCache is true only when both --action-cache was requested AND structured planning is enabled', () => {
+  assert.equal(resolveActionCache({ actionCache: true }, true), true)
+  assert.equal(resolveActionCache({ actionCache: true }, false), false, 'the cache is only ever a source for the upfront plan — nothing to do with structured planning off')
+  assert.equal(resolveActionCache({ actionCache: undefined }, true), false, 'opt-in only — never true unless explicitly requested')
+  assert.equal(resolveActionCache({}, true), false)
 })
 
 test('parseApiArgs sets allowWrites/allowDeletes independently', () => {
@@ -343,6 +355,19 @@ test('CLI "test" subcommand with --story rejects an unreadable story file, after
   const { stderr, status } = runCli(['test', 'http://localhost:1', '--story', '/nonexistent/story.txt'], FAKE_LLM_ENV)
   assert.notEqual(status, 0)
   assert.ok(stderr.includes("Couldn't read the story file"))
+})
+
+test('CLI "test" subcommand discloses the --action-cache/--no-structured-plan conflict before the API-key preflight, never silently overriding either flag', () => {
+  const { stdout, stderr } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--action-cache', '--no-structured-plan'])
+  assert.ok(stdout.includes('--action-cache has no effect together with --no-structured-plan'))
+  // Still reaches (and fails) the ordinary missing-API-key preflight
+  // afterward — the disclosure is additive, not a substitute for it.
+  assert.ok(stderr.includes('requires an LLM API key'))
+})
+
+test('CLI "test" subcommand does not disclose the --action-cache conflict when structured planning is left at its default-on state', () => {
+  const { stdout } = runCli(['test', 'http://localhost:1', '--goal', 'g', '--action-cache'])
+  assert.ok(!stdout.includes('--action-cache has no effect'))
 })
 
 test('CLI "api" subcommand with --story rejects an unreadable story file, after the API-key preflight passes', () => {

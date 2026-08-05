@@ -83,6 +83,7 @@ test('--repeat: two identical scripted runs against a real fixture produce non-c
         {},
         [],
         undefined,
+        undefined,
         undefined
       )
       assert.notEqual(result, 'errored')
@@ -148,6 +149,7 @@ test('--repeat: a scripted run that behaves differently on the second iteration 
         'fake-key',
         {},
         [],
+        undefined,
         undefined,
         undefined
       )

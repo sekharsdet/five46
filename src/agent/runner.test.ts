@@ -10,6 +10,8 @@ import { startLoginFixtureServer, LOGIN_FIXTURE_USERNAME, LOGIN_FIXTURE_PASSWORD
 import type { LlmProvider } from '../llm/types'
 import type { StorageState } from './browser'
 import { ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
+import { domShapeSignature } from './actionCache'
+import { snapshot } from './browser'
 
 /** Finds the ref to act on by matching the *real* prompt text the fake
  * provider actually received, rather than hardcoding an assumed ref value
@@ -2073,6 +2075,166 @@ test('runAgent rejects an indecisive model trying to "verify" its own click by r
       run.steps.every((s) => !s.ok || s.action.action !== 'assert_visible'),
       'the tautological assert_visible must never be recorded as a successful step'
     )
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+/** Computes the real `domShapeSignature` a run against `reveal.html` at
+ * its default state would produce, via a genuinely separate browser/
+ * navigation from whatever the test itself launches — matching how a real
+ * cache entry would have been written by an entirely earlier, unrelated
+ * process. */
+async function realRevealSignature(url: string): Promise<string> {
+  const browser = await launchAgentBrowser({ headless: true })
+  try {
+    await browser.page.goto(url)
+    return domShapeSignature(await snapshot(browser.page, undefined, true))
+  } finally {
+    await browser.close()
+  }
+}
+
+test('runAgent with useStructuredPlan and a matching cachedPlan skips the upfront plan LLM call entirely', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const realSignature = await realRevealSignature(server.url)
+    let liveCalls = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        liveCalls++
+        assert.ok(!prompt.includes('"steps"'), 'the plan LLM call must never happen on a cache hit')
+        // Reached only for the final done decision — the cached plan
+        // deliberately never includes its own trailing "done" step.
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'both cached steps already succeeded' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+      cachedPlan: {
+        domSignature: realSignature,
+        steps: [
+          { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+          { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed' },
+        ],
+      },
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(run.planStats?.source, 'cache')
+    assert.equal(run.planStats?.fastPathedSteps, 2)
+    assert.equal(liveCalls, 1, 'expected exactly one live call for the final done decision, and nothing else')
+    assert.equal(run.domSignature, realSignature)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with useStructuredPlan falls back to a real live plan call when cachedPlan.domSignature does not match this run\'s real initial page', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let sawPlanCall = false
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        if (prompt.includes('"steps"')) {
+          sawPlanCall = true
+          return JSON.stringify({
+            steps: [
+              { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+              { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed' },
+              { action: 'done', outcome: 'goal-reached', reason: 'confirmed' },
+            ],
+          })
+        }
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'fallback' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message and confirm it is visible',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+      cachedPlan: { domSignature: 'a-signature-that-cannot-possibly-match-the-real-page', steps: [] },
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.ok(sawPlanCall, 'expected a real live plan call once the cache signature did not match')
+    assert.equal(run.planStats?.source, 'live')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent refuses to fast-path a single cached step whose target no longer exists, without aborting the rest of the run', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    const realSignature = await realRevealSignature(server.url)
+    let liveCalls = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        liveCalls++
+        // Reached only because the first cached step (a target that never
+        // existed on this fixture at all) correctly refused to fast-path.
+        return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Show secret message'), reason: 'reveal it live instead' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'reveal the secret message',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      // Small on purpose — the fake keeps clicking the same, genuinely
+      // succeeding button forever (no `done` in its script), so this run
+      // is only ever going to end via the step cap; keeping it small
+      // keeps the test fast without changing what it actually proves.
+      maxSteps: 3,
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+      cachedPlan: {
+        domSignature: realSignature,
+        steps: [{ action: 'click', target: { role: 'button', nameContains: 'A button that does not exist on this page' }, reason: 'stale, from a since-changed page' }],
+      },
+    })
+
+    assert.equal(run.outcome, 'stopped-by-cap')
+    assert.ok(liveCalls >= 1, 'expected the unresolvable cached step to fall back to a real live decision, not abort the run')
+    assert.equal(run.planStats?.fastPathedSteps, 0, 'the unresolvable cached step must not count as fast-pathed')
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })

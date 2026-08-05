@@ -27,6 +27,8 @@ import { HARD_MAX_REPEAT, HARD_MAX_SCENARIOS, DEFAULT_CONCURRENCY, DEFAULT_BROWS
 import { splitUserStory } from './agent/storySplitter'
 import { runWithConcurrency } from './agent/concurrencyPool'
 import type { RunOutcome } from './agent/types'
+import { actionCacheKey, buildCachedPlanFromSteps, recordCacheEntry } from './agent/actionCache'
+import { loadActionCache, saveActionCache } from './config/actionCache'
 import type { LlmProvider } from './llm/types'
 import { loadProjectConfig, resolveProject, mergeProjectDefaultsForTest, mergeProjectDefaultsForApi } from './config/projectConfig'
 
@@ -87,6 +89,18 @@ export interface ParsedAgentArgs {
    * parsed-but-ignored without `--story`, same "shared parser, unused
    * elsewhere" precedent as `--allow-deletes` on `login`. */
   concurrency?: number
+  /** `test` only (v1 scope — see `agent/actionCache.ts`'s own doc comment
+   * for why the API engine's cache support is deliberately deferred, not
+   * attempted this pass). Opt-in, off by default — mirrors `fastSteps`'s
+   * polarity, not `structuredPlan`'s: this is a real, currently-unquantified
+   * risk (a stale cached step silently executing against a page that
+   * genuinely changed), not something that's earned default-on status the
+   * way structured planning did after its own live-validation runway. Only
+   * takes effect when structured planning itself is active (the cache is
+   * an alternative *source* for the upfront plan, never a parallel
+   * mechanism — see `RunAgentOptions.cachedPlan`'s own doc comment); see
+   * `resolveActionCache()` for the `--no-structured-plan` interaction. */
+  actionCache?: boolean
 }
 
 export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
@@ -133,11 +147,26 @@ export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
     } else if (argv[i] === '--concurrency') {
       const n = Number(argv[++i])
       if (Number.isFinite(n)) result.concurrency = n
+    } else if (argv[i] === '--action-cache') {
+      result.actionCache = true
     } else if (!result.url) {
       result.url = argv[i]
     }
   }
   return result
+}
+
+/** Resolves `--action-cache` against structured planning's own resolved
+ * state — the cache is only ever consulted as an alternative *source* for
+ * the upfront plan (see `RunAgentOptions.cachedPlan`), so it has nothing
+ * to do at all when structured planning itself is off. An explicit
+ * `--no-structured-plan` alongside `--action-cache` is a real, meaningful
+ * conflict worth disclosing (not silently overriding the user's explicit
+ * opt-out to make the cache flag "work anyway") — the caller prints
+ * `disclosureNote` when this returns `false` but `actionCache` was
+ * requested. */
+export function resolveActionCache(parsed: { actionCache?: boolean }, structuredPlanEnabled: boolean): boolean {
+  return Boolean(parsed.actionCache) && structuredPlanEnabled
 }
 
 /** Resolves `--no-structured-plan` into a definite boolean immediately after
@@ -351,8 +380,29 @@ export async function performOneE2eRun(
   credentials: LoginCredentials,
   secrets: (string | undefined)[],
   projectName: string | undefined,
-  fastSteps: boolean | undefined
+  fastSteps: boolean | undefined,
+  /** `--action-cache`, resolved (see `resolveActionCache`) — off unless
+   * both explicitly requested and structured planning is active. See
+   * `agent/actionCache.ts`/`config/actionCache.ts`. Loads/writes
+   * `~/.five46/cache.json` directly around this one call rather than
+   * threading a shared, load-once-per-invocation cache object through
+   * every caller (`runE2eTest`/`runRepeatedE2eTest`/`runStoryScenarios`) —
+   * a deliberate, disclosed tradeoff: a small local JSON file's load/save
+   * cost is negligible next to the LLM round-trips this feature exists to
+   * save, and this keeps the change contained to one function instead of
+   * threading a mutable object through several already-long call chains.
+   * The one real cost: two `--story` scenarios finishing at overlapping
+   * moments could each load before the other's write lands, and the
+   * second write would win, silently losing the first's cache update for
+   * this run — never a wrong test result (a lost cache write only means
+   * one fewer future fast-path opportunity), just a known, accepted,
+   * disclosed race window rather than a correctness bug. */
+  actionCacheEnabled: boolean | undefined
 ): Promise<{ outcome: RunOutcome; specBody: string } | 'errored'> {
+  const cacheScope = projectName ?? process.cwd()
+  const cacheKey = actionCacheEnabled ? actionCacheKey(cacheScope, goal, url) : undefined
+  const cachedEntry = cacheKey ? loadActionCache().entries[cacheKey] : undefined
+
   let run
   try {
     run = await runAgent({
@@ -369,6 +419,7 @@ export async function performOneE2eRun(
       recordVideo,
       useStructuredPlan: structuredPlan,
       useFastSteps: fastSteps,
+      cachedPlan: cachedEntry ? { domSignature: cachedEntry.domSignature, steps: cachedEntry.steps } : undefined,
       onDestructiveClick: (name, reason) => console.log(`  -> clicking "${redactSecrets(name, secrets)}" (${redactSecrets(reason, secrets)})`),
     })
   } catch (err) {
@@ -399,6 +450,27 @@ export async function performOneE2eRun(
     if (projectName) specBody = withProjectHeaderLine(specBody, projectName)
     writeFileSync(outPath, specBody, 'utf8')
     console.log(`\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
+
+    // Only ever written from a real, verified goal-reached outcome —
+    // strictly downstream of the (per-clause-strengthened) confirmation
+    // gate in runner.ts, so an unverified success can never poison the
+    // cache. Best-effort, its own try/catch: a cache-write failure (a full
+    // disk, an unwritable ~/.five46) must never turn an otherwise-successful
+    // run into a reported failure.
+    if (cacheKey && run.outcome === 'goal-reached' && run.domSignature) {
+      try {
+        const cachedSteps = buildCachedPlanFromSteps(run.steps)
+        if (cachedSteps.length > 0) {
+          const current = loadActionCache()
+          const updated = recordCacheEntry(current, cacheKey, { domSignature: run.domSignature, steps: cachedSteps, cachedAt: new Date().toISOString() })
+          saveActionCache(updated)
+        }
+      } catch {
+        // Never fails the run over this — see this function's own
+        // actionCacheEnabled doc comment for the full reasoning.
+      }
+    }
+
     return { outcome: run.outcome, specBody }
   } catch (err) {
     // Same redaction discipline as the runAgent-call catch above, extended
@@ -450,7 +522,8 @@ async function runE2eTest(
   recordVideo: boolean | undefined,
   structuredPlan: boolean | undefined,
   projectName: string | undefined,
-  fastSteps: boolean | undefined
+  fastSteps: boolean | undefined,
+  actionCache: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -492,6 +565,7 @@ async function runE2eTest(
   const artifactDir = join(process.cwd(), `five46-agent-${runId}`)
   if (recordVideo) console.log(`A full .webm video of this session will be recorded to ${artifactDir} once the run finishes.`)
   if (structuredPlan) console.log('One extra LLM call will plan the whole goal upfront; most steps then execute without a further live decision.')
+  if (actionCache) console.log('Action cache enabled: a previously-successful plan for this exact goal/target may be reused, skipping the upfront plan call entirely on a match.')
 
   const result = await performOneE2eRun(
     url,
@@ -510,7 +584,8 @@ async function runE2eTest(
     credentials,
     secrets,
     projectName,
-    fastSteps
+    fastSteps,
+    actionCache
   )
   return result !== 'errored' && result.outcome === 'goal-reached'
 }
@@ -543,7 +618,17 @@ async function runRepeatedE2eTest(
   structuredPlan: boolean | undefined,
   repeat: number,
   projectName: string | undefined,
-  fastSteps: boolean | undefined
+  fastSteps: boolean | undefined,
+  /** Accepted for signature consistency with `runE2eTest`/
+   * `runStoryScenarios` (all three receive the same resolved flags from
+   * `main()`), but deliberately never passed through to
+   * `performOneE2eRun` below — `--repeat`'s whole purpose is proving the
+   * live decision process itself is stable across genuinely independent
+   * re-decisions; a cache hit would make every repeat after the first a
+   * trivial, guaranteed-byte-identical replay of the same cached plan,
+   * defeating the flakiness check it exists to run rather than passing
+   * it honestly. Disclosed below when requested, not silently ignored. */
+  actionCache: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -583,6 +668,9 @@ async function runRepeatedE2eTest(
   console.log('Each repeat writes its own generated spec; the run-id header line is ignored when comparing them for flakiness.')
   if (recordVideo) console.log('A full .webm video of each repeat will be recorded to its own artifact directory once that repeat finishes.')
   if (structuredPlan) console.log('Each repeat plans the whole goal upfront with one extra LLM call; most steps then execute without a further live decision.')
+  if (actionCache) {
+    console.log('Note: --action-cache has no effect during --repeat — flakiness detection needs a genuinely fresh live decision on every repeat, so caching is disabled for this run.')
+  }
 
   const batchId = Date.now().toString(36)
   const results: RepeatIterationResult[] = []
@@ -607,7 +695,10 @@ async function runRepeatedE2eTest(
       credentials,
       secrets,
       projectName,
-      fastSteps
+      fastSteps,
+      // Always false here regardless of the caller's own `actionCache` —
+      // see this function's own parameter doc comment for why.
+      false
     )
     if (result === 'errored') {
       // Don't spend the remaining repeats' BYOK budget once one iteration
@@ -670,7 +761,8 @@ async function runStoryScenarios(
   structuredPlan: boolean | undefined,
   concurrency: number | undefined,
   projectName: string | undefined,
-  fastSteps: boolean | undefined
+  fastSteps: boolean | undefined,
+  actionCache: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -713,6 +805,7 @@ async function runStoryScenarios(
   if (credentials.username || credentials.password) {
     console.log('A login username/password is configured — never sent to the LLM, only used locally if a scenario fills a credential field.')
   }
+  if (actionCache) console.log('Action cache enabled: a previously-successful plan for a scenario\'s exact goal/target may be reused, skipping its upfront plan call entirely on a match.')
 
   const batchId = Date.now().toString(36)
   const tasks = goals.map((goal, i) => async () => {
@@ -736,7 +829,8 @@ async function runStoryScenarios(
       credentials,
       secrets,
       projectName,
-      fastSteps
+      fastSteps,
+      actionCache
     )
     return { goal, result }
   })
@@ -1406,7 +1500,7 @@ function listGeneratedRuns(dir: string, projectFilter?: string): boolean {
 }
 
 const USAGE = [
-  'Usage: five46 test <url> (--goal "text" | --story <path>) [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--record-video] [--no-structured-plan] [--fast-steps]',
+  'Usage: five46 test <url> (--goal "text" | --story <path>) [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--record-video] [--no-structured-plan] [--fast-steps] [--action-cache]',
   '       five46 login <url> --goal "text" --out <path> [--max-steps N] [--headed] [--record-video]',
   '       five46 api <base-url> (--goal "text" | --story <path>) [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--no-structured-plan] [--fast-steps]',
   '       five46 mcp   (starts an MCP server on stdio, exposing five46_test/five46_api to an IDE-embedded AI assistant)',
@@ -1554,10 +1648,17 @@ async function main() {
     process.exit(1)
   }
 
-  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, noStructuredPlan, fastSteps, story, concurrency } = resolveProjectForTest(
-    parseAgentArgs(argv.slice(1))
-  )
+  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, noStructuredPlan, fastSteps, story, concurrency, actionCache } =
+    resolveProjectForTest(parseAgentArgs(argv.slice(1)))
   const structuredPlan = resolveStructuredPlan({ noStructuredPlan })
+  const useActionCache = resolveActionCache({ actionCache }, structuredPlan)
+  if (actionCache && !useActionCache) {
+    // Disclosed, never silently overridden — an explicit --no-structured-plan
+    // is a real, meaningful conflict with --action-cache (the cache is only
+    // ever an alternative source for the upfront plan), not something to
+    // paper over by quietly ignoring one flag or the other.
+    console.log('\nNote: --action-cache has no effect together with --no-structured-plan — the cache is only ever consulted as a source for the upfront plan.')
+  }
   if (!url || (!goal && !story)) {
     console.error(USAGE)
     process.exit(1)
@@ -1571,10 +1672,10 @@ async function main() {
 
   try {
     const succeeded = story
-      ? await runStoryScenarios(url, story, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, concurrency, project, fastSteps)
+      ? await runStoryScenarios(url, story, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, concurrency, project, fastSteps, useActionCache)
       : repeat !== undefined && repeat >= 2
-        ? await runRepeatedE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, repeat, project, fastSteps)
-        : await runE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, project, fastSteps)
+        ? await runRepeatedE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, repeat, project, fastSteps, useActionCache)
+        : await runE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, project, fastSteps, useActionCache)
     if (!succeeded) process.exit(1)
   } catch (err) {
     console.error(`\nfive46 test failed: ${err instanceof Error ? err.message : String(err)}`)

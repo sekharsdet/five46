@@ -222,6 +222,19 @@ export interface TestRun {
    * whole run, see `runner.ts`). `plannedSteps` is the plan's own length;
    * `fastPathedSteps` is how many of `steps` executed without a live LLM
    * decision — the efficiency this feature actually buys, disclosed rather
-   * than left for a reader to infer from step count alone. */
-  planStats?: { plannedSteps: number; fastPathedSteps: number }
+   * than left for a reader to infer from step count alone. `source`
+   * discloses whether the plan came from the one-time upfront LLM call
+   * (`'live'`) or from `RunAgentOptions.cachedPlan` (`'cache'`, see
+   * `agent/actionCache.ts`) — `'cache'` means the upfront plan call itself
+   * was skipped entirely, on top of the per-step savings `fastPathedSteps`
+   * already discloses. */
+  planStats?: { plannedSteps: number; fastPathedSteps: number; source?: 'live' | 'cache' }
+  /** Populated whenever `RunAgentOptions.useStructuredPlan` was set,
+   * regardless of whether a cache was consulted or hit — `domShapeSignature`
+   * (`agent/actionCache.ts`) of the very first page's outline, exposed so a
+   * caller (`cli.ts`) can build a fresh cache entry keyed to this run's own
+   * signature after a real `goal-reached` outcome, without `runner.ts`
+   * itself doing any cache file I/O — same "no direct I/O, everything
+   * externalized" posture already applied to `onGoalReached`. */
+  domSignature?: string
 }
