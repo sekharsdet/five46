@@ -62,6 +62,16 @@
   <button id="delayed-heading-btn">Load heading</button>
   <h4 id="delayed-heading" style="display:none">Hello World!</h4>
 
+  <!-- Used by browser.test.ts/runner.test.ts to verify assert_page_text_absent:
+       a real, live-found gap distinct from every assertion above — every
+       existing one only ever proves presence, so a goal asking to confirm
+       something is GONE (found live: a completed TodoMVC item removed from
+       the list entirely under an "Active" filter) had no honest action to
+       express at all. `.remove()`, not a CSS hide, matches that real case
+       exactly: the element leaves the DOM, not just becomes invisible. -->
+  <button id="dismiss-btn">Dismiss notice</button>
+  <p id="notice" role="status">You have unread notifications</p>
+
   <script>
     document.getElementById('delayed-reveal-btn').addEventListener('click', () => {
       setTimeout(() => { document.getElementById('delayed-secret').hidden = false }, 800);
@@ -83,6 +93,9 @@
     });
     document.getElementById('delete-account-btn').addEventListener('click', () => {
       document.getElementById('delete-status').textContent = 'Account deleted';
+    });
+    document.getElementById('dismiss-btn').addEventListener('click', () => {
+      document.getElementById('notice').remove();
     });
   </script>
 </body>

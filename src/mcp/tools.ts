@@ -13,6 +13,7 @@ import { runApiTest } from '../agent/apiRunner'
 import { generateApiSpec } from '../agent/generateApiSpec'
 import { formatApiFailureReport } from '../agent/apiFailureReport'
 import type { SafetyMode } from '../agent/apiTypes'
+import type { CallerPlanStep } from '../agent/types'
 import type { LlmProvider } from '../llm/types'
 import { resolveMcpPath } from './paths'
 import { generateRootCauseHypothesis } from '../agent/rootCause'
@@ -105,6 +106,9 @@ export interface TestToolParams {
    * see `schemas.ts`'s comment on the pair). */
   goal?: string
   story?: string
+  /** Optional, requires `goal` (rejected alongside `story`) — see
+   * `validateSteps` and `schemas.ts`'s `stepsDescribe`. */
+  steps?: CallerPlanStep[]
   maxSteps?: number
   headed?: boolean
   storageStatePath?: string
@@ -113,6 +117,17 @@ export interface TestToolParams {
 function validateGoalOrStory(params: { goal?: string; story?: string }): { ok: true } | { ok: false; error: string } {
   if (!params.goal && !params.story) return { ok: false, error: 'exactly one of "goal"/"story" is required' }
   if (params.goal && params.story) return { ok: false, error: '"goal" and "story" are mutually exclusive — provide exactly one' }
+  return { ok: true }
+}
+
+/** `steps` only ever refines a single `goal`'s upfront plan (see
+ * `RunAgentOptions.callerPlanSteps`) — it has no defined meaning against a
+ * `story` call, which independently splits into several unrelated goals
+ * before any plan is ever made. */
+function validateSteps(params: { goal?: string; story?: string; steps?: CallerPlanStep[] }): { ok: true } | { ok: false; error: string } {
+  if (!params.steps) return { ok: true }
+  if (params.story) return { ok: false, error: '"steps" and "story" are mutually exclusive — "steps" only refines a single "goal"' }
+  if (!params.goal) return { ok: false, error: '"steps" requires "goal" (the overall objective "steps" refines)' }
   return { ok: true }
 }
 
@@ -167,7 +182,8 @@ async function runOneTestScenario(
   llmApiKey: string,
   allowDeletes: boolean,
   projectRoot: string,
-  artifactSuffix: string
+  artifactSuffix: string,
+  callerPlanSteps?: CallerPlanStep[]
 ): Promise<{ outcome: string; text: string; specPath?: string }> {
   const artifactDir = join(projectRoot, `five46-mcp-agent-${artifactSuffix}`)
   const destructiveClicks: string[] = []
@@ -183,6 +199,11 @@ async function runOneTestScenario(
       artifactDir,
       storageState,
       allowDeletes,
+      // MCP never sets useStructuredPlan on its own (see runner.ts's
+      // RunAgentOptions doc comment) — a caller who supplied `steps` is the
+      // one exception, since without it there'd be nowhere for them to go.
+      useStructuredPlan: callerPlanSteps && callerPlanSteps.length > 0 ? true : undefined,
+      callerPlanSteps,
       onDestructiveClick: (name, reason) => destructiveClicks.push(`clicked "${name}" (${reason})`),
     })
   } catch (err) {
@@ -231,6 +252,12 @@ async function runOneTestScenario(
  * `isError` unless every scenario reached `goal-reached`, mirroring the
  * single-goal path's own isError-mirrors-CI-gating rule. */
 export async function runTestTool(params: TestToolParams, context: McpToolContext): Promise<McpToolResult> {
+  // validateSteps runs first: it needs to see a case with `steps` but no
+  // `goal`/`story` at all to produce its own specific "steps requires goal"
+  // message — after validateGoalOrStory, exactly one of goal/story is
+  // always already guaranteed, which would make that branch unreachable.
+  const stepsValidation = validateSteps(params)
+  if (!stepsValidation.ok) return errorResult(stepsValidation.error)
   const validation = validateGoalOrStory(params)
   if (!validation.ok) return errorResult(validation.error)
 
@@ -304,7 +331,8 @@ export async function runTestTool(params: TestToolParams, context: McpToolContex
       llmApiKey,
       context.allowDeletes,
       context.projectRoot,
-      runId
+      runId,
+      params.steps
     )
     // isError mirrors the CLI's CI-gating exit-code rule exactly (see
     // DEVELOPMENT.md's "CI gating: exit codes" section): the calling IDE
@@ -325,6 +353,9 @@ export interface ApiToolParams {
    * `TestToolParams`, validated via the same `validateGoalOrStory`. */
   goal?: string
   story?: string
+  /** Same rule as `TestToolParams.steps` — validated via the same
+   * `validateSteps`. */
+  steps?: CallerPlanStep[]
   maxSteps?: number
 }
 
@@ -345,7 +376,8 @@ async function runOneApiScenario(
   provider: LlmProvider,
   llmApiKey: string,
   projectRoot: string,
-  secrets: (string | undefined)[]
+  secrets: (string | undefined)[],
+  callerPlanSteps?: CallerPlanStep[]
 ): Promise<{ outcome: string; text: string; specPath?: string }> {
   try {
     const writes: string[] = []
@@ -357,6 +389,10 @@ async function runOneApiScenario(
       maxSteps,
       safety,
       authHeaders,
+      // Same "MCP forces structured planning on only when steps are
+      // supplied" rule as runOneTestScenario — see its own comment.
+      useStructuredPlan: callerPlanSteps && callerPlanSteps.length > 0 ? true : undefined,
+      callerPlanSteps,
       onWrite: (method, url, reason) => writes.push(`${method} ${url} (${reason})`),
     })
 
@@ -389,6 +425,12 @@ async function runOneApiScenario(
  *
  * `story` mode: same design as `runTestTool`'s — see its doc comment. */
 export async function runApiTool(params: ApiToolParams, context: McpToolContext): Promise<McpToolResult> {
+  // validateSteps runs first: it needs to see a case with `steps` but no
+  // `goal`/`story` at all to produce its own specific "steps requires goal"
+  // message — after validateGoalOrStory, exactly one of goal/story is
+  // always already guaranteed, which would make that branch unreachable.
+  const stepsValidation = validateSteps(params)
+  if (!stepsValidation.ok) return errorResult(stepsValidation.error)
   const validation = validateGoalOrStory(params)
   if (!validation.ok) return errorResult(validation.error)
 
@@ -455,7 +497,7 @@ export async function runApiTool(params: ApiToolParams, context: McpToolContext)
       return allPassed ? textResult(finalText, structuredContent) : errorResult(finalText, structuredContent)
     }
 
-    const { outcome, text, specPath } = await runOneApiScenario(params.baseUrl, params.goal!, params.maxSteps, safety, authHeaders, provider, llmApiKey, context.projectRoot, secrets)
+    const { outcome, text, specPath } = await runOneApiScenario(params.baseUrl, params.goal!, params.maxSteps, safety, authHeaders, provider, llmApiKey, context.projectRoot, secrets, params.steps)
     // Same isError-mirrors-CI-gating rule as runTestTool — see its comment.
     const passed = outcome === 'goal-reached'
     const structuredContent: StructuredToolOutput = { passed, outcome, specPath }

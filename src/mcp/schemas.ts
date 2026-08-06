@@ -13,6 +13,18 @@ import * as z from 'zod/v4'
 // existing single-goal caller for a rarely-combined pair of fields.
 const storyDescribe = 'A raw, possibly multi-scenario user story/acceptance-criteria text to split into independent goals and run with bounded concurrency (see `concurrency` context, set via FIVE46_MCP_CONCURRENCY on the server, never a per-call argument). Mutually exclusive with `goal` — provide exactly one.'
 
+// `steps` is an optional refinement of `goal`, not a substitute for it — see
+// `mcp/tools.ts`'s validation (steps requires goal, and is rejected
+// alongside story). It forces structured-plan mode on for this call (one
+// extra upfront LLM call, same cost `--structured-plan` always has) so the
+// caller's steps have somewhere to go: see `runner.ts`'s
+// `RunAgentOptions.callerPlanSteps` doc comment.
+const stepSchema = z.object({
+  type: z.enum(['action', 'assertion']).describe('Advisory only — distinguishes a step that does something from one that checks something. Has no effect on parsing or execution.'),
+  description: z.string().min(1).describe('Plain language, e.g. "Click \'Add to cart\'" or "The cart shows exactly 1 item" — not a selector or role.'),
+})
+const stepsDescribe = 'An optional ordered checklist (1-50 items) of steps you already know must happen — e.g. from having just read/written the flow being tested. When provided, five46 grounds its one upfront plan call in this checklist instead of inventing its own decomposition of `goal`, then resolves each step against the real live page exactly as it always does (never a blind guess — falls back to a live decision on ambiguity). Requires `goal` (the overall objective `steps` refines); mutually exclusive with `story`.'
+
 export const testToolInputSchema = {
   url: z.string().describe('The live http(s) or file:// URL to test'),
   goal: z
@@ -20,6 +32,7 @@ export const testToolInputSchema = {
     .optional()
     .describe('What the agent should accomplish — provide exactly one of `goal`/`story`. A vague goal would burn real BYOK cost on an unfocused run.'),
   story: z.string().optional().describe(storyDescribe),
+  steps: z.array(stepSchema).min(1).max(50).optional().describe(stepsDescribe),
   maxSteps: z.number().int().positive().optional().describe('Step budget (default 15, hard-capped at 50 regardless of what is passed)'),
   headed: z.boolean().optional().describe('Watch it drive a real visible browser instead of headless (default false)'),
   storageStatePath: z
@@ -35,6 +48,7 @@ export const apiToolInputSchema = {
     .optional()
     .describe('What the agent should accomplish — provide exactly one of `goal`/`story`. A vague goal would burn real BYOK cost on an unfocused run.'),
   story: z.string().optional().describe(storyDescribe),
+  steps: z.array(stepSchema).min(1).max(50).optional().describe(stepsDescribe),
   maxSteps: z.number().int().positive().optional().describe('Step budget (default 15, hard-capped at 50 regardless of what is passed)'),
 }
 

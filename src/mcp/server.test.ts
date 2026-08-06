@@ -606,6 +606,147 @@ test('five46_api tool rejects a call with both goal and story, as isError', asyn
   }
 })
 
+test('five46_test tool rejects steps combined with story, as isError', async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const { client, close } = await connectedClient({ projectRoot, provider: scriptedProvider(['unused']), apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({
+        name: 'five46_test',
+        arguments: { url: 'http://localhost:1', story: 's', steps: [{ type: 'action', description: 'do something' }] },
+      })
+      assert.equal(result.isError, true)
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /"steps" and "story" are mutually exclusive/)
+    } finally {
+      await close()
+    }
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_test tool rejects steps with no goal (and no story), as isError', async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const { client, close } = await connectedClient({ projectRoot, provider: scriptedProvider(['unused']), apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({
+        name: 'five46_test',
+        arguments: { url: 'http://localhost:1', steps: [{ type: 'action', description: 'do something' }] },
+      })
+      assert.equal(result.isError, true)
+      const text = (result.content as { type: string; text: string }[])[0].text
+      assert.match(text, /"steps" requires "goal"/)
+    } finally {
+      await close()
+    }
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_test tool with steps grounds the upfront plan in the caller-supplied checklist, forcing structured planning on', async (t) => {
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const promptsSeen: string[] = []
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        promptsSeen.push(prompt)
+        // Only the plan call is ever expected here — a real, unambiguous
+        // role/name prediction for each caller step should fast-path both
+        // steps with zero further live calls (see reveal.html: a single
+        // <button>"Show secret message"</button> and its <p role="status">
+        // reveal target).
+        return JSON.stringify({
+          steps: [
+            { action: 'click', target: { role: 'button', nameContains: 'Show secret message' }, reason: 'reveal it' },
+            { action: 'assert_visible', target: { role: 'status', nameContains: 'agentic testing works' }, reason: 'confirm revealed' },
+            { action: 'done', outcome: 'goal-reached', reason: 'done' },
+          ],
+        })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({
+        name: 'five46_test',
+        arguments: {
+          url: server.url,
+          goal: 'reveal the secret message',
+          steps: [
+            { type: 'action', description: 'Click the button that shows the secret message' },
+            { type: 'assertion', description: 'The revealed message confirming agentic testing works is visible' },
+          ],
+          maxSteps: 5,
+        },
+      })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.equal(structured(result)?.passed, true)
+      assert.equal(promptsSeen.length, 1, 'both caller steps should fast-path — no further live decision call expected')
+      assert.ok(promptsSeen[0].includes('caller has already worked out the steps below'))
+      assert.ok(promptsSeen[0].includes('1. [action] Click the button that shows the secret message'))
+      assert.ok(promptsSeen[0].includes('2. [assertion] The revealed message confirming agentic testing works is visible'))
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
+test('five46_api tool with steps grounds the upfront plan in the caller-supplied checklist, forcing structured planning on', async () => {
+  const server = await startApiTestServer()
+  const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))
+  try {
+    const promptsSeen: string[] = []
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        promptsSeen.push(prompt)
+        return JSON.stringify({
+          steps: [
+            { action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' },
+            { action: 'assert_status', expected: 200, reason: 'confirm reachable' },
+            { action: 'done', outcome: 'goal-reached', reason: 'done' },
+          ],
+        })
+      },
+    }
+    const { client, close } = await connectedClient({ projectRoot, provider, apiKey: 'fake-key' })
+    try {
+      const result = await client.callTool({
+        name: 'five46_api',
+        arguments: {
+          baseUrl: server.url,
+          goal: 'confirm the items endpoint is reachable',
+          steps: [
+            { type: 'action', description: 'GET /items' },
+            { type: 'assertion', description: 'The response status is 200' },
+          ],
+        },
+      })
+      assert.equal(result.isError, undefined, JSON.stringify(result))
+      assert.equal(structured(result)?.passed, true)
+      assert.ok(promptsSeen[0].includes('caller has already worked out the steps below'))
+      assert.ok(promptsSeen[0].includes('1. [action] GET /items'))
+      assert.ok(promptsSeen[0].includes('2. [assertion] The response status is 200'))
+    } finally {
+      await close()
+    }
+  } finally {
+    await server.close()
+    rmSync(projectRoot, { recursive: true, force: true })
+  }
+})
+
 test('five46_api tool with story splits a raw story into independent goals and aggregates a per-AC report, all passing', async () => {
   const server = await startApiTestServer()
   const projectRoot = mkdtempSync(join(tmpdir(), 'five46-mcp-test-'))

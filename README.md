@@ -70,6 +70,10 @@ It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` fil
 - **Story mode** (`--story`) — splits a raw, multi-AC user story into
   independent goals and runs them with bounded concurrency, reporting a
   clear pass/fail per acceptance criterion. See "Story mode" below.
+- **Cross-run action cache** (`--action-cache`, opt-in) — skips the upfront
+  planning LLM call on a repeat run of the same goal by reusing a
+  previously-saved plan, falling back to a fresh plan automatically if the
+  page has changed. See "Cross-run action cache" below.
 
 ## five46 vs. cloud AI testing platforms
 
@@ -184,7 +188,9 @@ default upfront-plan-then-fast-path behavior and use the fully-adaptive,
 live-decision-every-step loop instead — see below), `--fast-steps` (opt-in,
 use a faster model for per-step decisions on Groq/Gemini — see below),
 `--story path` (split a raw multi-AC user story into independent goals and
-run them concurrently instead of a single `--goal` — see below).
+run them concurrently instead of a single `--goal` — see below),
+`--action-cache` (opt-in, skip the upfront planning LLM call on a repeat
+run of the same goal by reusing a previously-saved plan — see below).
 
 A successful run writes a real, human-readable Playwright `.spec.ts` file
 containing every confirmed-working step — re-runnable any time via
@@ -316,10 +322,11 @@ Confirming an outcome fast-paths too, not just navigating to it: a planned
 `assert_visible` step fast-paths under the same rule as clicks/fills (its
 target must resolve to exactly one real element, or it falls back to a live
 decision) — the visibility check itself still runs for real against the
-live page either way, nothing is assumed. `assert_text`/`assert_page_text`
-always make a live decision, since they'd also need to predict an exact
-expected text value for a page the plan never saw, a bigger risk than
-predicting an element's role/name. A well-formed goal can often complete
+live page either way, nothing is assumed. `assert_text`/`assert_value`/
+`assert_page_text`/`assert_page_text_absent` always make a live decision,
+since they'd also need to predict an exact expected text/value for a page
+the plan never saw, a bigger risk than predicting an element's role/name.
+A well-formed goal can often complete
 with a single LLM call total (the upfront plan) if every step, including
 the final confirmation, fast-paths.
 
@@ -329,9 +336,33 @@ five46 test http://localhost:3000 --goal "..." --no-structured-plan
 
 `--no-structured-plan` opts back into the fully-adaptive loop (a live
 decision every single step) — works the same way on `five46 api`. Note:
-this default applies to the `test`/`api` CLI commands only — MCP-driven
-runs (`five46 mcp`) always use the fully-adaptive loop regardless, since
-structured planning isn't exposed as an MCP tool parameter.
+this default applies to the `test`/`api` CLI commands only — an ordinary
+MCP-driven `goal`/`story` call always uses the fully-adaptive loop instead,
+since structured planning isn't independently exposed as an MCP tool
+parameter. The one exception: an MCP call that supplies `steps` (see below)
+forces structured planning on for that call, since that's what grounds it.
+
+## Cross-run action cache
+
+```bash
+five46 test http://localhost:3000 --goal "..." --action-cache
+```
+
+Opt-in, off by default, `test`/`api` CLI commands only (no MCP equivalent).
+Requires structured planning to be on (the default) — it's an alternative
+*source* for the upfront plan, not a parallel mechanism, so it has nothing
+to do with `--no-structured-plan` set. On a `goal-reached` run, the whole
+plan is saved to `~/.five46/cache.json`, keyed by project/goal/URL; the
+*next* run of that same goal skips the upfront planning LLM call entirely
+and reuses the cached plan — worthwhile when you're re-running the same
+check repeatedly (e.g. in a tight edit-test loop) and want to shave off
+that call's latency/cost every time. Every step is still resolved live
+against the real page/response before it runs, exactly like an ordinary
+structured-plan run — a stale cache (the page genuinely changed since it
+was written) is detected automatically and just falls back to a fresh live
+plan call, never a wrong guess. Disabled automatically during `--repeat`,
+since flakiness detection needs a genuinely fresh live decision on every
+repeat.
 
 ## Fast per-step decisions
 
@@ -424,11 +455,38 @@ for a `story` call) alongside the existing free-text report, so a calling
 coding agent can branch on a real field instead of parsing prose out of the
 report to decide whether to rework or move on.
 
+Both tools also accept an optional `steps` field alongside `goal` — an
+ordered checklist (1-50 items, `{ type: "action"|"assertion", description }`)
+of what you already know must happen, e.g. from having just read or written
+the flow being tested:
+
+```json
+{
+  "url": "http://localhost:3000/cart",
+  "goal": "guest can complete checkout",
+  "steps": [
+    { "type": "action", "description": "Click 'Add to cart' on the first product" },
+    { "type": "action", "description": "Go to /checkout and submit the test payment" },
+    { "type": "assertion", "description": "A confirmation page shows an order number" }
+  ]
+}
+```
+
+five46 still resolves every step against the real, live page itself — a
+step never skips discovery, it only saves five46 from having to invent the
+sequence from `goal` alone. Requires `goal` (the objective `steps`
+refines); mutually exclusive with `story` (one checklist doesn't map onto
+several independent scenarios). Forces structured-plan mode on for that
+call, so it costs the one extra upfront LLM call that mode always does.
+
 ## Known limitations
 
-- **No iframe or shadow DOM traversal** — elements inside an `<iframe>` or
-  a closed/open shadow root aren't visible to the agent's page snapshot
-  today. Works fine on pages that don't rely on either.
+- **No *closed* shadow DOM traversal** — elements inside a `mode: "closed"`
+  shadow root aren't visible to the agent's page snapshot (by design, a
+  closed shadow root is deliberately inaccessible to external tooling in
+  general, not just five46). An *open* shadow root (the overwhelming
+  majority of real-world web components) works fine, same as `<iframe>`/
+  `<frame>` content.
 - **Chromium only** for browser mode — no Firefox/WebKit yet.
 - A run itself is not deterministic (the same goal against the same page
   can take a different path next time) — the generated spec is the frozen,

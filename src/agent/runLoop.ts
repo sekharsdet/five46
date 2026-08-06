@@ -69,18 +69,33 @@ export const HARD_MAX_CONCURRENCY = 5
  * empty completion, not a truncated-but-non-empty one). Chosen with real
  * margin above the actual prompt schemas (planner.ts/apiPlanner.ts), not
  * guessed — see planner.test.ts's sizing sanity check for PLAN_MAX_OUTPUT_TOKENS. */
-/** Raised from an original 400 after a real live failure: even with Gemini's
- * `thinkingBudget: 1` (gemini.ts), thinking-token usage still has real
- * variance on a realistic prompt (33-60+ tokens observed, confirmed via
- * direct calls) — occasionally enough to truncate a legitimate response mid-JSON
- * at 400. Raised to match the shared 1024 fallback every provider already
- * uses when a caller omits maxOutputTokens entirely, removing the
- * Gemini-fragile special case rather than tuning it tighter. */
-export const ACTION_MAX_OUTPUT_TOKENS = 1024
-/** Larger than the browser engine's action cap: an API `request` action can
- * carry a real request body (e.g. a multi-field JSON payload for a POST),
- * meaningfully bigger than a browser action's `{"action":"click","ref":"e3",...}`. */
-export const API_ACTION_MAX_OUTPUT_TOKENS = 800
+/** Raised from an original 400, then 1024, after two real live failures —
+ * both against the SAME root cause, just two different severities of it.
+ * gemini.ts's own doc comment already names the mechanism: Gemini's
+ * "thinking" tokens are drawn from the same `maxOutputTokens` budget as the
+ * visible JSON answer, and `thinkingConfig.thinkingBudget: 1` is a hint, not
+ * a hard ceiling. The first raise (400 -> 1024) was tuned against
+ * `thoughtsTokenCount` in the 33-60 range, observed directly at the time.
+ * Re-measured live 2026-08-06 (`gemini-flash-latest` currently resolves to
+ * `gemini-3.6-flash`, confirmed via `modelVersion` in the raw response — see
+ * gemini.ts's own doc comment on alias drift) against realistic
+ * buildActionPrompt output: `thoughtsTokenCount` now ranges roughly 250-980
+ * on the exact same task shape, a real 10-15x jump from when 1024 was
+ * chosen — not a guess, a live repro that hit `finishReason: "MAX_TOKENS"`
+ * and failed to parse at the old cap. Raised again with real margin above
+ * that new observed ceiling, same non-guessed sizing standard as
+ * PLAN_MAX_OUTPUT_TOKENS itself. */
+export const ACTION_MAX_OUTPUT_TOKENS = 3072
+/** Scaled up proportionally to ACTION_MAX_OUTPUT_TOKENS's own 2026-08-06
+ * re-measurement (see its doc comment) — the same underlying Gemini
+ * thinking-token mechanism applies uniformly to every per-step decision
+ * call regardless of which engine (browser vs. API) made it; nothing about
+ * `apiRunner.ts`'s prompt shape changes that. Kept smaller than
+ * ACTION_MAX_OUTPUT_TOKENS, preserving the original relative sizing (an API
+ * `request` action's own JSON is typically smaller than a browser action's,
+ * even though a request body can occasionally be a real multi-field
+ * payload). */
+export const API_ACTION_MAX_OUTPUT_TOKENS = 2048
 /** Covers an upfront plan of up to HARD_MAX_STEPS (50) step objects. */
 export const PLAN_MAX_OUTPUT_TOKENS = 4096
 /** A "1-3 sentence hypothesis" plus a short suggestion — see rootCause.ts. */

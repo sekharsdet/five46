@@ -7,6 +7,7 @@ import { countConfirmationClauses, clauseLikelyMatches } from './planner'
 import { splitConfirmationClauses } from './clauseSplitter'
 import { isHostAllowed, isMethodAllowed, effectiveMethod } from './apiTypes'
 import type { ApiAction, ApiHistoryEntry, ApiPlan, ApiTestRun, ExecutedApiStep, HttpMethod, SafetyMode } from './apiTypes'
+import type { CallerPlanStep } from './types'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId, API_ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
 export interface RunApiTestOptions {
@@ -40,14 +41,20 @@ export interface RunApiTestOptions {
   onWrite?: (method: HttpMethod, url: string, reason: string) => void
   /** Same meaning as `RunAgentOptions.useStructuredPlan` — see its own doc
    * comment, including the "default false at this engine layer, `cli.ts`
-   * defaults it to true for the `api` command, MCP never sets it" nuance.
-   * The ordinary fully-adaptive loop is completely unchanged unless this is
-   * set. */
+   * defaults it to true for the `api` command, MCP never sets it on its own"
+   * nuance (MCP forces it on when `callerPlanSteps` is supplied — see
+   * below). The ordinary fully-adaptive loop is completely unchanged unless
+   * this is set. */
   useStructuredPlan?: boolean
   /** Same meaning as `RunAgentOptions.useFastSteps` — see its own doc
    * comment. Default false, opt-in via `--fast-steps`, only affects the
    * per-turn live action-decision call, never the upfront plan call. */
   useFastSteps?: boolean
+  /** Same meaning as `RunAgentOptions.callerPlanSteps` — see its own doc
+   * comment. MCP-only (`five46_api`'s `steps` param), fed straight into
+   * `buildApiPlanPrompt`; every downstream execution mechanism is
+   * unaffected. */
+  callerPlanSteps?: CallerPlanStep[]
 }
 
 const SAFE_METHODS = new Set<HttpMethod>(['GET', 'HEAD', 'OPTIONS'])
@@ -219,7 +226,7 @@ export async function runApiTest(options: RunApiTestOptions): Promise<ApiTestRun
   if (options.useStructuredPlan) {
     try {
       const planRaw = await options.provider.complete(
-        buildApiPlanPrompt(options.goal, options.safety, clauseTrackingActive ? clauses : undefined),
+        buildApiPlanPrompt(options.goal, options.safety, clauseTrackingActive ? clauses : undefined, options.callerPlanSteps),
         options.apiKey,
         { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS }
       )

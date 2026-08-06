@@ -70,6 +70,14 @@ test('generateAgentSpec renders assert_page_text as a real body-wide toContainTe
   assert.ok(spec.includes(`await expect(page.locator('body')).toContainText("Hello World!")`))
 })
 
+test('generateAgentSpec renders assert_page_text_absent as a real body-wide not.toContainText assertion, needing no selector', () => {
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'assert_page_text_absent', expectedText: 'Deleted item', reason: 'confirm it is gone' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true }]
+  const run: TestRun = { runId: 'abc123', url: 'http://localhost:1234', goal: 'confirm text is gone', steps, outcome: 'goal-reached' }
+
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes(`await expect(page.locator('body')).not.toContainText("Deleted item")`))
+})
+
 test('generateAgentSpec still writes the steps that succeeded before a failure, with an honest note about the outcome', () => {
   const steps: ExecutedStep[] = [
     { step: 1, action: { action: 'click', ref: 'e1', reason: 'open' }, outline: outlineWith('e1', '#reveal-btn'), ok: true },
@@ -160,6 +168,24 @@ test('generateAgentSpec translates a credential placeholder inside assert_text t
   assert.ok(!spec.includes(USERNAME_PLACEHOLDER))
 })
 
+test('generateAgentSpec renders assert_value as a real toHaveValue() regex assertion — substring semantics, matching the live run\'s own .includes() check, not toHaveValue()\'s own default exact-match behavior', () => {
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'assert_value', ref: 'e1', expectedValue: 'Edited!', reason: 'confirm the field updated' }, outline: outlineWith('e1', '#notes'), ok: true },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('await expect(page.locator("#notes")).toHaveValue(new RegExp("Edited!"))'), spec)
+})
+
+test('generateAgentSpec escapes regex metacharacters in an assert_value expectedValue, so a literal value containing them still matches literally', () => {
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'assert_value', ref: 'e1', expectedValue: '$19.99 (was $25.00)', reason: 'confirm price field' }, outline: outlineWith('e1', '#price'), ok: true },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('new RegExp("\\\\$19\\\\.99 \\\\(was \\\\$25\\\\.00\\\\)")'), spec)
+})
+
 test('generateAgentSpec leaves an ordinary string with no placeholder completely unchanged (unaffected by this feature)', () => {
   const steps: ExecutedStep[] = [
     { step: 1, action: { action: 'fill', ref: 'e1', value: 'ordinary text', reason: 'x' }, outline: outlineWith('e1', '#field'), ok: true },
@@ -243,4 +269,139 @@ test('generateAgentSpec prefers getByRole for a fill action too, on both the fil
   const spec = generateAgentSpec(run)
   assert.ok(spec.includes('page.getByRole("textbox", { name: "Search" }).fill("hello")'), spec)
   assert.ok(spec.includes('page.getByRole("textbox", { name: "Search" }).press(\'Enter\')'), spec)
+})
+
+test('generateAgentSpec always emits a dialog auto-accept handler, matching the live run\'s own always-on default', () => {
+  // The live run this file was recorded from always had confirm()/alert()/
+  // prompt() dialogs auto-accepted for its entire duration (see
+  // browser.ts's launchAgentBrowser) — a faithful standalone replay must
+  // set up the same handler, unconditionally, or a step that only worked
+  // live because of this would silently regress to Playwright's own
+  // default (auto-dismiss) once five46 is no longer involved.
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'click', ref: 'e1', reason: 'x' }, outline: outlineWith('e1', '#btn'), ok: true }]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes(`page.on('dialog', (dialog) => dialog.accept().catch(() => {}))`), spec)
+})
+
+test('generateAgentSpec renders hover, press_key, and upload as real, standalone Playwright calls', () => {
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'hover', ref: 'e1', reason: 'reveal tooltip' }, outline: outlineWith('e1', '#target'), ok: true },
+    { step: 2, action: { action: 'press_key', ref: 'e1', key: 'Escape', reason: 'dismiss' }, outline: outlineWith('e1', '#target'), ok: true },
+    { step: 3, action: { action: 'upload', ref: 'e1', filePath: '/tmp/resume.pdf', reason: 'attach' }, outline: outlineWith('e1', '#file-input'), ok: true },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('await page.locator("#target").hover()'), spec)
+  assert.ok(spec.includes('await page.locator("#target").press("Escape")'), spec)
+  assert.ok(spec.includes('await page.locator("#file-input").setInputFiles("/tmp/resume.pdf")'), spec)
+})
+
+test('generateAgentSpec renders dblclick as a real, standalone Playwright dblclick() call', () => {
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'dblclick', ref: 'e1', reason: 'enter edit mode' }, outline: outlineWith('e1', '#label'), ok: true }]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('await page.locator("#label").dblclick()'), spec)
+})
+
+test('generateAgentSpec renders drag as a real, standalone Playwright dragTo() call, resolving BOTH the source and destination selectors from the step\'s own outline', () => {
+  const outline: PageOutline = {
+    elements: [
+      { ref: 'e1', tag: 'li', role: 'listitem', name: 'Item C', selector: '#item-c' },
+      { ref: 'e2', tag: 'li', role: 'listitem', name: 'Item A', selector: '#item-a' },
+    ],
+    truncated: false,
+    totalFound: 2,
+  }
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'drag', ref: 'e1', targetRef: 'e2', reason: 'reorder' }, outline, ok: true }]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('await page.locator("#item-c").dragTo(page.locator("#item-a"))'), spec)
+})
+
+test('generateAgentSpec renders a drag whose destination lives inside an iframe with its own chained frameLocator, independent of the source\'s own frame', () => {
+  const outline: PageOutline = {
+    elements: [
+      { ref: 'e1', tag: 'li', role: 'listitem', name: 'Item C', selector: '#item-c' },
+      { ref: 'e2', tag: 'li', role: 'listitem', name: 'Item A', selector: '#item-a', frameChain: ['[id="board-frame"]'] },
+    ],
+    truncated: false,
+    totalFound: 2,
+  }
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'drag', ref: 'e1', targetRef: 'e2', reason: 'reorder' }, outline, ok: true }]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('await page.locator("#item-c").dragTo(page.frameLocator("[id=\\"board-frame\\"]").locator("#item-a"))'), spec)
+})
+
+test('generateAgentSpec renders a frame-scoped element via a chained frameLocator, matching browser.ts\'s own live resolveRoot()', () => {
+  const outline: PageOutline = {
+    elements: [{ ref: 'e1', tag: 'input', role: 'textbox', name: 'Cardholder name', selector: '[id="cardname"]', frameChain: ['[id="payment-frame"]'] }],
+    truncated: false,
+    totalFound: 1,
+  }
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'fill', ref: 'e1', value: 'Jane Doe', reason: 'x' }, outline, ok: true, frameChain: ['[id="payment-frame"]'] }]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('await page.frameLocator("[id=\\"payment-frame\\"]").locator("[id=\\"cardname\\"]").fill("Jane Doe")'), spec)
+})
+
+test('generateAgentSpec renders assert_page_text as a frame-aware check when the run touched any iframe, not just the plain single-body one', () => {
+  const frameOutline: PageOutline = {
+    elements: [{ ref: 'e1', tag: 'input', role: 'textbox', name: 'x', selector: '#x', frameChain: ['#payment-frame'] }],
+    truncated: false,
+    totalFound: 1,
+  }
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'fill', ref: 'e1', value: 'x', reason: 'x' }, outline: frameOutline, ok: true, frameChain: ['#payment-frame'] },
+    { step: 2, action: { action: 'assert_page_text', expectedText: 'Payment submitted', reason: 'confirm' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('for (const frame of page.frames())'), spec)
+  assert.ok(spec.includes('expect(combinedText).toContain("Payment submitted")'), spec)
+})
+
+test('generateAgentSpec renders assert_page_text_absent as a frame-aware check when the run touched any iframe, not just the plain single-body one', () => {
+  const frameOutline: PageOutline = {
+    elements: [{ ref: 'e1', tag: 'input', role: 'textbox', name: 'x', selector: '#x', frameChain: ['#payment-frame'] }],
+    truncated: false,
+    totalFound: 1,
+  }
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'fill', ref: 'e1', value: 'x', reason: 'x' }, outline: frameOutline, ok: true, frameChain: ['#payment-frame'] },
+    { step: 2, action: { action: 'assert_page_text_absent', expectedText: 'Payment pending', reason: 'confirm' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes('for (const frame of page.frames())'), spec)
+  assert.ok(spec.includes('expect(combinedText).not.toContain("Payment pending")'), spec)
+})
+
+test('generateAgentSpec captures a newly opened tab with Promise.all + context.waitForEvent, and switches later steps to it', () => {
+  // The exact race-safety pattern this exists for: a bare `await ...click()`
+  // followed by a separate `await context.waitForEvent('page')` risks
+  // missing the popup's own 'page' event if it fires before the second
+  // await even starts listening — Promise.all starts listening and fires
+  // the click in the same tick.
+  const steps: ExecutedStep[] = [
+    { step: 1, action: { action: 'click', ref: 'e1', reason: 'open new tab' }, outline: outlineWith('e1', '#open-link'), ok: true },
+    { step: 2, action: { action: 'assert_page_text', expectedText: 'New Window', reason: 'confirm' }, outline: { elements: [], truncated: false, totalFound: 0 }, ok: true, pageIndex: 1 },
+  ]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes(`async ({ page, context }) =>`), spec)
+  assert.ok(spec.includes(`const [page1] = await Promise.all([`), spec)
+  assert.ok(spec.includes(`context.waitForEvent('page'),`), spec)
+  assert.ok(spec.includes(`page.locator("#open-link").click(),`), spec)
+  assert.ok(spec.includes(`await page1.waitForLoadState().catch(() => {})`), spec)
+  assert.ok(spec.includes(`await expect(page1.locator('body')).toContainText("New Window")`), spec)
+})
+
+test('generateAgentSpec never adds the context fixture or any popup machinery when no step ever switched tabs', () => {
+  const steps: ExecutedStep[] = [{ step: 1, action: { action: 'click', ref: 'e1', reason: 'x' }, outline: outlineWith('e1', '#btn'), ok: true }]
+  const run: TestRun = { runId: 'x', url: 'http://localhost:1', goal: 'g', steps, outcome: 'goal-reached' }
+  const spec = generateAgentSpec(run)
+  assert.ok(spec.includes(`async ({ page }) =>`), spec)
+  assert.ok(!spec.includes('context'), 'the ordinary, no-popup case must stay exactly as simple as before this feature')
 })

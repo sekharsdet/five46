@@ -2,6 +2,7 @@ import type { ApiAction, ApiHistoryEntry, ApiPlan, HttpMethod, SafetyMode } from
 import { isMethodAllowed, isHostAllowed, effectiveMethod, VALID_METHODS } from './apiTypes'
 import { extractPlaceholderNames } from './apiExecutor'
 import { countConfirmationClauses } from './planner'
+import type { CallerPlanStep } from './types'
 
 const MAX_HISTORY = 10
 
@@ -159,8 +160,14 @@ const API_PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"request","method":"POST","
  * `buildApiActionPrompt`'s identical gate), asks the plan itself to predict
  * each assertion step's `clauseIndex` upfront — necessary since the fast
  * path never calls this file's per-step schema at all; see `apiRunner.ts`'s
- * fast-path clauseIndex refusal rule. */
-export function buildApiPlanPrompt(goal: string, safety: SafetyMode, clauses?: string[]): string {
+ * fast-path clauseIndex refusal rule.
+ *
+ * `callerSteps`, when passed (an MCP `steps` call — see `mcp/tools.ts`),
+ * mirrors `planner.ts`'s `buildPlanPrompt` identical parameter: seeds the
+ * plan with what the caller already knows (e.g. the exact endpoint/method
+ * from having just written it) instead of asking the model to invent a
+ * decomposition from `goal` alone. Only the instruction text changes. */
+export function buildApiPlanPrompt(goal: string, safety: SafetyMode, clauses?: string[], callerSteps?: CallerPlanStep[]): string {
   const clauseNote =
     clauses && clauses.length > 1
       ? [
@@ -170,11 +177,22 @@ export function buildApiPlanPrompt(goal: string, safety: SafetyMode, clauses?: s
         ]
       : []
   const clauseIndexHint = clauses && clauses.length > 1 ? `,"clauseIndex":<0-based index of the clause above this satisfies>` : ''
+  const callerStepsNote =
+    callerSteps && callerSteps.length > 0
+      ? [
+          ``,
+          `The caller has already worked out the steps below — do not invent your own sequence or add extra steps beyond what's listed. For each one, in order, produce the matching structured plan step. Only fall back to your own judgment if a listed step doesn't cleanly map to any action type below.`,
+          ...callerSteps.map((s, i) => `  ${i + 1}. [${s.type}] ${s.description}`),
+        ]
+      : []
   return [
-    `You are an API testing agent. Before making any requests, plan out the whole sequence of steps needed to accomplish this goal.`,
+    callerSteps && callerSteps.length > 0
+      ? `You are an API testing agent. Before making any requests, translate the caller-supplied steps below into the real sequence of requests/assertions needed.`
+      : `You are an API testing agent. Before making any requests, plan out the whole sequence of steps needed to accomplish this goal.`,
     ``,
     `Goal: ${goal}`,
     ...clauseNote,
+    ...callerStepsNote,
     ``,
     describeSafetyMode(safety),
     ``,

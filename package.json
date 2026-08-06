@@ -1,6 +1,6 @@
 {
   "name": "five46",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "mcpName": "io.github.sekharsdet/five46",
   "description": "Autonomous AI testing agent that verifies your app or API actually works while you're still building it. Give it a plain-English goal, your own LLM key (OpenAI/Anthropic/Gemini/Groq/Bedrock) drives the real thing locally, and a real standalone Playwright/node:test spec is captured as a permanent regression test afterward. Fully local, BYOK, no cloud sandbox.",
   "homepage": "https://github.com/sekharsdet/five46#readme",
@@ -19,7 +19,8 @@
     "dist/**/*.js",
     "dist/**/*.d.ts",
     "!dist/**/*.test.js",
-    "!dist/**/*.test.d.ts"
+    "!dist/**/*.test.d.ts",
+    "!dist/eval/**"
   ],
   "type": "commonjs",
   "engines": {
@@ -29,6 +30,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "ts-node src/cli.ts",
     "test": "npm run build && node --test $(find dist -name '*.test.js')",
+    "eval": "npm run build && node dist/eval/run.js",
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
@@ -78,6 +80,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@playwright/test": "^1.62.0",
     "playwright": "^1.62.0",
+    "yaml": "^2.9.0",
     "zod": "^4.4.3"
   }
 }

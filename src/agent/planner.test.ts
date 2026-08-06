@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { serializeOutline, buildActionPrompt, parseAgentAction, countConfirmationClauses, isDestructiveClickTarget, clauseLikelyMatches, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
+import { serializeOutline, buildActionPrompt, parseAgentAction, countConfirmationClauses, isDestructiveClickTarget, isImplausibleFillTarget, clauseLikelyMatches, buildPlanPrompt, parsePlan, resolvePlannedTarget, describePlannedStep } from './planner'
 import { USERNAME_PLACEHOLDER } from './browser'
 import type { PageOutline } from './types'
 import { PLAN_MAX_OUTPUT_TOKENS, HARD_MAX_STEPS } from './runLoop'
@@ -33,6 +33,19 @@ test('serializeOutline lists each element with its ref, and discloses truncation
   const truncated: PageOutline = { ...OUTLINE, truncated: true, totalFound: 5 }
   const truncatedText = serializeOutline(truncated)
   assert.ok(truncatedText.includes('3 more visible interactive element(s) not shown'))
+})
+
+test('serializeOutline flags a file input so the model knows to use "upload", not "fill"', () => {
+  const withFileInput: PageOutline = {
+    elements: [...OUTLINE.elements, { ref: 'e3', tag: 'input', role: 'textbox', name: 'Attach resume', selector: '#resume', isFileInput: true }],
+    truncated: false,
+    totalFound: 3,
+  }
+  const text = serializeOutline(withFileInput)
+  assert.ok(text.includes('[e3] textbox "Attach resume" (file input — use the "upload" action, never "fill")'))
+  // An ordinary element (no isFileInput) must render exactly as before this
+  // feature — no stray suffix on a field that was never flagged.
+  assert.ok(text.includes('[e1] button "Show secret message"\n') || text.includes('[e1] button "Show secret message"'))
 })
 
 test('buildActionPrompt includes the goal, the outline, and the exact JSON schema', () => {
@@ -103,6 +116,69 @@ test('parseAgentAction parses a real click response and validates the ref agains
   }
 })
 
+test('parseAgentAction parses a real hover response and validates the ref against this turn\'s outline', () => {
+  const raw = JSON.stringify({ action: 'hover', ref: 'e1', reason: 'reveal the tooltip' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'hover', ref: 'e1', reason: 'reveal the tooltip' })
+})
+
+test('parseAgentAction fails honestly on a hover with no valid ref', () => {
+  const raw = JSON.stringify({ action: 'hover', ref: 'e99', reason: 'nonexistent' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /valid refs/)
+})
+
+test('parseAgentAction parses a real dblclick response and validates the ref against this turn\'s outline', () => {
+  const raw = JSON.stringify({ action: 'dblclick', ref: 'e1', reason: 'enter edit mode' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'dblclick', ref: 'e1', reason: 'enter edit mode' })
+})
+
+test('parseAgentAction parses a real drag response, validating both ref and targetRef against this turn\'s outline', () => {
+  const raw = JSON.stringify({ action: 'drag', ref: 'e1', targetRef: 'e2', reason: 'reorder' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'drag', ref: 'e1', targetRef: 'e2', reason: 'reorder' })
+})
+
+test('parseAgentAction fails honestly on a drag whose targetRef is not one of this turn\'s valid refs, even when ref itself is valid', () => {
+  const raw = JSON.stringify({ action: 'drag', ref: 'e1', targetRef: 'e99', reason: 'reorder' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /targetRef/)
+})
+
+test('parseAgentAction parses a real press_key response, validating both the ref and the required key field', () => {
+  const raw = JSON.stringify({ action: 'press_key', ref: 'e2', key: 'Escape', reason: 'dismiss it' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'press_key', ref: 'e2', key: 'Escape', reason: 'dismiss it' })
+})
+
+test('parseAgentAction fails honestly on a press_key with no "key" field', () => {
+  const raw = JSON.stringify({ action: 'press_key', ref: 'e2', reason: 'missing key' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /"key" is missing/)
+})
+
+test('parseAgentAction parses a real upload response, validating both the ref and the required filePath field', () => {
+  const raw = JSON.stringify({ action: 'upload', ref: 'e2', filePath: '/tmp/fixture.txt', reason: 'attach the file' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'upload', ref: 'e2', filePath: '/tmp/fixture.txt', reason: 'attach the file' })
+})
+
+test('parseAgentAction fails honestly on an upload with no "filePath" field', () => {
+  const raw = JSON.stringify({ action: 'upload', ref: 'e2', reason: 'missing path' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /"filePath" is missing/)
+})
+
 test('parseAgentAction strips a markdown json fence some models add, without guessing at malformed content', () => {
   const raw = '```json\n' + JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' }) + '\n```'
   const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
@@ -167,6 +243,20 @@ test('parseAgentAction fails honestly when assert_page_text is missing expectedT
   if (!result.ok) assert.match(result.error, /expectedText/)
 })
 
+test('parseAgentAction accepts a valid assert_page_text_absent action, needing no ref', () => {
+  const raw = JSON.stringify({ action: 'assert_page_text_absent', expectedText: 'Deleted item', reason: 'confirm it is gone' })
+  const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
+  assert.ok(result.ok)
+  if (result.ok) assert.deepEqual(result.action, { action: 'assert_page_text_absent', expectedText: 'Deleted item', reason: 'confirm it is gone' })
+})
+
+test('parseAgentAction fails honestly when assert_page_text_absent is missing expectedText', () => {
+  const raw = JSON.stringify({ action: 'assert_page_text_absent', reason: 'r' })
+  const result = parseAgentAction(raw, EMPTY_OUTLINE, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /expectedText/)
+})
+
 test('isDestructiveClickTarget matches account/data-destruction phrases, not generic delete/remove verbs', () => {
   assert.equal(isDestructiveClickTarget('Delete Account'), true)
   assert.equal(isDestructiveClickTarget('Deactivate my account'), true)
@@ -196,6 +286,54 @@ test('parseAgentAction never blocks a click on a non-destructive-looking target,
   const raw = JSON.stringify({ action: 'click', ref: 'e2', reason: 'remove the item' })
   const result = parseAgentAction(raw, DELETE_OUTLINE, false)
   assert.ok(result.ok)
+})
+
+test('isImplausibleFillTarget flags known-never-fillable roles, never a real text-entry role', () => {
+  assert.equal(isImplausibleFillTarget('button'), true)
+  assert.equal(isImplausibleFillTarget('checkbox'), true)
+  assert.equal(isImplausibleFillTarget('link'), true)
+  assert.equal(isImplausibleFillTarget('heading'), true)
+  assert.equal(isImplausibleFillTarget('generic'), true)
+  assert.equal(isImplausibleFillTarget('textbox'), false)
+  assert.equal(isImplausibleFillTarget('combobox'), false)
+  assert.equal(isImplausibleFillTarget('searchbox'), false)
+})
+
+test('parseAgentAction rejects a fill on a real, live-found implausible target (a checkbox, matching react-select.com\'s own reasoning-quality miss) as a recoverable error the model can act on next turn', () => {
+  const outline: PageOutline = {
+    elements: [{ ref: 'e1', tag: 'input', role: 'checkbox', name: 'Searchable', selector: '#searchable-toggle' }],
+    truncated: false,
+    totalFound: 1,
+  }
+  const raw = JSON.stringify({ action: 'fill', ref: 'e1', value: 'Vanilla', reason: 'search for the option' })
+  const result = parseAgentAction(raw, outline, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    assert.equal(result.recoverable, true)
+    if (result.recoverable) assert.deepEqual(result.attemptedAction, { action: 'fill', ref: 'e1', value: 'Vanilla', submit: false, reason: 'search for the option' })
+    assert.match(result.error, /checkbox/)
+  }
+})
+
+test('parseAgentAction never blocks a fill on a genuine text-entry role', () => {
+  const raw = JSON.stringify({ action: 'fill', ref: 'e2', value: 'Ada', reason: 'enter the name' })
+  const result = parseAgentAction(raw, OUTLINE, false)
+  assert.ok(result.ok)
+})
+
+test('parseAgentAction rejects an assert_value on an implausible (non-form-field) target the same way fill is rejected', () => {
+  const outline: PageOutline = {
+    elements: [{ ref: 'e1', tag: 'button', role: 'button', name: 'Submit', selector: '#submit-btn' }],
+    truncated: false,
+    totalFound: 1,
+  }
+  const raw = JSON.stringify({ action: 'assert_value', ref: 'e1', expectedValue: 'Vanilla', reason: 'confirm the value' })
+  const result = parseAgentAction(raw, outline, false)
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    assert.equal(result.recoverable, true)
+    assert.match(result.error, /button/)
+  }
 })
 
 test('parseAgentAction blocks asserting visibility of the exact element just clicked/filled — it proves nothing changed', () => {
@@ -278,7 +416,7 @@ test('buildActionPrompt always discloses the assertion requirement upfront, not 
   // comment and DEVELOPMENT.md's "Known limitations" section.
   const withConfirmWording = buildActionPrompt('reveal the secret and confirm it is visible', [], OUTLINE)
   assert.ok(withConfirmWording.includes('at least 1 successful'))
-  assert.ok(withConfirmWording.includes('assert_visible, assert_text, or assert_page_text'))
+  assert.ok(withConfirmWording.includes('assert_visible, assert_text, assert_value, assert_page_text, or assert_page_text_absent'))
 
   const plainGoal = buildActionPrompt('reveal the secret', [], OUTLINE)
   assert.ok(plainGoal.includes('at least 1 successful'), 'the note must still appear even when the goal has no confirm/verify wording at all')
@@ -345,14 +483,39 @@ test('buildPlanPrompt warns against declaring goal-unreachable from assumption a
   assert.ok(prompt.includes('a guess made now'))
 })
 
+test('buildPlanPrompt grounds the plan in caller-supplied steps when given, instead of asking the model to invent its own sequence', () => {
+  const prompt = buildPlanPrompt('reveal the secret message', OUTLINE, undefined, [
+    { type: 'action', description: 'Click the reveal button' },
+    { type: 'assertion', description: 'The secret message is now visible' },
+  ])
+  assert.ok(prompt.includes('caller has already worked out the steps below'))
+  assert.ok(prompt.includes('1. [action] Click the reveal button'))
+  assert.ok(prompt.includes('2. [assertion] The secret message is now visible'))
+  // The JSON response contract is unchanged — still the same schema/fields.
+  assert.ok(prompt.includes('"steps"'))
+  assert.ok(prompt.includes('"nameContains"'))
+})
+
+test('buildPlanPrompt asks the model to invent its own sequence when no caller steps are given, same as before this option existed', () => {
+  const prompt = buildPlanPrompt('reveal the secret message', OUTLINE)
+  assert.ok(prompt.includes('plan out the whole sequence of steps needed'))
+  assert.ok(!prompt.includes('caller has already worked out'))
+})
+
 test('parsePlan strictly parses a real, well-formed plan response', () => {
   const raw = JSON.stringify({
     steps: [
       { action: 'click', target: { role: 'link', nameContains: 'Rooms' }, reason: 'open the listing' },
       { action: 'fill', target: { role: 'textbox', nameContains: 'name' }, value: 'Ada', submit: true, reason: 'fill the name' },
+      { action: 'hover', target: { role: 'button', nameContains: 'tooltip' }, reason: 'reveal the tooltip' },
+      { action: 'dblclick', target: { role: 'gridcell', nameContains: 'cell' }, reason: 'enter edit mode' },
+      { action: 'drag', target: { role: 'listitem', nameContains: 'Item C' }, destinationTarget: { role: 'listitem', nameContains: 'Item A' }, reason: 'reorder' },
+      { action: 'press_key', target: { role: 'textbox', nameContains: 'search' }, key: 'Escape', reason: 'dismiss it' },
+      { action: 'upload', target: { role: 'textbox', nameContains: 'resume' }, filePath: '/tmp/resume.pdf', reason: 'attach the file' },
       { action: 'assert_visible', target: { role: 'status', nameContains: 'price' }, reason: 'confirm price shown' },
       { action: 'assert_text', target: { role: 'status', nameContains: 'price' }, expectedText: '$100', reason: 'confirm exact price' },
       { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm text appears anywhere on the page' },
+      { action: 'assert_page_text_absent', expectedText: 'Goodbye World!', reason: 'confirm text is gone from the page' },
       { action: 'scroll', direction: 'down', reason: 'reveal more content' },
       { action: 'wait', reason: 'content may still be loading' },
       { action: 'done', outcome: 'goal-reached', reason: 'all confirmed' },
@@ -361,11 +524,22 @@ test('parsePlan strictly parses a real, well-formed plan response', () => {
   const result = parsePlan(raw)
   assert.equal(result.ok, true)
   if (!result.ok) throw new Error('unreachable')
-  assert.equal(result.plan.steps.length, 8)
+  assert.equal(result.plan.steps.length, 14)
   assert.deepEqual(result.plan.steps[0], { action: 'click', target: { role: 'link', nameContains: 'Rooms' }, reason: 'open the listing' })
-  assert.deepEqual(result.plan.steps[4], { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm text appears anywhere on the page' })
-  assert.deepEqual(result.plan.steps[6], { action: 'wait', reason: 'content may still be loading' })
-  assert.equal(result.plan.steps[7].action, 'done')
+  assert.deepEqual(result.plan.steps[2], { action: 'hover', target: { role: 'button', nameContains: 'tooltip' }, reason: 'reveal the tooltip' })
+  assert.deepEqual(result.plan.steps[3], { action: 'dblclick', target: { role: 'gridcell', nameContains: 'cell' }, reason: 'enter edit mode' })
+  assert.deepEqual(result.plan.steps[4], {
+    action: 'drag',
+    target: { role: 'listitem', nameContains: 'Item C' },
+    destinationTarget: { role: 'listitem', nameContains: 'Item A' },
+    reason: 'reorder',
+  })
+  assert.deepEqual(result.plan.steps[5], { action: 'press_key', target: { role: 'textbox', nameContains: 'search' }, key: 'Escape', reason: 'dismiss it' })
+  assert.deepEqual(result.plan.steps[6], { action: 'upload', target: { role: 'textbox', nameContains: 'resume' }, filePath: '/tmp/resume.pdf', reason: 'attach the file' })
+  assert.deepEqual(result.plan.steps[9], { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'confirm text appears anywhere on the page' })
+  assert.deepEqual(result.plan.steps[10], { action: 'assert_page_text_absent', expectedText: 'Goodbye World!', reason: 'confirm text is gone from the page' })
+  assert.deepEqual(result.plan.steps[12], { action: 'wait', reason: 'content may still be loading' })
+  assert.equal(result.plan.steps[13].action, 'done')
 })
 
 test('parsePlan strips a markdown json fence, the same accommodation parseAgentAction already makes', () => {
@@ -466,9 +640,29 @@ test('buildActionPrompt injects plan context only when a live fallback actually 
 
 test('describePlannedStep renders each planned action type in a short, human-readable phrase', () => {
   assert.equal(describePlannedStep({ action: 'click', target: { role: 'link', nameContains: 'Rooms' }, reason: 'r' }), 'click a link matching "Rooms"')
+  assert.equal(describePlannedStep({ action: 'hover', target: { role: 'button', nameContains: 'tip' }, reason: 'r' }), 'hover a button matching "tip"')
+  assert.equal(describePlannedStep({ action: 'dblclick', target: { role: 'gridcell', nameContains: 'cell' }, reason: 'r' }), 'double-click a gridcell matching "cell"')
+  assert.equal(
+    describePlannedStep({
+      action: 'drag',
+      target: { role: 'listitem', nameContains: 'Item C' },
+      destinationTarget: { role: 'listitem', nameContains: 'Item A' },
+      reason: 'r',
+    }),
+    'drag a listitem matching "Item C" onto a listitem matching "Item A"'
+  )
+  assert.equal(
+    describePlannedStep({ action: 'press_key', target: { role: 'textbox', nameContains: 'search' }, key: 'Escape', reason: 'r' }),
+    'press "Escape" on a textbox matching "search"'
+  )
+  assert.equal(
+    describePlannedStep({ action: 'upload', target: { role: 'textbox', nameContains: 'resume' }, filePath: '/tmp/r.pdf', reason: 'r' }),
+    'upload "/tmp/r.pdf" to a textbox matching "resume"'
+  )
   assert.equal(describePlannedStep({ action: 'scroll', direction: 'down', reason: 'r' }), 'scroll down')
   assert.equal(describePlannedStep({ action: 'wait', reason: 'r' }), 'wait')
   assert.equal(describePlannedStep({ action: 'assert_page_text', expectedText: 'Hello World!', reason: 'r' }), 'assert the page contains "Hello World!"')
+  assert.equal(describePlannedStep({ action: 'assert_page_text_absent', expectedText: 'Goodbye World!', reason: 'r' }), 'assert the page no longer contains "Goodbye World!"')
   assert.equal(describePlannedStep({ action: 'done', outcome: 'goal-reached', reason: 'r' }), 'done (goal-reached)')
 })
 
@@ -507,6 +701,10 @@ test('parseAgentAction captures a valid clauseIndex on an assertion', () => {
   const pageText = parseAgentAction(JSON.stringify({ action: 'assert_page_text', expectedText: 'hi', reason: 'r', clauseIndex: 2 }), EMPTY_OUTLINE, false)
   assert.ok(pageText.ok)
   if (pageText.ok) assert.deepEqual(pageText.action, { action: 'assert_page_text', expectedText: 'hi', reason: 'r', clauseIndex: 2 })
+
+  const pageTextAbsent = parseAgentAction(JSON.stringify({ action: 'assert_page_text_absent', expectedText: 'gone', reason: 'r', clauseIndex: 3 }), EMPTY_OUTLINE, false)
+  assert.ok(pageTextAbsent.ok)
+  if (pageTextAbsent.ok) assert.deepEqual(pageTextAbsent.action, { action: 'assert_page_text_absent', expectedText: 'gone', reason: 'r', clauseIndex: 3 })
 })
 
 test('parseAgentAction omits clauseIndex entirely (not clauseIndex: undefined) when absent or invalid, keeping every pre-existing exact-shape test unaffected', () => {
@@ -551,7 +749,7 @@ test('buildActionPrompt renders per-clause coverage instructions and a clauseInd
   assert.ok(withClauses.includes('"clauseIndex"'))
   // The old total-count wording must not also appear — the two notes are
   // mutually exclusive, never both rendered.
-  assert.ok(!withClauses.includes('successful assert_visible, assert_text, or assert_page_text action(s) before'))
+  assert.ok(!withClauses.includes('successful assert_visible, assert_text, assert_value, assert_page_text, or assert_page_text_absent action(s) before'))
 
   const withoutClauses = buildActionPrompt('goal', [], EMPTY_OUTLINE, undefined, true)
   assert.ok(!withoutClauses.includes('distinct things to confirm'))
@@ -562,7 +760,7 @@ test('buildActionPrompt treats a single-element clauses array as no compound str
   const prompt = buildActionPrompt('goal', [], EMPTY_OUTLINE, undefined, true, undefined, ['only one clause'])
   assert.ok(!prompt.includes('distinct things to confirm'))
   assert.ok(!prompt.includes('"clauseIndex"'))
-  assert.ok(prompt.includes('successful assert_visible, assert_text, or assert_page_text action(s) before'))
+  assert.ok(prompt.includes('successful assert_visible, assert_text, assert_value, assert_page_text, or assert_page_text_absent action(s) before'))
 })
 
 test('buildPlanPrompt renders per-clause coverage instructions and a clauseIndex schema hint only when 2+ clauses are passed', () => {

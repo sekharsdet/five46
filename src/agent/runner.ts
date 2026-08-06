@@ -1,10 +1,10 @@
 import type { LlmProvider } from '../llm/types'
 import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders } from './browser'
 import type { LoginCredentials, StorageState } from './browser'
-import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, resolvePlannedTarget, clauseLikelyMatches } from './planner'
+import { buildActionPrompt, buildPlanPrompt, parseAgentAction, parsePlan, countConfirmationClauses, isDestructiveClickTarget, isImplausibleFillTarget, resolvePlannedTarget, clauseLikelyMatches } from './planner'
 import { splitConfirmationClauses } from './clauseSplitter'
 import { domShapeSignature } from './actionCache'
-import type { AgentAction, AgentPlan, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
+import type { AgentAction, AgentPlan, CallerPlanStep, ExecutedStep, HistoryEntry, PageOutline, PlannedStep, TestRun } from './types'
 import { DEFAULT_MAX_STEPS, HARD_MAX_STEPS, makeRunId, ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
 export interface RunAgentOptions {
@@ -61,9 +61,12 @@ export interface RunAgentOptions {
    * defaulting it to `true` for the `test` command (see
    * `resolveStructuredPlan`), so every existing test calling `runAgent()`
    * directly without setting this is unaffected by that CLI-level default.
-   * MCP (`src/mcp/tools.ts`) also never sets this, so MCP-driven runs stay
-   * fully-adaptive regardless — a deliberate scope boundary, not an
-   * oversight. When set: one extra upfront `provider.complete()` call plans
+   * MCP (`src/mcp/tools.ts`) also never sets this on its own, so an
+   * ordinary MCP `goal`/`story` call stays fully-adaptive — a deliberate
+   * scope boundary, not an oversight. The one exception: an MCP call that
+   * supplies `callerPlanSteps` (below) forces this on, since there's
+   * otherwise nowhere for those steps to go. When set: one extra upfront
+   * `provider.complete()` call plans
    * the whole goal (see `planner.ts`'s `buildPlanPrompt`), and most planned
    * steps then execute directly against a fresh page snapshot with no
    * further LLM call at all — see the dedicated fast-path section in this
@@ -96,6 +99,15 @@ export interface RunAgentOptions {
    * silently to a live plan call, the exact same "never worse off for
    * having tried" posture a malformed live plan response already gets. */
   cachedPlan?: { domSignature: string; steps: PlannedStep[] }
+  /** MCP-only (`five46_test`'s `steps` param — see `mcp/tools.ts`): a
+   * caller-authored hint list fed into the upfront plan call (`planner.ts`'s
+   * `buildPlanPrompt`) instead of letting the model invent its own
+   * decomposition. Only meaningful when `useStructuredPlan` is also set (MCP
+   * forces it on whenever this is present); ignored otherwise. Never
+   * consulted by `cachedPlan` or any execution logic below — it only ever
+   * reaches `buildPlanPrompt`, so every safety/resolution mechanism in this
+   * file treats a caller-seeded plan identically to a self-invented one. */
+  callerPlanSteps?: CallerPlanStep[]
 }
 
 function actionSignature(action: AgentAction): string {
@@ -105,10 +117,24 @@ function actionSignature(action: AgentAction): string {
       return `${action.action}:${action.ref}`
     case 'fill':
       return `${action.action}:${action.ref}:${action.value}`
+    case 'hover':
+      return `hover:${action.ref}`
+    case 'dblclick':
+      return `dblclick:${action.ref}`
+    case 'drag':
+      return `drag:${action.ref}:${action.targetRef}`
+    case 'press_key':
+      return `press_key:${action.ref}:${action.key}`
+    case 'upload':
+      return `upload:${action.ref}:${action.filePath}`
     case 'assert_text':
       return `${action.action}:${action.ref}:${action.expectedText}`
+    case 'assert_value':
+      return `${action.action}:${action.ref}:${action.expectedValue}`
     case 'assert_page_text':
       return `assert_page_text:${action.expectedText}`
+    case 'assert_page_text_absent':
+      return `assert_page_text_absent:${action.expectedText}`
     case 'scroll':
       // Up/down must be distinct repeat-buckets, matching how fill/
       // assert_text already key off their value, not just the action
@@ -143,7 +169,14 @@ function actionSignature(action: AgentAction): string {
  * inline. Returns `undefined` for any non-assertion action, which the
  * caller already only calls this for real assertions in practice. */
 function getClauseIndex(action: AgentAction): number | undefined {
-  if (action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text') return action.clauseIndex
+  if (
+    action.action === 'assert_visible' ||
+    action.action === 'assert_text' ||
+    action.action === 'assert_value' ||
+    action.action === 'assert_page_text' ||
+    action.action === 'assert_page_text_absent'
+  )
+    return action.clauseIndex
   return undefined
 }
 
@@ -155,7 +188,12 @@ function clauseComparisonText(action: AgentAction, outline: PageOutline): string
       const name = outline.elements.find((el) => el.ref === action.ref)?.name ?? ''
       return `${name} ${action.expectedText}`
     }
+    case 'assert_value': {
+      const name = outline.elements.find((el) => el.ref === action.ref)?.name ?? ''
+      return `${name} ${action.expectedValue}`
+    }
     case 'assert_page_text':
+    case 'assert_page_text_absent':
       return action.expectedText
     default:
       return ''
@@ -307,7 +345,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       } else {
         try {
           const planRaw = await options.provider.complete(
-            buildPlanPrompt(options.goal, initialOutline, clauseTrackingActive ? clauses : undefined),
+            buildPlanPrompt(options.goal, initialOutline, clauseTrackingActive ? clauses : undefined, options.callerPlanSteps),
             options.apiKey,
             { maxOutputTokens: PLAN_MAX_OUTPUT_TOKENS }
           )
@@ -466,6 +504,17 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
               history.push({ action: attempted, result: 'failed', detail: 'blocked: destructive-looking click' })
               continue
             }
+            // The fast-path's own copy of parseAgentAction's identical
+            // fill-role-plausibility gate (planner.ts) — reproduced here
+            // for the exact same reason the destructive-click gate above
+            // is: this fast path deliberately never calls that parser at
+            // all. Unlike the destructive-click gate (a hard safety stop),
+            // an implausible fill target isn't unsafe, just probably a bad
+            // prediction — refusing to fast-path it and falling through to
+            // a live decision (below) gives the model a real chance to
+            // reconsider within the same step, rather than burning a whole
+            // step on a guaranteed-wrong action the way a hard fail would.
+            const fillTargetPlausible = plannedStep.action !== 'fill' || !isImplausibleFillTarget(candidate.role)
             // When clause tracking is active, an assert_visible plan step
             // with no usable clauseIndex (missing, or out of range for
             // this run's actual clause list — e.g. a plan made before
@@ -479,7 +528,7 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
               plannedStep.action !== 'assert_visible' ||
               !clauseTrackingActive ||
               (plannedStep.clauseIndex !== undefined && plannedStep.clauseIndex >= 0 && plannedStep.clauseIndex < clauses.length)
-            if (clauseIndexUsable) {
+            if (clauseIndexUsable && fillTargetPlausible) {
               action =
                 plannedStep.action === 'click'
                   ? { action: 'click', ref: candidate.ref, reason: plannedStep.reason }
@@ -561,12 +610,26 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       }
       lastSignature = signature
 
-      if (action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text') {
-        // assert_page_text has no `ref` (that's the whole point — see its
-        // own doc comment), so it's tracked by `expectedText` instead,
-        // reusing the same "current assertion target" slot rather than a
-        // second parallel counter.
-        const baseKey = action.action === 'assert_page_text' ? `page-text:${action.expectedText}` : action.ref
+      if (
+        action.action === 'assert_visible' ||
+        action.action === 'assert_text' ||
+        action.action === 'assert_value' ||
+        action.action === 'assert_page_text' ||
+        action.action === 'assert_page_text_absent'
+      ) {
+        // assert_page_text/assert_page_text_absent have no `ref` (that's the
+        // whole point — see their own doc comments), so they're tracked by
+        // `expectedText` instead, reusing the same "current assertion
+        // target" slot rather than a second parallel counter. The action
+        // type is folded into the key too — otherwise asserting text present
+        // then immediately asserting the SAME text absent (a legitimate,
+        // meaningful pair of checks) would collide into one repeat-tracked
+        // key and risk tripping the guard on two actions that are opposites
+        // of each other, not repeats.
+        const baseKey =
+          action.action === 'assert_page_text' || action.action === 'assert_page_text_absent'
+            ? `${action.action}:${action.expectedText}`
+            : action.ref
         // When clause tracking is active, a self-declared clauseIndex is
         // part of the repeat-identity too. Live-caught on GitHub: a model
         // legitimately re-asserted the exact same ref via assert_text twice
@@ -593,7 +656,15 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
           repeatedAssertionRef = key
           repeatedAssertionCount = 1
         }
-      } else if (action.action === 'click' || action.action === 'fill' || action.action === 'scroll' || action.action === 'wait') {
+      } else if (
+        action.action === 'click' ||
+        action.action === 'fill' ||
+        action.action === 'hover' ||
+        action.action === 'press_key' ||
+        action.action === 'upload' ||
+        action.action === 'scroll' ||
+        action.action === 'wait'
+      ) {
         repeatedAssertionRef = undefined
         repeatedAssertionCount = 0
       }
@@ -667,6 +738,22 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
       // it — only withheld from the confirmation-gate credit.
       const isTautologicalPageText =
         action.action === 'assert_page_text' && result.ok && baselineBodyText.includes(substitutePlaceholders(action.expectedText, options.credentials))
+      // The mirror-image gap for the negative case, arguably more important
+      // than the positive one: without this, a model could "confirm" a
+      // deletion/removal it never actually attempted just by asserting the
+      // absence of text that was never on the page to begin with (the
+      // baseline, captured before any action this run, already never
+      // contained it) — a trivially-true check that proves nothing about
+      // whether the goal's actual removal step worked.
+      const isTautologicalPageTextAbsent =
+        action.action === 'assert_page_text_absent' && result.ok && !baselineBodyText.includes(substitutePlaceholders(action.expectedText, options.credentials))
+
+      // Copied from the pre-action outline (not affected by healing — a
+      // heal re-matches within the same frame, never a different one, see
+      // browser.ts's own frameChain-equality filter in its healing
+      // candidates check) — see ExecutedStep.frameChain's own doc comment
+      // for why generateSpec.ts needs this alongside resolvedSelector.
+      const frameChain = 'ref' in action ? outline.elements.find((el) => el.ref === action.ref)?.frameChain : undefined
 
       steps.push({
         step: stepNumber,
@@ -680,6 +767,12 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         healed: result.healed,
         resolvedSelector: result.healedSelector,
         verifiedRoleLocator: result.verifiedRoleLocator,
+        frameChain,
+        // Absent (not 0) for the overwhelming majority case — see
+        // ExecutedStep.pageIndex's own doc comment for why the mere
+        // presence of this field is itself a meaningful signal to
+        // generateSpec.ts.
+        pageIndex: browser.pageIndex || undefined,
       })
       history.push({
         action,
@@ -692,15 +785,22 @@ export async function runAgent(options: RunAgentOptions): Promise<TestRun> {
         // response bodies.
         detail: isTautologicalPageText
           ? 'succeeded, but this exact text was already present before any actions ran this run — does not count as confirmation of anything'
-          : result.ok
-            ? result.healed
-              ? 'succeeded after healing a stale selector'
-              : ''
-            : (result.failureDetail ?? 'failed'),
+          : isTautologicalPageTextAbsent
+            ? 'succeeded, but this exact text was already absent before any actions ran this run — does not count as confirmation of anything'
+            : result.ok
+              ? result.healed
+                ? 'succeeded after healing a stale selector'
+                : ''
+              : (result.failureDetail ?? 'failed'),
       })
 
-      const isAssertion = action.action === 'assert_visible' || action.action === 'assert_text' || action.action === 'assert_page_text'
-      if (isAssertion && result.ok && !isTautologicalPageText) {
+      const isAssertion =
+        action.action === 'assert_visible' ||
+        action.action === 'assert_text' ||
+        action.action === 'assert_value' ||
+        action.action === 'assert_page_text' ||
+        action.action === 'assert_page_text_absent'
+      if (isAssertion && result.ok && !isTautologicalPageText && !isTautologicalPageTextAbsent) {
         if (clauseTrackingActive) {
           // Never trusted blindly — `action.clauseIndex` is the model's own
           // self-declared claim (see `AgentAction`'s doc comment). Requires

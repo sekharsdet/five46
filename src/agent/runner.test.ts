@@ -786,7 +786,14 @@ test('runAgent completes a real login through credential placeholders, never sen
         turn++
         if (turn === 1) return JSON.stringify({ action: 'fill', ref: refFor(prompt, 'sername'), value: USERNAME_PLACEHOLDER, reason: 'fill username' })
         if (turn === 2) return JSON.stringify({ action: 'fill', ref: refFor(prompt, 'assword'), value: PASSWORD_PLACEHOLDER, reason: 'fill password' })
-        if (turn === 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Log in'), reason: 'submit' })
+        // 'button "Log in"', not just 'Log in' — the page's own <h1>Log in</h1>
+        // heading is now a real, legitimately outline-eligible candidate too
+        // (accessibility-tree-based discovery surfaces headings on its own —
+        // a real, deliberate improvement, see DEVELOPMENT.md), so a bare
+        // 'Log in' substring is genuinely ambiguous between it and the submit
+        // button; role-qualifying the match keeps this test pinned to the
+        // button specifically, same as it always intended.
+        if (turn === 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'button "Log in"'), reason: 'submit' })
         if (turn === 4) return JSON.stringify({ action: 'assert_text', ref: refFor(prompt, 'Welcome back'), expectedText: 'Welcome back', reason: 'confirm logged in' })
         return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'logged in' })
       },
@@ -1352,6 +1359,107 @@ test('runAgent does not accept an assert_page_text whose expected text was alrea
   }
 })
 
+test('runAgent accepts a genuine assert_page_text_absent as real confirmation after an action that actually removes the target text', async (t) => {
+  // The exact real-world shape this action exists for (found live on
+  // TodoMVC): confirm something is GONE after an action that removes it.
+  // #notice starts genuinely present and is removed via a real .remove()
+  // call on click — the same DOM-removal shape as the live case, not a
+  // CSS-hide.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Dismiss notice'), reason: 'dismiss it' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_page_text_absent', expectedText: 'You have unread notifications', reason: 'confirm the notice is gone' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'notice confirmed gone' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'dismiss the notice and confirm it is gone',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    const absentStep = run.steps.find((s) => s.action.action === 'assert_page_text_absent')
+    assert.ok(absentStep)
+    assert.equal(absentStep!.ok, true)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent does not accept an assert_page_text_absent whose expected text was never present at all, as confirmation', async (t) => {
+  // The mirror-image gap of the assert_page_text tautology test above,
+  // arguably the more important direction: without this, a model could
+  // "confirm" a removal it never attempted at all, just by asserting the
+  // absence of text that was never on the page to begin with — trivially
+  // true, proves nothing about whether the goal's actual action worked.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'assert_page_text_absent', expectedText: 'this text is not anywhere on this page', reason: 'trivially true, was never there' })
+        if (turn === 2) return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'trust me, confirmed absent' })
+        // Only reached if turn 2 was correctly rejected: a genuinely real
+        // removal action, then a genuinely new (non-tautological) absence
+        // check, must satisfy the gate — the guard isn't just blocking
+        // `done`, it's specifically blocking the *trivial* assertion.
+        if (turn === 3) return JSON.stringify({ action: 'click', ref: refFor(prompt, 'Dismiss notice'), reason: 'actually remove something this time' })
+        if (turn === 4) return JSON.stringify({ action: 'assert_page_text_absent', expectedText: 'You have unread notifications', reason: 'confirm the notice is genuinely gone now' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'genuinely confirmed now' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'confirm something that was never there is absent',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 10,
+      headless: true,
+      artifactDir,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 5, 'the turn-2 done attempt must have been rejected — the turn-1 assertion was trivially true before any action ran, so it must not count as confirmation')
+    // The tautological assertion still genuinely succeeded (the DOM check
+    // itself is real) — it must be recorded as a real, correctly-executed
+    // step, not silently dropped or marked as a failure.
+    const tautologicalStep = run.steps.find((s) => s.action.action === 'assert_page_text_absent' && s.action.expectedText === 'this text is not anywhere on this page')
+    assert.ok(tautologicalStep)
+    assert.equal(tautologicalStep!.ok, true)
+    const genuineStep = run.steps.find((s) => s.action.action === 'assert_page_text_absent' && s.action.expectedText === 'You have unread notifications')
+    assert.ok(genuineStep)
+    assert.equal(genuineStep!.ok, true)
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
 test('runAgent blocks a real click on a destructive-looking button by default, never actually clicking it', async (t) => {
   if (!(await playwrightAvailable())) {
     t.skip('playwright unavailable in this environment')
@@ -1911,6 +2019,73 @@ test('runAgent with useStructuredPlan allows a fast-pathed destructive click whe
     assert.equal(run.planStats?.fastPathedSteps, 2)
     assert.equal(destructiveClicks.length, 1)
     assert.equal(destructiveClicks[0].name, 'Delete Account')
+  } finally {
+    await server.close()
+    rmSync(artifactDir, { recursive: true, force: true })
+  }
+})
+
+test('runAgent with useStructuredPlan refuses to fast-path a fill onto an implausible (non-text-entry) target, falling back to a live decision instead of blindly filling it', async (t) => {
+  // The fast-path's own copy of parseAgentAction's isImplausibleFillTarget
+  // gate — real, live-found reasoning-quality miss (react-select.com): the
+  // model's OWN upfront plan can just as easily predict the wrong role as
+  // a live per-step decision can, and the fast path deliberately never
+  // calls parseAgentAction at all, so this must be enforced independently
+  // at the fast-path's own execution site too — same reasoning as the
+  // destructive-click fast-path gate above. Unlike that one (a hard
+  // safety stop), this isn't unsafe, just probably wrong: refusing to
+  // fast-path it should fall through to a real live decision within the
+  // SAME step, not burn a whole step failing outright.
+  if (!(await playwrightAvailable())) {
+    t.skip('playwright unavailable in this environment')
+    return
+  }
+  const server = await startFixtureServer()
+  const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
+  try {
+    let turn = 0
+    const fakeProvider: LlmProvider = {
+      id: 'fake',
+      async complete(prompt) {
+        turn++
+        if (turn === 1) {
+          return JSON.stringify({
+            steps: [
+              // Resolves to exactly one real candidate (reveal.html's own
+              // real checkbox) — genuinely fast-pathable by candidate
+              // count alone, which is exactly why the role-plausibility
+              // gate has to be a separate, independent check.
+              { action: 'fill', target: { role: 'checkbox', nameContains: 'Subscribe' }, value: 'yes please', reason: 'subscribe' },
+              { action: 'done', outcome: 'goal-reached', reason: 'done' },
+            ],
+          })
+        }
+        // Only reached if the fill step correctly fell through to a live
+        // decision instead of blindly fast-pathing the fill — recovers by
+        // doing something real and sensible instead (confirming the
+        // checkbox is genuinely there), satisfying the confirmation gate
+        // so the plan's own fast-pathed "done" step can then succeed.
+        return JSON.stringify({ action: 'assert_visible', ref: refFor(prompt, 'Subscribe'), reason: 'confirm the checkbox is there' })
+      },
+    }
+
+    const run = await runAgent({
+      url: server.url,
+      goal: 'subscribe to updates',
+      provider: fakeProvider,
+      apiKey: 'fake-key',
+      maxSteps: 5,
+      headless: true,
+      artifactDir,
+      useStructuredPlan: true,
+    })
+
+    assert.equal(run.outcome, 'goal-reached')
+    assert.equal(turn, 2, 'the fill step must have fallen through to exactly one live decision, not fast-pathed straight through')
+    assert.ok(
+      !run.steps.some((s) => s.action.action === 'fill'),
+      'the implausible fill must never have actually executed at all, fast-pathed or otherwise'
+    )
   } finally {
     await server.close()
     rmSync(artifactDir, { recursive: true, force: true })

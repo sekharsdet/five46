@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync, statSync, readFileSync } from 'fs'
+import { mkdtempSync, rmSync, existsSync, statSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { launchAgentBrowser, snapshot, executeAction, substitutePlaceholders, evaluateWithNavigationRaceRetry, USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
@@ -316,23 +316,64 @@ test('executeAction assert_text succeeds against text that only appears after a 
   }
 })
 
+test('executeAction assert_value checks a real input\'s current VALUE, which assert_text can never see — a real, live-found gap found via src/eval/\'s double-click-to-edit regression probe: body.innerText() genuinely never includes an input\'s value string, confirmed directly', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<input id="notes" value="Edited!" /><p>Some unrelated visible text</p>`)
+    const bodyText = await browser.page.locator('body').innerText()
+    assert.ok(!bodyText.includes('Edited!'), 'test setup: the value must NOT be part of the page\'s visible text for this to prove anything')
+
+    const outline = await snapshot(browser.page)
+    const input = outline.elements.find((el) => el.role === 'textbox')
+    assert.ok(input, `expected the input as a candidate, got: ${JSON.stringify(outline.elements)}`)
+
+    const result = await executeAction(browser.page, { action: 'assert_value', ref: input!.ref, expectedValue: 'Edited!', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+    assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('executeAction assert_value fails honestly, naming the mismatch, when the value genuinely does not match', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<input id="notes" value="something else" />`)
+    const outline = await snapshot(browser.page)
+    const input = outline.elements.find((el) => el.role === 'textbox')
+    const result = await executeAction(browser.page, { action: 'assert_value', ref: input!.ref, expectedValue: 'Edited!', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+    assert.equal(result.ok, false)
+    assert.match(result.failureDetail ?? '', /Edited!/)
+  } finally {
+    await browser.close()
+  }
+})
+
 test('executeAction assert_page_text finds real page text that was never in the interactive-elements outline at all', async (t) => {
-  // The real, deeper gap this fixes: snapshot()'s SELECTOR
-  // ('button, a, input, select, textarea, [role]') never includes a plain
-  // heading with no ARIA role — confirmed live against
-  // the-internet.herokuapp.com's own `<h4>Hello World!</h4>`, no `role`
-  // attribute at all. No amount of waiting makes such text assertable via
-  // assert_visible/assert_text, since there's never a `ref` for it. This
-  // fixture's own `<h1>Simple Reveal</h1>` is the same shape (no `role`).
+  // The real, deeper gap this fixes: real, rendered text with no
+  // accessible representation at all — a plain `<div>`/`<span>` with no
+  // ARIA role and no `aria-label`, confirmed live to still be genuinely
+  // outline-invisible even under the new accessibility-tree-based discovery
+  // (unlike a heading or a `role="status"` message, which that mechanism
+  // now legitimately surfaces on its own — a real, deliberate improvement,
+  // see DEVELOPMENT.md — so this repro deliberately avoids that shape). No
+  // amount of waiting makes such text assertable via assert_visible/
+  // assert_text, since there's never a `ref` for it.
   const browser = await withRealBrowser(t)
   if (!browser) return
   const server = await startFixtureServer()
   try {
     await browser.page.goto(server.url)
+    await browser.page.evaluate(`(() => {
+      const el = document.createElement('div')
+      el.textContent = 'Visible But Not Accessible'
+      document.body.appendChild(el)
+    })()`)
     const outline = await snapshot(browser.page)
-    assert.ok(!outline.elements.some((el) => el.name.includes('Simple Reveal')), 'test setup: the heading must NOT be in the outline for this to prove anything')
+    assert.ok(!outline.elements.some((el) => el.name.includes('Visible But Not Accessible')), 'test setup: the div must NOT be in the outline for this to prove anything')
 
-    const result = await executeAction(browser.page, { action: 'assert_page_text', expectedText: 'Simple Reveal', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
+    const result = await executeAction(browser.page, { action: 'assert_page_text', expectedText: 'Visible But Not Accessible', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 1)
     assert.equal(result.ok, true)
   } finally {
     await browser.close()
@@ -361,6 +402,47 @@ test('executeAction assert_page_text succeeds against text with no ARIA role tha
     // assert_visible/assert_text poll tests above.
     const result = await executeAction(browser.page, { action: 'assert_page_text', expectedText: 'Hello World!', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 2)
     assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+test('executeAction assert_page_text_absent passes once a real click removes the target text from the DOM entirely, and fails honestly while the text is still there', async (t) => {
+  // Real, live-found gap: every other assertion only ever proves presence.
+  // A goal confirming something is GONE (a TodoMVC item removed from the
+  // DOM under an "Active" filter, confirmed live — not merely CSS-hidden)
+  // had no honest action to express at all, so the model looped instead.
+  // This fixture's #notice is removed via a real .remove() call, the same
+  // shape as that live case.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+
+    const stillPresent = await executeAction(
+      browser.page,
+      { action: 'assert_page_text_absent', expectedText: 'You have unread notifications', reason: 'test' },
+      outline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      1
+    )
+    assert.equal(stillPresent.ok, false, 'must fail honestly while the text is genuinely still on the page')
+
+    const dismissRef = outline.elements.find((el) => el.name === 'Dismiss notice')!.ref
+    const clickResult = await executeAction(browser.page, { action: 'click', ref: dismissRef, reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-agent-test-')), 2)
+    assert.equal(clickResult.ok, true)
+
+    const nowAbsent = await executeAction(
+      browser.page,
+      { action: 'assert_page_text_absent', expectedText: 'You have unread notifications', reason: 'test' },
+      outline,
+      mkdtempSync(join(tmpdir(), 'five46-agent-test-')),
+      3
+    )
+    assert.equal(nowAbsent.ok, true)
   } finally {
     await browser.close()
     await server.close()
@@ -401,25 +483,34 @@ test('executeAction on a failing assertion captures a real screenshot and DOM sn
 
 test('executeAction on a failing assertion captures the page\'s real visible text to a local file, even when the interactive-elements outline is sparse', async (t) => {
   // Reproduces the real, live-found bug directly: a page with rich TEXT
-  // content (a heading, a paragraph) but almost no INTERACTIVE elements
-  // (button/a/input/[role]) — the exact shape that made a root-cause
-  // hypothesis wrongly call a fully-rendered real page "blank." Proves the
-  // captured file holds the real content the sparse outline alone would
-  // never reveal.
+  // content but almost no ELEMENT the outline surfaces — the exact shape
+  // that made a root-cause hypothesis wrongly call a fully-rendered real
+  // page "blank." Proves the captured file holds the real content the
+  // sparse outline alone would never reveal. `aria-hidden="true"` is used
+  // (rather than plain text/headings, which `snapshot()`'s accessibility-
+  // tree-based discovery now surfaces on its own — a real, deliberate
+  // improvement to the exact bug this test guards, see DEVELOPMENT.md) to
+  // keep this specific repro genuinely reproducible regardless: content
+  // explicitly hidden from the accessibility tree is still real, rendered,
+  // *visible* text a human — and this file's own visibleTextPath capture,
+  // which reads the page directly, not through any outline — must still see.
   const browser = await withRealBrowser(t)
   if (!browser) return
   const artifactDir = mkdtempSync(join(tmpdir(), 'five46-agent-test-'))
   try {
     await browser.page.setContent(`
-      <h1>Single Room</h1>
-      <p>A cozy, accessible room with a view.</p>
-      <div>£100 per night</div>
+      <div aria-hidden="true">
+        <h1>Single Room</h1>
+        <p>A cozy, accessible room with a view.</p>
+        <div>£100 per night</div>
+      </div>
       <button id="unrelated-btn">Unrelated</button>
     `)
     const outline = await snapshot(browser.page)
-    // Confirms the real gap: the outline the root-cause LLM used to see is
-    // near-empty despite the page being full of real, rendered content.
-    assert.equal(outline.elements.length, 1, 'test setup: only the button should be interactive-eligible')
+    // Confirms the real gap: the outline the root-cause LLM used to see
+    // never mentions the room's actual description/price at all, despite
+    // the page being full of that real, rendered content.
+    assert.ok(!outline.elements.some((el) => el.name.includes('£100')), 'test setup: the price must not be in the outline for this to prove anything')
 
     // A ref that never existed in this outline — a simple, reliable way to
     // force a genuine failure through the same fail() path any real
@@ -1084,5 +1175,632 @@ test('snapshot() genuinely recovers from a real navigation race against a real b
   } finally {
     await browser.close()
     await server.close()
+  }
+})
+
+test('executeAction hover triggers a real :hover state, revealing CSS-gated content — a real, live gap: the-internet.herokuapp.com/hovers had no hover action at all, only click/fill', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <style>#tip { display: none; } #target:hover + #tip { display: block; }</style>
+      <button id="target">Hover for tip</button>
+      <p id="tip" role="status">Tip revealed</p>
+    `)
+    const outline = await snapshot(browser.page)
+    const target = outline.elements.find((el) => el.name === 'Hover for tip')
+    assert.ok(target, `expected a "Hover for tip" element, got: ${JSON.stringify(outline.elements)}`)
+    const result = await executeAction(browser.page, { action: 'hover', ref: target!.ref, reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-')), 1)
+    assert.equal(result.ok, true)
+    await assert.doesNotReject(browser.page.locator('#tip').waitFor({ state: 'visible', timeout: 2000 }), 'hovering should have revealed the CSS-gated tip')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('executeAction dblclick triggers a real dblclick event, distinct from two ordinary clicks — a real, live-found gap found via src/eval/\'s regression corpus: an inline-edit-mode UI has no honest action without this', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<div id="label" aria-label="Double-click to edit" ondblclick="document.getElementById('result').textContent='edit mode'">Double-click to edit</div><p id="result" role="status"></p>`)
+    const outline = await snapshot(browser.page)
+    const target = outline.elements.find((el) => el.name.includes('Double-click'))
+    assert.ok(target, `expected the label as a candidate, got: ${JSON.stringify(outline.elements)}`)
+    const result = await executeAction(browser.page, { action: 'dblclick', ref: target!.ref, reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-')), 1)
+    assert.equal(result.ok, true)
+    assert.equal(await browser.page.locator('#result').textContent(), 'edit mode')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('executeAction drag performs a real drag gesture that a mouse-event-based custom sortable list (not native HTML5 draggable) actually responds to — a real, live-found gap found via src/eval/\'s regression corpus: no existing action could express a drag at all', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <ul id="list">
+        <li id="item-a" data-name="A">A</li>
+        <li id="item-b" data-name="B">B</li>
+      </ul>
+      <p id="order" role="status">Order: A, B</p>
+      <script>
+        let dragging = null;
+        document.querySelectorAll('#list li').forEach((li) => li.addEventListener('mousedown', () => { dragging = li; }));
+        document.addEventListener('mousemove', (e) => {
+          if (!dragging) return;
+          for (const item of document.querySelectorAll('#list li')) {
+            if (item === dragging) continue;
+            const rect = item.getBoundingClientRect();
+            if (e.clientY > rect.top && e.clientY < rect.bottom) {
+              item.parentNode.insertBefore(dragging, item);
+              break;
+            }
+          }
+        });
+        document.addEventListener('mouseup', () => {
+          if (dragging) document.getElementById('order').textContent = 'Order: ' + Array.from(document.querySelectorAll('#list li')).map((el) => el.dataset.name).join(', ');
+          dragging = null;
+        });
+      </script>
+    `)
+    const outline = await snapshot(browser.page)
+    const itemA = outline.elements.find((el) => el.name === 'A')
+    const itemB = outline.elements.find((el) => el.name === 'B')
+    assert.ok(itemA && itemB, `expected both list items as candidates, got: ${JSON.stringify(outline.elements)}`)
+    const result = await executeAction(browser.page, { action: 'drag', ref: itemB!.ref, targetRef: itemA!.ref, reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-')), 1)
+    assert.equal(result.ok, true)
+    assert.equal(await browser.page.locator('#order').textContent(), 'Order: B, A')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('executeAction press_key dispatches a real keyboard event — unlike fill, which only sets a value directly and never fires keydown/keyup at all', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <input id="target" type="text" />
+      <p id="result" role="status"></p>
+      <script>
+        document.getElementById('target').addEventListener('keydown', (e) => {
+          document.getElementById('result').textContent = 'Key: ' + e.key;
+        });
+      </script>
+    `)
+    const outline = await snapshot(browser.page)
+    const target = outline.elements.find((el) => el.role === 'textbox')
+    assert.ok(target)
+    const result = await executeAction(browser.page, { action: 'press_key', ref: target!.ref, key: 'Escape', reason: 'test' }, outline, mkdtempSync(join(tmpdir(), 'five46-')), 1)
+    assert.equal(result.ok, true)
+    assert.equal(await browser.page.locator('#result').textContent(), 'Key: Escape')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot flags a real <input type="file"> with isFileInput, and executeAction upload actually attaches the file — fill silently no-ops on this element type instead', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const dir = mkdtempSync(join(tmpdir(), 'five46-upload-'))
+  const filePath = join(dir, 'sample.txt')
+  writeFileSync(filePath, 'five46 upload test fixture')
+  try {
+    await browser.page.setContent(`
+      <input id="file-input" type="file" />
+      <input id="text-input" type="text" />
+      <p id="result" role="status"></p>
+      <script>
+        document.getElementById('file-input').addEventListener('change', (e) => {
+          document.getElementById('result').textContent = 'File: ' + (e.target.files[0] ? e.target.files[0].name : 'none');
+        });
+      </script>
+    `)
+    const outline = await snapshot(browser.page)
+    const fileInput = outline.elements.find((el) => el.selector === '[id="file-input"]')
+    const textInput = outline.elements.find((el) => el.selector === '[id="text-input"]')
+    assert.equal(fileInput?.isFileInput, true)
+    assert.equal(textInput?.isFileInput, undefined, 'an ordinary text input must not be flagged as a file input')
+
+    const result = await executeAction(browser.page, { action: 'upload', ref: fileInput!.ref, filePath, reason: 'test' }, outline, dir, 1)
+    assert.equal(result.ok, true)
+    assert.equal(await browser.page.locator('#result').textContent(), 'File: sample.txt')
+  } finally {
+    await browser.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('launchAgentBrowser auto-accepts a native confirm() dialog by default — Playwright itself auto-dismisses (Cancel) with no handler at all, a real, live-found gap', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <button id="confirm-btn" onclick="document.getElementById('result').textContent = confirm('sure?') ? 'accepted' : 'dismissed'">Confirm</button>
+      <p id="result" role="status"></p>
+    `)
+    await browser.page.locator('#confirm-btn').click()
+    await assert.doesNotReject(
+      browser.page.locator('#result').filter({ hasText: 'accepted' }).waitFor({ state: 'visible', timeout: 2000 }),
+      'expected the confirm() dialog to be auto-accepted, not left at Playwright\'s own default (auto-dismiss/Cancel)'
+    )
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot finds elements inside a real iframe, tagged with frameChain, and executeAction resolves them via a chained frameLocator — a real, live-found gap: a TinyMCE-style editor iframe was previously completely invisible to both snapshot() and executeAction()', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<h1>Outer</h1><iframe id="inner-frame"></iframe>`)
+    const frame = browser.page.frames().find((f) => f !== browser.page.mainFrame())
+    assert.ok(frame, 'expected a real child frame for the iframe element')
+    await frame!.setContent(`
+      <input id="inner-input" />
+      <button id="inner-btn" onclick="document.getElementById('inner-result').textContent='clicked'">Go</button>
+      <p id="inner-result" role="status"></p>
+    `)
+
+    const outline = await snapshot(browser.page)
+    const innerInput = outline.elements.find((el) => el.role === 'textbox')
+    const innerBtn = outline.elements.find((el) => el.role === 'button')
+    assert.ok(innerInput, `expected a textbox from inside the iframe, got: ${JSON.stringify(outline.elements)}`)
+    assert.ok(innerBtn)
+    assert.ok(innerInput!.frameChain && innerInput!.frameChain.length === 1, 'expected a one-level frameChain for a direct child iframe')
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const fillResult = await executeAction(browser.page, { action: 'fill', ref: innerInput!.ref, value: 'hi', reason: 'test' }, outline, dir, 1)
+    assert.equal(fillResult.ok, true)
+    const clickResult = await executeAction(browser.page, { action: 'click', ref: innerBtn!.ref, reason: 'test' }, outline, dir, 2)
+    assert.equal(clickResult.ok, true)
+
+    assert.equal(await frame!.locator('#inner-result').textContent(), 'clicked')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot finds a contenteditable region with an implicit "textbox" role and executeAction fills it via a real click+type — a real, live-found gap: a rich-text editor\'s actual editable surface (a plain div/body with contenteditable="true", not an <input>/<textarea>) was previously invisible to the outline entirely', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <div id="toolbar"><button id="bold-btn">Bold</button></div>
+      <div id="editor" contenteditable="true" aria-label="Message body"></div>
+      <div id="readonly-note" contenteditable="false">Not editable</div>
+    `)
+
+    const outline = await snapshot(browser.page)
+    const editable = outline.elements.find((el) => el.name === 'Message body')
+    const readonlyNote = outline.elements.find((el) => el.name === 'Not editable')
+    assert.ok(editable, `expected the contenteditable div as a candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.equal(editable!.role, 'textbox')
+    assert.equal(readonlyNote, undefined, 'contenteditable="false" must never be surfaced as a fillable candidate')
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const fillResult = await executeAction(browser.page, { action: 'fill', ref: editable!.ref, value: 'hello from five46', reason: 'test' }, outline, dir, 1)
+    assert.equal(fillResult.ok, true)
+    assert.equal(await browser.page.locator('#editor').innerText(), 'hello from five46')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot surfaces a plain, non-decorative <img> as a hover candidate — a real, live-found gap: the-internet.herokuapp.com/hovers reveals a caption on :hover, but the avatar image triggering it has no role, no title, and no pointer cursor, so it was completely invisible to every existing candidate signal', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <style>.figcaption { display: none; } .figure:hover .figcaption { display: block; }</style>
+      <div class="figure">
+        <img src="/avatar1.jpg" alt="User Avatar 1">
+        <div class="figcaption" role="status">name: user1</div>
+      </div>
+      <a href="/profile"><img src="/avatar2.jpg" alt="User Avatar 2"></a>
+      <img src="/spacer.gif" alt="">
+    `)
+
+    const outline = await snapshot(browser.page)
+    const avatar1 = outline.elements.find((el) => el.name === 'User Avatar 1')
+    const avatar2 = outline.elements.find((el) => el.role === 'img' && el.name === 'User Avatar 2')
+    const spacer = outline.elements.find((el) => el.tag === 'img' && el.name === '')
+    assert.ok(avatar1, `expected the standalone avatar image as a candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.equal(avatar1!.role, 'img')
+    // An image inside a real <a> is a genuinely distinct accessibility-tree
+    // node from the link itself (both are real, legitimate targets — hover
+    // the image specifically, or click the link) — a deliberate behavior
+    // change from the old, bespoke img-fallback heuristic's own anti-
+    // duplication rule, which doesn't apply to this discovery mechanism.
+    assert.ok(avatar2, `expected the linked avatar image to also be a candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.equal(spacer, undefined, 'alt="" is the explicit decorative-image signal and must never be surfaced')
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const hoverResult = await executeAction(browser.page, { action: 'hover', ref: avatar1!.ref, reason: 'test' }, outline, dir, 1)
+    assert.equal(hoverResult.ok, true)
+    await browser.page.locator('.figcaption').waitFor({ state: 'visible', timeout: 2000 })
+  } finally {
+    await browser.close()
+  }
+})
+
+test('AgentBrowser.page/pageIndex automatically switch to a newly opened tab once its navigation settles — a real, live-found gap: every subsequent snapshot/action used to keep silently operating on the now-stale original tab', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    const originalPage = browser.page
+    assert.equal(browser.pageIndex, 0)
+    await browser.page.goto(server.url)
+    // A real http:// target (not a data: URL) — Chromium blocks a
+    // target="_blank" navigation straight to a data: URL outright, which
+    // isn't what this test is about (that's a browser security policy, not
+    // this feature). A plain string page.evaluate() (not a typed function)
+    // matches this file's own SNAPSHOT_SCRIPT-style convention: this
+    // project's tsconfig deliberately has no "dom" lib, so a real function
+    // referencing `document` wouldn't type-check here either.
+    await browser.page.evaluate(`(() => {
+      const a = document.createElement('a')
+      a.id = 'open-link'
+      a.href = ${JSON.stringify(server.url)}
+      a.target = '_blank'
+      a.textContent = 'Open'
+      document.body.appendChild(a)
+    })()`)
+    await browser.page.locator('#open-link').click()
+
+    const deadline = Date.now() + 5000
+    while (browser.page === originalPage && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.notEqual(browser.page, originalPage, 'expected AgentBrowser.page to switch to the newly opened tab')
+    assert.equal(browser.pageIndex, 1)
+    assert.equal(browser.page.url(), server.url + '/', 'expected the new tab to have really navigated to the fixture server')
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+// snapshot — replaces SNAPSHOT_SCRIPT's hand-rolled
+// querySelectorAll/accessibleName()/roleOf() reimplementation with
+// Playwright's own ariaSnapshot({ mode: 'ai' }), a first-party API purpose-
+// built for AI browser agents. See DEVELOPMENT.md's "Migrating element
+// discovery to Playwright's own accessibility snapshot" for the full
+// investigation and root-cause diagnosis: every "gap found on a new site"
+// across three separate live-testing sessions traced back to the OLD
+// mechanism reimplementing accessible-name/role computation instead of using
+// the browser's own, already-correct implementation of it. Every test below
+// mirrors a real, historical "found via live gap" fix from those sessions,
+// proving the new mechanism covers it natively rather than needing its own
+// bespoke patch.
+
+test('snapshot finds ordinary interactive elements with correct role/name, same as the old mechanism', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  const server = await startFixtureServer()
+  try {
+    await browser.page.goto(server.url)
+    const outline = await snapshot(browser.page)
+    const revealBtn = outline.elements.find((el) => el.name === 'Show secret message')
+    const nameInput = outline.elements.find((el) => el.role === 'textbox')
+    assert.ok(revealBtn, `expected the reveal button, got: ${JSON.stringify(outline.elements)}`)
+    assert.equal(revealBtn!.role, 'button')
+    assert.ok(nameInput)
+  } finally {
+    await browser.close()
+    await server.close()
+  }
+})
+
+test('snapshot finds a contenteditable region natively, with executeAction able to fill it — no bespoke contenteditable heuristic needed', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <div id="toolbar"><button id="bold-btn">Bold</button></div>
+      <div id="editor" contenteditable="true" aria-label="Message body"></div>
+      <div id="readonly-note" contenteditable="false">Not editable</div>
+    `)
+    const outline = await snapshot(browser.page)
+    const editable = outline.elements.find((el) => el.name === 'Message body')
+    assert.ok(editable, `expected the contenteditable div as a candidate, got: ${JSON.stringify(outline.elements)}`)
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const fillResult = await executeAction(browser.page, { action: 'fill', ref: editable!.ref, value: 'hello from five46', reason: 'test' }, outline, dir, 1)
+    assert.equal(fillResult.ok, true)
+    assert.equal(await browser.page.locator('#editor').innerText(), 'hello from five46')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot finds a plain heading with no ARIA role natively, assertable directly instead of needing assert_page_text', async (t) => {
+  // The exact real, live-found gap that motivated assert_page_text in the
+  // first place (the-internet.herokuapp.com's own <h4>Hello World!</h4>) —
+  // now a real, directly-assertable ref instead of only reachable via a
+  // whole-page text search.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<h4 id="plain-heading">Hello World!</h4>`)
+    const outline = await snapshot(browser.page)
+    const heading = outline.elements.find((el) => el.name === 'Hello World!')
+    assert.ok(heading, `expected the plain heading as a candidate, got: ${JSON.stringify(outline.elements)}`)
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const result = await executeAction(browser.page, { action: 'assert_visible', ref: heading!.ref, reason: 'test' }, outline, dir, 1)
+    assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot finds a plain <img alt> as a hover candidate natively — no bespoke img[alt] heuristic needed', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <style>.figcaption { display: none; } .figure:hover .figcaption { display: block; }</style>
+      <div class="figure">
+        <img src="/avatar1.jpg" alt="User Avatar 1">
+        <div class="figcaption" role="status">name: user1</div>
+      </div>
+    `)
+    const outline = await snapshot(browser.page)
+    const avatar = outline.elements.find((el) => el.name === 'User Avatar 1')
+    assert.ok(avatar, `expected the avatar image as a candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.equal(avatar!.role, 'img')
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const hoverResult = await executeAction(browser.page, { action: 'hover', ref: avatar!.ref, reason: 'test' }, outline, dir, 1)
+    assert.equal(hoverResult.ok, true)
+    await browser.page.locator('.figcaption').waitFor({ state: 'visible', timeout: 2000 })
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot finds elements inside a real iframe natively, tagged with frameChain, resolved via a chained frameLocator for codegen', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<h1>Outer</h1><iframe id="inner-frame"></iframe>`)
+    const frame = browser.page.frames().find((f) => f !== browser.page.mainFrame())
+    await frame!.setContent(`
+      <input id="inner-input" />
+      <button id="inner-btn" onclick="document.getElementById('inner-result').textContent='clicked'">Go</button>
+      <p id="inner-result" role="status"></p>
+    `)
+
+    const outline = await snapshot(browser.page)
+    const innerInput = outline.elements.find((el) => el.role === 'textbox')
+    const innerBtn = outline.elements.find((el) => el.role === 'button' && el.name === 'Go')
+    assert.ok(innerInput, `expected a textbox from inside the iframe, got: ${JSON.stringify(outline.elements)}`)
+    assert.ok(innerBtn)
+    assert.ok(innerInput!.frameChain && innerInput!.frameChain.length === 1, 'expected a one-level frameChain for a direct child iframe')
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const fillResult = await executeAction(browser.page, { action: 'fill', ref: innerInput!.ref, value: 'hi', reason: 'test' }, outline, dir, 1)
+    assert.equal(fillResult.ok, true)
+    const clickResult = await executeAction(browser.page, { action: 'click', ref: innerBtn!.ref, reason: 'test' }, outline, dir, 2)
+    assert.equal(clickResult.ok, true)
+
+    assert.equal(await frame!.locator('#inner-result').textContent(), 'clicked')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot finds elements inside a doubly-nested iframe, with a correct two-level frameChain — deeper than SNAPSHOT_SCRIPT was ever live-tested against', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<iframe id="outer-frame"></iframe>`)
+    const outerFrame = browser.page.frames().find((f) => f !== browser.page.mainFrame())!
+    await outerFrame.setContent(`<iframe id="inner-frame"></iframe>`)
+    const innerFrame = outerFrame.childFrames()[0]
+    await innerFrame.setContent(`<button id="deep-btn">Deep button</button>`)
+
+    const outline = await snapshot(browser.page)
+    const deepBtn = outline.elements.find((el) => el.name === 'Deep button')
+    assert.ok(deepBtn, `expected the doubly-nested button, got: ${JSON.stringify(outline.elements)}`)
+    assert.equal(deepBtn!.frameChain?.length, 2, 'expected a two-level frameChain')
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const clickResult = await executeAction(browser.page, { action: 'click', ref: deepBtn!.ref, reason: 'test' }, outline, dir, 1)
+    assert.equal(clickResult.ok, true)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot assigns correct checkbox/radio roles and flags a real <input type="file">', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <input id="cb" type="checkbox" /><label for="cb">Subscribe</label>
+      <input id="r1" type="radio" name="g" /><label for="r1">Option A</label>
+      <input id="resume" type="file" />
+    `)
+    const outline = await snapshot(browser.page)
+    const checkbox = outline.elements.find((el) => el.name === 'Subscribe')
+    const radio = outline.elements.find((el) => el.name === 'Option A')
+    const fileInput = outline.elements.find((el) => el.isFileInput)
+    assert.equal(checkbox?.role, 'checkbox')
+    assert.equal(radio?.role, 'radio')
+    assert.ok(fileInput, `expected a file input candidate, got: ${JSON.stringify(outline.elements)}`)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot excludes a genuinely hidden element, same as the old mechanism', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<div style="display:none"><button id="hidden-btn">Should never appear</button></div>`)
+    const outline = await snapshot(browser.page)
+    assert.ok(!outline.elements.some((el) => el.name.includes('never appear')), `hidden element must not appear, got: ${JSON.stringify(outline.elements)}`)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot does not crash on a classic <frameset> page, which has no real <body> element at all', async (t) => {
+  // Real, live-found gap: confirmed against the-internet.herokuapp.com's own
+  // nested_frames demo (a genuine <frameset>-based page — `<html><frameset>
+  // ...`, no <body> tag at all). `document.body` itself is truthy for such a
+  // page (the HTML spec's own IDL getter returns either <body> OR
+  // <frameset>), but there is no actual <body> element for a real DOM query
+  // to match — `page.locator('body').ariaSnapshot()` threw outright
+  // ("Selector \"body\" does not match any element"), a hard crash, not a
+  // graceful degradation, since discovery is a one-shot call with no
+  // per-iteration retry the way assert_page_text's own 'body' usage
+  // elsewhere in this file already tolerates. Fixed by scoping to 'html'
+  // instead, present on every real page regardless.
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<frameset rows="50%,50%"><frame src="about:blank"><frame src="about:blank"></frameset>`)
+    const outline = await snapshot(browser.page)
+    assert.ok(outline, 'snapshot() must not throw on a frameset page with no <body>')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot finds and executeAction clicks a real element inside an open shadow root — a genuine bonus of the accessibility-tree-based mechanism, the old querySelectorAll-based one structurally could not do this at all', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<div id="host"></div>`)
+    await browser.page.evaluate(`(() => {
+      const shadow = document.getElementById('host').attachShadow({ mode: 'open' })
+      shadow.innerHTML = '<button id="shadow-btn">Click me (in shadow DOM)</button>'
+    })()`)
+    const outline = await snapshot(browser.page)
+    const shadowBtn = outline.elements.find((el) => el.name.includes('shadow DOM'))
+    assert.ok(shadowBtn, `expected the shadow-DOM button as a candidate, got: ${JSON.stringify(outline.elements)}`)
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const result = await executeAction(browser.page, { action: 'click', ref: shadowBtn!.ref, reason: 'test' }, outline, dir, 1)
+    assert.equal(result.ok, true)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot still cannot see inside a CLOSED shadow root — deliberately inaccessible to external tooling in general, not a five46-specific gap', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<div id="host"></div>`)
+    await browser.page.evaluate(`(() => {
+      const shadow = document.getElementById('host').attachShadow({ mode: 'closed' })
+      shadow.innerHTML = '<button id="shadow-btn">Click me (closed shadow)</button>'
+    })()`)
+    const outline = await snapshot(browser.page)
+    assert.ok(!outline.elements.some((el) => el.name.includes('closed shadow')), `a closed shadow root must not be visible, got: ${JSON.stringify(outline.elements)}`)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot still finds a genuinely clickable icon-only control via the title+cursor:pointer fallback — the one real case the accessibility tree itself does not cover', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<span id="edit-icon" data-toggle="tooltip" title="Edit" style="cursor:pointer" onclick="window.__clicked=true">&#9998;</span>`)
+    const outline = await snapshot(browser.page)
+    const icon = outline.elements.find((el) => el.name === 'Edit')
+    assert.ok(icon, `expected the icon-only control via the title+cursor fallback, got: ${JSON.stringify(outline.elements)}`)
+
+    const dir = mkdtempSync(join(tmpdir(), 'five46-'))
+    const clickResult = await executeAction(browser.page, { action: 'click', ref: icon!.ref, reason: 'test' }, outline, dir, 1)
+    assert.equal(clickResult.ok, true)
+    assert.equal(await browser.page.evaluate('window.__clicked'), true)
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot excludes pure structural/layout noise (an unnamed generic wrapper, the iframe host, the list wrapper, an unnamed listitem wrapping its own already-listed child) from the candidate list', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <div>
+        <ul>
+          <li><button>Nested 1</button></li>
+          <li><button>Nested 2</button></li>
+        </ul>
+      </div>
+      <iframe id="empty-frame"></iframe>
+    `)
+    const outline = await snapshot(browser.page)
+    assert.ok(!outline.elements.some((el) => el.role === 'generic' && !el.name), `no unnamed generic wrapper should appear, got: ${JSON.stringify(outline.elements)}`)
+    assert.ok(!outline.elements.some((el) => el.role === 'iframe'), `the iframe host itself should not be a candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.ok(!outline.elements.some((el) => el.role === 'list'), `the <ul> wrapper itself should not be a candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.ok(!outline.elements.some((el) => el.role === 'listitem'), `a listitem wrapping its own already-listed button should not ALSO be a candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.ok(outline.elements.some((el) => el.name === 'Nested 1'))
+    assert.ok(outline.elements.some((el) => el.name === 'Nested 2'))
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot gives a bare <li> with no other markup inside its own real, named candidate — a real, live-found gap found via src/eval/\'s drag-and-drop regression probe: blanket-excluding listitem (like list itself) left a plain sortable-list item with ZERO candidates at all, not just a missing drag action', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`<ul><li id="item-a">Item A</li><li id="item-b">Item B</li></ul>`)
+    const outline = await snapshot(browser.page)
+    const itemA = outline.elements.find((el) => el.name === 'Item A')
+    const itemB = outline.elements.find((el) => el.name === 'Item B')
+    assert.ok(itemA, `expected the bare listitem to be its own named candidate, got: ${JSON.stringify(outline.elements)}`)
+    assert.ok(itemB)
+    assert.equal(itemA!.role, 'listitem')
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot correctly parses a name containing a literal quote and a name containing a colon — both force a different underlying YAML quoting style, confirmed to round-trip identically', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    await browser.page.setContent(`
+      <button id="quote-btn">Say "hi" to the "world"</button>
+      <button id="colon-btn">Price: $100</button>
+    `)
+    const outline = await snapshot(browser.page)
+    assert.ok(
+      outline.elements.some((el) => el.name === 'Say "hi" to the "world"'),
+      `expected the literal-quote name to round-trip correctly, got: ${JSON.stringify(outline.elements)}`
+    )
+    assert.ok(
+      outline.elements.some((el) => el.name === 'Price: $100'),
+      `expected the colon-containing name to round-trip correctly, got: ${JSON.stringify(outline.elements)}`
+    )
+  } finally {
+    await browser.close()
+  }
+})
+
+test('snapshot respects maxElements and discloses truncation, same contract as the old mechanism', async (t) => {
+  const browser = await withRealBrowser(t)
+  if (!browser) return
+  try {
+    const buttons = Array.from({ length: 10 }, (_, i) => `<button>Button ${i}</button>`).join('')
+    await browser.page.setContent(`<div>${buttons}</div>`)
+    const outline = await snapshot(browser.page, 5)
+    assert.equal(outline.elements.length, 5)
+    assert.equal(outline.truncated, true)
+    assert.equal(outline.totalFound, 10)
+  } finally {
+    await browser.close()
   }
 })

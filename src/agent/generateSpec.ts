@@ -10,30 +10,52 @@ function selectorFor(step: ExecutedStep): string | undefined {
   // find nothing or resolve to an unrelated element.
   if (step.resolvedSelector) return step.resolvedSelector
   const action = step.action
-  // None of these four has a ref/selector at all — `renderStep` intercepts
-  // `scroll`/`wait`/`assert_page_text` before ever calling this, but the
-  // guard is required here regardless for the discriminated-union
-  // narrowing below to type-check.
-  if (action.action === 'done' || action.action === 'scroll' || action.action === 'wait' || action.action === 'assert_page_text') return undefined
+  // None of these five has a ref/selector at all — `renderStep` intercepts
+  // `scroll`/`wait`/`assert_page_text`/`assert_page_text_absent` before ever
+  // calling this, but the guard is required here regardless for the
+  // discriminated-union narrowing below to type-check.
+  if (
+    action.action === 'done' ||
+    action.action === 'scroll' ||
+    action.action === 'wait' ||
+    action.action === 'assert_page_text' ||
+    action.action === 'assert_page_text_absent'
+  )
+    return undefined
   return step.outline.elements.find((el) => el.ref === action.ref)?.selector
 }
 
+/** Renders the real Playwright root expression a step's locator is built
+ * on — `pageVar` itself (see `generateAgentSpec`'s per-tab variable
+ * tracking) for a main-page element (no `frameChain`, or an empty one), or
+ * a chained `pageVar.frameLocator("...").frameLocator("...")` for one that
+ * lives inside one or more nested iframes/frames, mirroring exactly what
+ * `browser.ts`'s `resolveRoot()` builds and resolved against during the
+ * live run itself — the exported spec and the run that produced it must
+ * agree on this or a healthy-looking generated step would silently target
+ * the wrong document. */
+function rootExprFor(pageVar: string, frameChain?: string[]): string {
+  return (frameChain ?? []).reduce((expr, selector) => `${expr}.frameLocator(${JSON.stringify(selector)})`, pageVar)
+}
+
 /** The Playwright locator expression a generated step should use — prefers
- * `page.getByRole(role, { name })` when `browser.ts`'s `verifyRoleLocator()`
- * confirmed live, during the actual run, that it resolves uniquely to the
- * exact element this step acted on (see `ExecutedStep.verifiedRoleLocator`'s
- * own doc comment for the full reasoning); falls back to the raw, always-
- * correct `page.locator(selector)` otherwise — the exact, unchanged
- * behavior from before this feature. A `getByRole` locator is far more
- * resilient to future DOM restructuring than a positional CSS path, since
- * the whole point of a generated spec is to be re-run standalone, for a
- * long time, with no five46 involved. */
-function locatorExprFor(step: ExecutedStep, selector: string): string {
+ * `pageVar.getByRole(role, { name })` when `browser.ts`'s
+ * `verifyRoleLocator()` confirmed live, during the actual run, that it
+ * resolves uniquely to the exact element this step acted on (see
+ * `ExecutedStep.verifiedRoleLocator`'s own doc comment for the full
+ * reasoning); falls back to the raw, always-correct
+ * `pageVar.locator(selector)` otherwise — the exact, unchanged behavior
+ * from before this feature (when `pageVar` is always `'page'`). A
+ * `getByRole` locator is far more resilient to future DOM restructuring
+ * than a positional CSS path, since the whole point of a generated spec is
+ * to be re-run standalone, for a long time, with no five46 involved. */
+function locatorExprFor(step: ExecutedStep, selector: string, pageVar: string): string {
+  const root = rootExprFor(pageVar, step.frameChain)
   if (step.verifiedRoleLocator) {
     const { role, name } = step.verifiedRoleLocator
-    return `page.getByRole(${JSON.stringify(role)}, { name: ${JSON.stringify(name)} })`
+    return `${root}.getByRole(${JSON.stringify(role)}, { name: ${JSON.stringify(name)} })`
   }
-  return `page.locator(${JSON.stringify(selector)})`
+  return `${root}.locator(${JSON.stringify(selector)})`
 }
 
 // `%` has no special meaning in a regex, so the placeholder tokens
@@ -42,6 +64,18 @@ const PLACEHOLDER_SPLIT_PATTERN = new RegExp(`(${USERNAME_PLACEHOLDER}|${PASSWOR
 
 function escapeTemplateLiteralSegment(text: string): string {
   return text.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${')
+}
+
+/** Escapes regex metacharacters in a literal string — used only by
+ * `assert_value`'s codegen (see its own case below): the live run matches
+ * an input's value via `.includes()` (substring, same convention
+ * `assert_text` already uses), but Playwright's own `toHaveValue()`
+ * assertion does an *exact* match unless given a `RegExp` — escaping first
+ * and wrapping in `new RegExp(...)` keeps the exported spec's semantics
+ * identical to what the live run actually checked, rather than silently
+ * tightening it to an exact match a real live pass wouldn't have required. */
+function escapeRegExpLiteral(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 /** Renders a `fill`/`assert_text` string value as a real JS expression. A
@@ -74,27 +108,80 @@ function renderCredentialAwareExpression(value: string): string {
 /** Renders one executed step as real, idiomatic Playwright code — a human
  * reading this file should see ordinary Playwright, not anything referring
  * back to five46's own ref/outline machinery, which only exists to keep
- * the LLM from authoring its own selectors during the run itself. */
-function renderStep(step: ExecutedStep): string | undefined {
+ * the LLM from authoring its own selectors during the run itself.
+ *
+ * `pageVar` is which page variable this step's action actually ran
+ * against (`'page'` for the tab `test()` was given, `'page1'`/`'page2'`/...
+ * for a tab opened later in the run — see `generateAgentSpec`'s own
+ * tracking). `hasFrames` — true only when *some* step in this whole run
+ * touched a non-main-frame element — switches `assert_page_text` from the
+ * plain single-body check to one that also searches every other frame on
+ * the page, matching `browser.ts`'s own live `executeAction` behavior for
+ * this action; kept conditional (not always emitted) so the overwhelming
+ * majority of generated specs (no iframes at all) keep the exact same
+ * simple one-liner as before this feature. */
+function renderStep(step: ExecutedStep, pageVar: string, hasFrames: boolean): string | undefined {
   // scroll/wait/assert_page_text have no selector at all — handled before
   // selectorFor, not as one of its branches, since selectorFor's whole job
   // is finding *a* selector for the step's target and none of these three
   // has one.
   if (step.action.action === 'scroll') {
     const top = step.action.direction === 'down' ? 'window.innerHeight' : '-window.innerHeight'
-    return `  await page.evaluate(() => window.scrollBy({ top: ${top}, left: 0, behavior: 'instant' }))`
+    return `  await ${pageVar}.evaluate(() => window.scrollBy({ top: ${top}, left: 0, behavior: 'instant' }))`
   }
   if (step.action.action === 'wait') {
-    return `  await page.waitForTimeout(${WAIT_ACTION_MS})`
+    return `  await ${pageVar}.waitForTimeout(${WAIT_ACTION_MS})`
   }
   if (step.action.action === 'assert_page_text') {
-    return `  await expect(page.locator('body')).toContainText(${renderCredentialAwareExpression(step.action.expectedText)})`
+    const expected = renderCredentialAwareExpression(step.action.expectedText)
+    if (!hasFrames) {
+      return `  await expect(${pageVar}.locator('body')).toContainText(${expected})`
+    }
+    // Mirrors browser.ts's own live assert_page_text check (main body,
+    // then every other frame) — a plain single-body toContainText() would
+    // silently and permanently fail here for a run whose matching text
+    // actually came from inside an iframe, even though the live run that
+    // produced this exact step genuinely observed it.
+    return [
+      `  await expect(async () => {`,
+      `    let combinedText = await ${pageVar}.locator('body').innerText()`,
+      `    for (const frame of ${pageVar}.frames()) {`,
+      `      if (frame === ${pageVar}.mainFrame()) continue`,
+      `      combinedText += await frame.locator('body').innerText().catch(() => '')`,
+      `    }`,
+      `    expect(combinedText).toContain(${expected})`,
+      `  }).toPass({ timeout: 5000 })`,
+    ].join('\n')
+  }
+  if (step.action.action === 'assert_page_text_absent') {
+    const expected = renderCredentialAwareExpression(step.action.expectedText)
+    if (!hasFrames) {
+      // Playwright's own `.not.toContainText()` already auto-retries until
+      // the condition holds (or times out) — the exact inverted-polling
+      // behavior `browser.ts`'s live `assert_page_text_absent` check
+      // implements by hand, no custom retry loop needed for this branch.
+      return `  await expect(${pageVar}.locator('body')).not.toContainText(${expected})`
+    }
+    // Same frame-inclusion reasoning as assert_page_text's own multi-frame
+    // branch above, inverted condition — the built-in `.not.toContainText()`
+    // has no equivalent for "combined text across several locators," so
+    // this still needs the same hand-rolled `toPass` retry wrapper.
+    return [
+      `  await expect(async () => {`,
+      `    let combinedText = await ${pageVar}.locator('body').innerText()`,
+      `    for (const frame of ${pageVar}.frames()) {`,
+      `      if (frame === ${pageVar}.mainFrame()) continue`,
+      `      combinedText += await frame.locator('body').innerText().catch(() => '')`,
+      `    }`,
+      `    expect(combinedText).not.toContain(${expected})`,
+      `  }).toPass({ timeout: 5000 })`,
+    ].join('\n')
   }
 
   const selector = selectorFor(step)
   if (!selector) return undefined
-  const action = step.action as Exclude<AgentAction, { action: 'done' | 'scroll' | 'wait' | 'assert_page_text' }>
-  const locatorExpr = locatorExprFor(step, selector)
+  const action = step.action as Exclude<AgentAction, { action: 'done' | 'scroll' | 'wait' | 'assert_page_text' | 'assert_page_text_absent' }>
+  const locatorExpr = locatorExprFor(step, selector, pageVar)
 
   switch (action.action) {
     case 'click':
@@ -104,11 +191,60 @@ function renderStep(step: ExecutedStep): string | undefined {
       if (action.submit) lines.push(`  await ${locatorExpr}.press('Enter')`)
       return lines.join('\n')
     }
+    case 'hover':
+      return `  await ${locatorExpr}.hover()`
+    case 'dblclick':
+      return `  await ${locatorExpr}.dblclick()`
+    case 'drag': {
+      // The destination ref is never eligible for self-healing (same as
+      // the source — see browser.ts's own doc comment on `drag`'s healing
+      // exclusion), so its selector/frameChain come straight from this
+      // step's own pre-action outline, no `resolvedSelector` fallback
+      // needed. Looked up independently rather than reusing `locatorExpr`'s
+      // own `frameChain`/`verifiedRoleLocator` — the destination is a
+      // different element, in principle a different frame, with no
+      // live-verified getByRole equivalent of its own.
+      const targetOutlineEl = step.outline.elements.find((el) => el.ref === action.targetRef)
+      if (!targetOutlineEl) return undefined
+      const targetRoot = rootExprFor(pageVar, targetOutlineEl.frameChain)
+      const targetExpr = `${targetRoot}.locator(${JSON.stringify(targetOutlineEl.selector)})`
+      return `  await ${locatorExpr}.dragTo(${targetExpr})`
+    }
+    case 'press_key':
+      return `  await ${locatorExpr}.press(${JSON.stringify(action.key)})`
+    case 'upload':
+      return `  await ${locatorExpr}.setInputFiles(${JSON.stringify(action.filePath)})`
     case 'assert_visible':
       return `  await expect(${locatorExpr}).toBeVisible()`
     case 'assert_text':
       return `  await expect(${locatorExpr}).toContainText(${renderCredentialAwareExpression(action.expectedText)})`
+    case 'assert_value':
+      return `  await expect(${locatorExpr}).toHaveValue(new RegExp(${renderCredentialAwareExpression(escapeRegExpLiteral(action.expectedValue))}))`
   }
+}
+
+/** Renders the click that opens a new tab, wrapped so the resulting `Page`
+ * is actually captured — a bare, sequential `await ...click()` followed by
+ * a later `context.waitForEvent('page')` would race the popup's own 'page'
+ * event, which can fire before a separately-awaited `waitForEvent` call
+ * even starts listening. `Promise.all` starts the listener and fires the
+ * click in the same tick, matching Playwright's own documented pattern for
+ * this exact scenario. `newVar.waitForLoadState()` (best-effort) mirrors
+ * `browser.ts`'s own live behavior of only switching `AgentBrowser.page`
+ * once the new tab's navigation has actually settled. `clickLine` is
+ * `renderStep`'s own already-rendered `  await X.click()` line for this
+ * exact step — reused rather than re-derived, so this can never silently
+ * drift from what `renderStep` would otherwise have emitted for the same
+ * step. */
+function renderPopupCapture(clickLine: string, newVar: string): string {
+  const clickExpr = clickLine.trim().replace(/^await /, '').replace(/;$/, '')
+  return [
+    `  const [${newVar}] = await Promise.all([`,
+    `    context.waitForEvent('page'),`,
+    `    ${clickExpr},`,
+    `  ])`,
+    `  await ${newVar}.waitForLoadState().catch(() => {})`,
+  ].join('\n')
 }
 
 /** Turns one `TestRun` into a real, standalone `.spec.ts` a human can read,
@@ -123,6 +259,12 @@ function renderStep(step: ExecutedStep): string | undefined {
  * disclosure in `cli.ts`. */
 export function generateAgentSpec(run: TestRun): string {
   const successfulSteps = run.steps.filter((s) => s.ok)
+  const hasFrames = run.steps.some((s) => s.frameChain && s.frameChain.length > 0)
+  // True only when this run ever actually drove a tab other than the
+  // original — see `ExecutedStep.pageIndex`'s own doc comment for why its
+  // mere presence (not just a non-zero value) is the right check: absent
+  // means "still page 0" by construction.
+  const hasPopups = successfulSteps.some((s) => (s.pageIndex ?? 0) > 0)
   const lines: string[] = []
 
   lines.push(
@@ -138,17 +280,68 @@ export function generateAgentSpec(run: TestRun): string {
     `// ordinary Playwright spec — re-run it any time with no five46/LLM involved.`,
     `import { test, expect } from '@playwright/test'`,
     ``,
-    `test(${JSON.stringify(run.goal)}, async ({ page }) => {`,
+    `test(${JSON.stringify(run.goal)}, async ({ page${hasPopups ? ', context' : ''} }) => {`,
     `  await page.goto(${JSON.stringify(run.url)})`,
+    // Matches browser.ts's own launchAgentBrowser default, unconditionally
+    // (never gated on whether a dialog actually appeared) — the live run
+    // this file was recorded from always had this active for its entire
+    // duration, so a faithful standalone replay must too, or a step that
+    // only worked live because a confirm()/prompt() got auto-accepted
+    // would silently regress to Playwright's own default (auto-dismiss)
+    // the moment five46 is no longer involved. `context.on('page', ...)`
+    // covers a tab opened later in the run the same way
+    // `launchAgentBrowser` itself does.
+    `  page.on('dialog', (dialog) => dialog.accept().catch(() => {}))`,
+    ...(hasPopups ? [`  context.on('page', (p) => p.on('dialog', (dialog) => dialog.accept().catch(() => {})))`] : []),
     ``
   )
 
   if (successfulSteps.length === 0) {
     lines.push(`  // No steps completed successfully in this run — nothing to replay.`)
   }
-  for (const step of successfulSteps) {
-    const rendered = renderStep(step)
-    if (rendered) lines.push(rendered)
+
+  // Tracks which page variable each subsequent step's action should target
+  // — 'page' until/unless a step's own recorded `pageIndex` says otherwise
+  // (see ExecutedStep.pageIndex's own doc comment). `pageVarForIndex` only
+  // ever grows: once a tab is captured into its own variable, every later
+  // step on that same tab reuses it.
+  let currentPageVar = 'page'
+  let currentPageIndex = 0
+  const pageVarForIndex = new Map<number, string>([[0, 'page']])
+
+  for (let i = 0; i < successfulSteps.length; i++) {
+    const step = successfulSteps[i]
+    const stepPageIndex = step.pageIndex ?? 0
+    if (stepPageIndex !== currentPageIndex) {
+      const known = pageVarForIndex.get(stepPageIndex)
+      if (known) {
+        currentPageVar = known
+        currentPageIndex = stepPageIndex
+      }
+      // If not yet known, the lookahead capture below should have already
+      // handled it when rendering the previous step — falling through
+      // here just means this step renders against whatever `currentPageVar`
+      // still is, the same graceful-degrade posture as every other
+      // best-effort part of this codebase (never throw, worst case one
+      // step's generated line targets a not-yet-switched tab).
+    }
+
+    const rendered = renderStep(step, currentPageVar, hasFrames)
+    if (!rendered) continue
+
+    // A click is the only action that can plausibly open a new tab — if
+    // the *next* successful step happens on a tab not yet captured, this
+    // click is where that capture must happen (see renderPopupCapture's
+    // own doc comment for why it must wrap the click, not follow it).
+    const next = successfulSteps[i + 1]
+    const nextPageIndex = next?.pageIndex ?? 0
+    if (next && step.action.action === 'click' && nextPageIndex !== currentPageIndex && !pageVarForIndex.has(nextPageIndex)) {
+      const newVar = `page${nextPageIndex}`
+      pageVarForIndex.set(nextPageIndex, newVar)
+      lines.push(renderPopupCapture(rendered, newVar))
+    } else {
+      lines.push(rendered)
+    }
   }
 
   if (

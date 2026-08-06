@@ -7,12 +7,26 @@ export function describeAction(step: TestRun['steps'][number]): string {
       return `click`
     case 'fill':
       return `fill (${JSON.stringify(a.value)})`
+    case 'hover':
+      return `hover`
+    case 'dblclick':
+      return `double-click`
+    case 'drag':
+      return `drag`
+    case 'press_key':
+      return `press key (${JSON.stringify(a.key)})`
+    case 'upload':
+      return `upload (${JSON.stringify(a.filePath)})`
     case 'assert_visible':
       return `assert visible`
     case 'assert_text':
       return `assert text contains ${JSON.stringify(a.expectedText)}`
+    case 'assert_value':
+      return `assert value contains ${JSON.stringify(a.expectedValue)}`
     case 'assert_page_text':
       return `assert page contains ${JSON.stringify(a.expectedText)}`
+    case 'assert_page_text_absent':
+      return `assert page no longer contains ${JSON.stringify(a.expectedText)}`
     case 'scroll':
       return `scroll ${a.direction}`
     case 'wait':

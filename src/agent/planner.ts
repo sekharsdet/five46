@@ -1,4 +1,4 @@
-import type { AgentAction, AgentPlan, CredentialAvailability, HistoryEntry, OutlineElement, PageOutline, PlannedStep, PlannedStepTarget } from './types'
+import type { AgentAction, AgentPlan, CallerPlanStep, CredentialAvailability, HistoryEntry, OutlineElement, PageOutline, PlannedStep, PlannedStepTarget } from './types'
 import { USERNAME_PLACEHOLDER, PASSWORD_PLACEHOLDER } from './browser'
 
 const MAX_HISTORY = 10
@@ -24,7 +24,7 @@ export function resolvePlannedTarget(outline: PageOutline, target: PlannedStepTa
  * drives BYOK cost per step. */
 export function serializeOutline(outline: PageOutline): string {
   if (outline.elements.length === 0) return '(no visible interactive elements found on this page)'
-  const lines = outline.elements.map((el) => `[${el.ref}] ${el.role} "${el.name}"`)
+  const lines = outline.elements.map((el) => `[${el.ref}] ${el.role} "${el.name}"${el.isFileInput ? ' (file input — use the "upload" action, never "fill")' : ''}`)
   if (outline.truncated) {
     lines.push(`(${outline.totalFound - outline.elements.length} more visible interactive element(s) not shown)`)
   }
@@ -57,12 +57,26 @@ function describeAction(action: AgentAction): string {
       return `click ${action.ref}`
     case 'fill':
       return `fill ${action.ref} with "${action.value}"${action.submit ? ' then press Enter' : ''}`
+    case 'hover':
+      return `hover ${action.ref}`
+    case 'dblclick':
+      return `double-click ${action.ref}`
+    case 'drag':
+      return `drag ${action.ref} onto ${action.targetRef}`
+    case 'press_key':
+      return `press "${action.key}" on ${action.ref}`
+    case 'upload':
+      return `upload "${action.filePath}" to ${action.ref}`
     case 'assert_visible':
       return `assert ${action.ref} is visible`
     case 'assert_text':
       return `assert ${action.ref} contains "${action.expectedText}"`
+    case 'assert_value':
+      return `assert ${action.ref}'s value contains "${action.expectedValue}"`
     case 'assert_page_text':
       return `assert the page contains "${action.expectedText}"`
+    case 'assert_page_text_absent':
+      return `assert the page no longer contains "${action.expectedText}"`
     case 'scroll':
       return `scroll ${action.direction}`
     case 'wait':
@@ -137,6 +151,49 @@ const DESTRUCTIVE_CLICK_PHRASES = [
 export function isDestructiveClickTarget(name: string): boolean {
   const lower = name.toLowerCase()
   return DESTRUCTIVE_CLICK_PHRASES.some((phrase) => lower.includes(phrase))
+}
+
+/** Roles a `fill`/`assert_value` target is never actually going to be —
+ * confirmed live as a real reasoning-quality gap (react-select.com's own
+ * "Searchable" toggle demo): the model typed a search term directly into
+ * what its own root-cause hypothesis correctly identified afterward as a
+ * checkbox, not the actual combobox input, because nothing caught the
+ * mismatch before the live `fill` call ran and silently did nothing useful.
+ * A blocklist, deliberately NOT an allowlist of "known-good" fillable
+ * roles: `browser.ts`'s own discovery mechanism (Chromium's real
+ * accessibility tree) can legitimately produce roles this file doesn't
+ * enumerate, and an allowlist would reject every one of them by default —
+ * exactly the false-positive risk that makes an allowlist the wrong tool
+ * here. A blocklist only ever catches a role this project has positive,
+ * specific reason to say is never a real text-entry target, the same
+ * "catch the concrete case with high confidence, accept lower recall"
+ * tradeoff `DESTRUCTIVE_CLICK_PHRASES` above already makes. `generic` is
+ * included deliberately: `browser.ts` already promotes a genuinely
+ * fillable `contenteditable` region from `generic` to `textbox` at
+ * snapshot time (see its own doc comment), so a ref that still reports
+ * `generic` here is, by construction, not one. */
+const NON_FILLABLE_ROLES = new Set([
+  'button',
+  'link',
+  'checkbox',
+  'radio',
+  'switch',
+  'img',
+  'heading',
+  'paragraph',
+  'status',
+  'list',
+  'listitem',
+  'menuitem',
+  'tab',
+  'generic',
+])
+
+/** True if `role` (an `OutlineElement.role`) is a real, positively-known-bad
+ * target for `fill`/`assert_value` — see `NON_FILLABLE_ROLES`'s own doc
+ * comment for why this is a blocklist, not an allowlist. */
+export function isImplausibleFillTarget(role: string): boolean {
+  return NON_FILLABLE_ROLES.has(role)
 }
 
 const CLAUSE_MATCH_STOPWORDS = new Set([
@@ -218,12 +275,26 @@ export function describePlannedStep(step: PlannedStep): string {
       return `click a ${step.target.role} matching "${step.target.nameContains}"`
     case 'fill':
       return `fill a ${step.target.role} matching "${step.target.nameContains}" with "${step.value}"${step.submit ? ' then press Enter' : ''}`
+    case 'hover':
+      return `hover a ${step.target.role} matching "${step.target.nameContains}"`
+    case 'dblclick':
+      return `double-click a ${step.target.role} matching "${step.target.nameContains}"`
+    case 'drag':
+      return `drag a ${step.target.role} matching "${step.target.nameContains}" onto a ${step.destinationTarget.role} matching "${step.destinationTarget.nameContains}"`
+    case 'press_key':
+      return `press "${step.key}" on a ${step.target.role} matching "${step.target.nameContains}"`
+    case 'upload':
+      return `upload "${step.filePath}" to a ${step.target.role} matching "${step.target.nameContains}"`
     case 'assert_visible':
       return `assert a ${step.target.role} matching "${step.target.nameContains}" is visible`
     case 'assert_text':
       return `assert a ${step.target.role} matching "${step.target.nameContains}" contains "${step.expectedText}"`
+    case 'assert_value':
+      return `assert a ${step.target.role} matching "${step.target.nameContains}"'s value contains "${step.expectedValue}"`
     case 'assert_page_text':
       return `assert the page contains "${step.expectedText}"`
+    case 'assert_page_text_absent':
+      return `assert the page no longer contains "${step.expectedText}"`
     case 'scroll':
       return `scroll ${step.direction}`
     case 'wait':
@@ -284,12 +355,12 @@ export function buildActionPrompt(
   const confirmationNote = clauseTrackingActive
     ? [
         ``,
-        `This goal has ${clauses!.length} distinct things to confirm, listed below with their 0-based index. You must get a successful assert_visible, assert_text, or assert_page_text for EACH one before you're allowed to declare "done" with outcome "goal-reached" — one clause's assertion does not count toward another; each needs its own real, matching check. When performing an assertion meant to satisfy one of these, include "clauseIndex": <its index> in that action's JSON. Declaring done with any clause unverified, or asserting something unrelated to the clause index you claim, will be rejected.`,
+        `This goal has ${clauses!.length} distinct things to confirm, listed below with their 0-based index. You must get a successful assert_visible, assert_text, assert_value, assert_page_text, or assert_page_text_absent for EACH one before you're allowed to declare "done" with outcome "goal-reached" — one clause's assertion does not count toward another; each needs its own real, matching check. When performing an assertion meant to satisfy one of these, include "clauseIndex": <its index> in that action's JSON. Declaring done with any clause unverified, or asserting something unrelated to the clause index you claim, will be rejected.`,
         ...clauses!.map((c, i) => `  ${i}. ${c}`),
       ]
     : [
         ``,
-        `You must perform at least ${requiredAssertionCount} successful assert_visible, assert_text, or assert_page_text action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
+        `You must perform at least ${requiredAssertionCount} successful assert_visible, assert_text, assert_value, assert_page_text, or assert_page_text_absent action(s) before you're allowed to declare "done" with outcome "goal-reached" — this applies even if the goal above doesn't explicitly say "confirm"/"verify": a claimed success must always be backed by a real check, never just your own belief that you're finished. Declaring done without enough successful assertions will be rejected.`,
       ]
   // Generalizes the existing tautology guard (never re-assert the exact
   // element you just clicked/filled, in the assert_visible schema line
@@ -305,6 +376,19 @@ export function buildActionPrompt(
   const assertionQualityNote = [
     ``,
     `When choosing what to assert, avoid a persistent/ambient element that would already be visible or true regardless of whether your actions actually worked — a site-wide header/nav/footer label, a page title, a generic link that's present on every page. That kind of assertion can pass even when nothing you did actually mattered. Prefer something that specifically changed, newly appeared, or only exists because of the actions you just took.`,
+  ]
+  // Disclosed up front for the same reason deleteNote below is: catching
+  // this mechanically after the fact (see parseAgentAction's own
+  // isImplausibleFillTarget check) still costs a wasted turn if the model
+  // never had the warning first. Found via a real, live reasoning-quality
+  // miss (react-select.com): the model typed a search term directly into
+  // what its own root-cause hypothesis later identified as an unrelated
+  // checkbox, not the actual combobox input — a widget with several
+  // similar-looking controls close together is exactly the shape where
+  // this happens.
+  const fillTargetNote = [
+    ``,
+    `Before using "fill", make sure the ref's own role is actually a text-entry field (textbox/combobox/searchbox) — not a button, checkbox, link, or other non-text control that merely happens to sit near the field you meant. A page with several similar-looking controls close together (a search widget with its own toggle/checkbox nearby, say) is exactly where this mistake happens.`,
   ]
   // Disclosed up front, same reasoning as apiPlanner.ts's describeSafetyMode:
   // telling the model before it wastes a turn is more efficient than only
@@ -352,15 +436,23 @@ export function buildActionPrompt(
     `Goal: ${goal}`,
     ...confirmationNote,
     ...assertionQualityNote,
+    ...fillTargetNote,
     ...deleteNote,
     ...credentialNote,
     ``,
     `Respond with exactly one JSON object describing the next single action to take, one of:`,
     `- {"action":"click","ref":"<ref>","reason":"<why>"}`,
-    `- {"action":"fill","ref":"<ref>","value":"<text>","submit":<true|false>,"reason":"<why>"}`,
+    `- {"action":"fill","ref":"<ref>","value":"<text>","submit":<true|false>,"reason":"<why>"} (never use this on a ref marked "file input" — use "upload" instead)`,
+    `- {"action":"hover","ref":"<ref>","reason":"<why>"} (moves the pointer over the element without clicking — use this for content that only appears on :hover, like a tooltip or an overlay link)`,
+    `- {"action":"dblclick","ref":"<ref>","reason":"<why>"} (double-clicks the element — use this only when a single click won't do, e.g. entering an inline-edit mode)`,
+    `- {"action":"drag","ref":"<ref>","targetRef":"<ref>","reason":"<why>"} (drags the "ref" element and drops it onto the "targetRef" element — use this for reordering a list, a sortable/kanban board, or any UI that responds to a real drag gesture, never a click/press_key substitute for one)`,
+    `- {"action":"press_key","ref":"<ref>","key":"<key name, e.g. Escape/Enter/Tab/ArrowDown>","reason":"<why>"} (dispatches one real keyboard key press at the element — use this when the page reacts to a specific key, not just typed text)`,
+    `- {"action":"upload","ref":"<ref>","filePath":"<absolute or goal-provided path>","reason":"<why>"} (sets a file input's selected file — only use a path the goal itself gave you, never invent one)`,
     `- {"action":"assert_visible","ref":"<ref>","reason":"<why>"${clauseIndexHint}} (never assert visibility of the exact element you just clicked or filled — it was already visible in order to be interactable, so this proves nothing changed; assert something that actually reflects the outcome instead)`,
     `- {"action":"assert_text","ref":"<ref>","expectedText":"<text>","reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_value","ref":"<ref>","expectedValue":"<text>","reason":"<why>"${clauseIndexHint}} (checks a form field's current VALUE, e.g. an <input>/<textarea>/<select> — use this instead of assert_text/assert_page_text whenever what you need to confirm is what a field now contains, since a field's value is never part of the page's visible text)`,
     `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"${clauseIndexHint}} (checks the WHOLE page's visible text, not just one ref — use this when the text you need to confirm isn't in the elements list above at all, e.g. a plain heading or message with no interactive role; this is the only assertion that doesn't need a ref)`,
+    `- {"action":"assert_page_text_absent","expectedText":"<text>","reason":"<why>"${clauseIndexHint}} (the inverse of assert_page_text — confirms a substring is genuinely GONE from the whole rendered page. Use this whenever the goal asks you to confirm something no longer appears/is removed/is hidden — e.g. after deleting an item, dismissing a message, or filtering something out. Never use assert_visible/assert_text for this: if the thing is gone, it won't be in the elements list above to reference at all)`,
     `- {"action":"scroll","direction":"up"|"down","reason":"<why>"} (scrolls the whole page by one viewport height — use this if what you need isn't in the list above)`,
     `- {"action":"wait","reason":"<why>"} (pauses briefly, then re-reads the page — use this if the page looks like it's still loading: a spinner, a skeleton, a "loading..." message, or right after an action that plausibly triggers something async. Do not use it more than twice in a row without trying something else in between; if the content still hasn't appeared after that, it's more likely genuinely not there)`,
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (choose "goal-unreachable" honestly when the goal's target genuinely is not in the elements list above, an assert_page_text check for it hasn't found it anywhere on the page either, scrolling will not reveal it, waiting for it to load hasn't revealed it either, and no unopened menu/dropdown/tab/accordion visible on the page is likely to reveal it either — try clicking one such element first if one plausibly exists; never guess by acting on or asserting against the closest-looking element instead)`,
@@ -425,32 +517,62 @@ const PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"click","target":{"role":"link"
  * fast path (which never calls this file's per-step schema at all) still
  * has a clauseIndex to check before fast-pathing a planned assertion; see
  * `runner.ts`'s "refuse to fast-path a clause-tracked assertion with no
- * clauseIndex" rule. */
-export function buildPlanPrompt(goal: string, initialOutline: PageOutline, clauses?: string[]): string {
+ * clauseIndex" rule.
+ *
+ * `callerSteps`, when passed (an MCP `steps` call — see `mcp/tools.ts`),
+ * seeds the plan with what the caller already knows instead of asking the
+ * model to invent a decomposition from `goal` alone — e.g. a coding agent
+ * that just implemented a checkout flow and knows the exact button labels.
+ * This only changes the instruction text; the JSON response contract,
+ * clause-index handling, and every downstream consumer (`parsePlan`,
+ * `runner.ts`'s fast path) are unchanged — a caller step still becomes an
+ * ordinary `PlannedStep` with a target resolved live, never a shortcut
+ * around that resolution. */
+export function buildPlanPrompt(goal: string, initialOutline: PageOutline, clauses?: string[], callerSteps?: CallerPlanStep[]): string {
   const clauseNote =
     clauses && clauses.length > 1
       ? [
           ``,
-          `This goal has ${clauses.length} distinct things to confirm, listed below with their 0-based index. Every assert_visible/assert_text/assert_page_text step in your plan must include "clauseIndex": <the index of the clause it's meant to satisfy>, and the plan must cover all of them before its final "done" step.`,
+          `This goal has ${clauses.length} distinct things to confirm, listed below with their 0-based index. Every assert_visible/assert_text/assert_value/assert_page_text/assert_page_text_absent step in your plan must include "clauseIndex": <the index of the clause it's meant to satisfy>, and the plan must cover all of them before its final "done" step.`,
           ...clauses.map((c, i) => `  ${i}. ${c}`),
         ]
       : []
   const clauseIndexHint = clauses && clauses.length > 1 ? `,"clauseIndex":<0-based index of the clause above this satisfies>` : ''
+  const callerStepsNote =
+    callerSteps && callerSteps.length > 0
+      ? [
+          ``,
+          `The caller has already worked out the steps below — do not invent your own sequence or add extra steps beyond what's listed. For each one, in order, produce the matching structured plan step, predicting its most likely target the same way you normally would. Only fall back to your own judgment if a listed step doesn't cleanly map to any action type below.`,
+          ...callerSteps.map((s, i) => `  ${i + 1}. [${s.type}] ${s.description}`),
+        ]
+      : []
   return [
-    `You are a web testing agent. Before taking any actions, plan out the whole sequence of steps needed to accomplish this goal on a real browser.`,
+    callerSteps && callerSteps.length > 0
+      ? `You are a web testing agent. Before taking any actions, translate the caller-supplied steps below into the real sequence of actions needed on a real browser.`
+      : `You are a web testing agent. Before taking any actions, plan out the whole sequence of steps needed to accomplish this goal on a real browser.`,
     ``,
     `Goal: ${goal}`,
     ...clauseNote,
+    ...callerStepsNote,
+    ``,
+    `For a "fill" step, "target.role" must genuinely be a text-entry field (textbox/combobox/searchbox) — a fresh live decision will refuse to run it otherwise. A page with several similar-looking controls close together (a search widget with its own toggle/checkbox nearby, say) is exactly where predicting the wrong one happens.`,
     ``,
     `Elements currently visible on the page (the very first page only — later steps will likely land on pages you cannot see yet, so predict each one's likely role/name rather than requiring it to be in this list):`,
     serializeOutline(initialOutline),
     ``,
     `Respond with exactly one JSON object: {"steps": [...]}, where each step is one of:`,
     `- {"action":"click","target":{"role":"<expected ARIA role, e.g. link/button/checkbox>","nameContains":"<expected substring of its accessible name>"},"reason":"<why>"}`,
-    `- {"action":"fill","target":{...},"value":"<text>","submit":<true|false>,"reason":"<why>"}`,
+    `- {"action":"fill","target":{...},"value":"<text>","submit":<true|false>,"reason":"<why>"} (never for a file input — use "upload" instead)`,
+    `- {"action":"hover","target":{...},"reason":"<why>"} (use for content that only appears on :hover)`,
+    `- {"action":"dblclick","target":{...},"reason":"<why>"} (use only when a single click won't do, e.g. an inline-edit mode)`,
+    `- {"action":"drag","target":{...},"destinationTarget":{...},"reason":"<why>"} (drags "target" and drops it onto "destinationTarget" — reordering a list, a sortable/kanban board, or any UI needing a real drag gesture)`,
+    `- {"action":"press_key","target":{...},"key":"<key name, e.g. Escape/Enter/Tab/ArrowDown>","reason":"<why>"} (dispatches one real keyboard key press)`,
+    `- {"action":"upload","target":{...},"filePath":"<path>","reason":"<why>"} (sets a file input's selected file — only a path the goal itself gave you)`,
     `- {"action":"assert_visible","target":{...},"reason":"<why>"${clauseIndexHint}}`,
     `- {"action":"assert_text","target":{...},"expectedText":"<text>","reason":"<why>"${clauseIndexHint}}`,
+    `- {"action":"assert_value","target":{...},"expectedValue":"<text>","reason":"<why>"${clauseIndexHint}} (checks a form field's current VALUE — an <input>/<textarea>/<select> — never part of the page's visible text)`,
     `- {"action":"assert_page_text","expectedText":"<text>","reason":"<why>"${clauseIndexHint}} (checks the whole page's visible text, no target needed — use for plain text/headings with no interactive role)`,
+    `- {"action":"assert_page_text_absent","expectedText":"<text>","reason":"<why>"${clauseIndexHint}} (the inverse — confirms text is GONE from the whole page; use whenever the goal asks you to confirm something no longer appears/was removed/is hidden, since a gone element can't be a "target" at all)`,
     `- {"action":"scroll","direction":"up"|"down","reason":"<why>"}`,
     `- {"action":"wait","reason":"<why>"} (pauses briefly for content that loads asynchronously — a spinner, a skeleton, a delayed page)`,
     `- {"action":"done","outcome":"goal-reached"|"goal-unreachable","reason":"<why>"} (a plan is made BEFORE most of the page has even been seen — you have no real evidence yet to judge "unreachable" against, only your own assumptions about how this site probably works. Only plan a "goal-unreachable" done step here if the goal itself is genuinely impossible to express as a sequence of steps at all. If you are just unsure whether a later page will actually contain what the goal needs, plan the steps anyway; a live decision later, made against the real rendered page, is what should determine reachability, not a guess made now)`,
@@ -478,13 +600,31 @@ function parsePlannedStep(raw: unknown): PlannedStep | undefined {
     case 'fill':
       if (!isValidTarget(obj.target) || typeof obj.value !== 'string') return undefined
       return { action: 'fill', target: obj.target, value: obj.value, submit: obj.submit === true, reason }
+    case 'hover':
+      return isValidTarget(obj.target) ? { action: 'hover', target: obj.target, reason } : undefined
+    case 'dblclick':
+      return isValidTarget(obj.target) ? { action: 'dblclick', target: obj.target, reason } : undefined
+    case 'drag':
+      if (!isValidTarget(obj.target) || !isValidTarget(obj.destinationTarget)) return undefined
+      return { action: 'drag', target: obj.target, destinationTarget: obj.destinationTarget, reason }
+    case 'press_key':
+      if (!isValidTarget(obj.target) || !isNonEmptyString(obj.key)) return undefined
+      return { action: 'press_key', target: obj.target, key: obj.key, reason }
+    case 'upload':
+      if (!isValidTarget(obj.target) || !isNonEmptyString(obj.filePath)) return undefined
+      return { action: 'upload', target: obj.target, filePath: obj.filePath, reason }
     case 'assert_visible':
       return isValidTarget(obj.target) ? { action: 'assert_visible', target: obj.target, reason, ...clauseIndexField(obj.clauseIndex) } : undefined
     case 'assert_text':
       if (!isValidTarget(obj.target) || !isNonEmptyString(obj.expectedText)) return undefined
       return { action: 'assert_text', target: obj.target, expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) }
+    case 'assert_value':
+      if (!isValidTarget(obj.target) || !isNonEmptyString(obj.expectedValue)) return undefined
+      return { action: 'assert_value', target: obj.target, expectedValue: obj.expectedValue, reason, ...clauseIndexField(obj.clauseIndex) }
     case 'assert_page_text':
       return isNonEmptyString(obj.expectedText) ? { action: 'assert_page_text', expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } : undefined
+    case 'assert_page_text_absent':
+      return isNonEmptyString(obj.expectedText) ? { action: 'assert_page_text_absent', expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } : undefined
     case 'scroll': {
       const direction = obj.direction === 'up' || obj.direction === 'down' ? obj.direction : undefined
       return direction ? { action: 'scroll', direction, reason } : undefined
@@ -660,10 +800,53 @@ export function parseAgentAction(
       if (!isNonEmptyString(obj.value) && typeof obj.value !== 'string') {
         return { ok: false, error: '"value" is missing for a fill action', raw }
       }
+      const target = outline.elements.find((el) => el.ref === ref)
+      if (target && isImplausibleFillTarget(target.role)) {
+        const attempted: AgentAction = { action: 'fill', ref, value: obj.value as string, submit: obj.submit === true, reason }
+        return {
+          ok: false,
+          error: `"${target.name}" is a ${target.role}, not a real text-entry field — filling it won't do anything useful. Find the actual textbox/combobox/searchbox this value belongs in instead.`,
+          raw,
+          recoverable: true,
+          attemptedAction: attempted,
+        }
+      }
       return {
         ok: true,
         action: { action: 'fill', ref, value: obj.value as string, submit: obj.submit === true, reason },
       }
+    }
+    case 'hover': {
+      const ref = checkRef()
+      if (!ref) return { ok: false, error: `"ref" is missing or not one of this turn's valid refs`, raw }
+      return { ok: true, action: { action: 'hover', ref, reason } }
+    }
+    case 'dblclick': {
+      const ref = checkRef()
+      if (!ref) return { ok: false, error: `"ref" is missing or not one of this turn's valid refs`, raw }
+      return { ok: true, action: { action: 'dblclick', ref, reason } }
+    }
+    case 'drag': {
+      const ref = checkRef()
+      if (!ref) return { ok: false, error: `"ref" is missing or not one of this turn's valid refs`, raw }
+      // Same "must be a real ref from this exact turn's outline" rule as
+      // `ref` itself — `targetRef` isn't checked via `checkRef()` (which
+      // only ever reads `obj.ref`), so it's validated the same way by hand.
+      const targetRef = isNonEmptyString(obj.targetRef) && validRefs.has(obj.targetRef) ? obj.targetRef : undefined
+      if (!targetRef) return { ok: false, error: `"targetRef" is missing or not one of this turn's valid refs`, raw }
+      return { ok: true, action: { action: 'drag', ref, targetRef, reason } }
+    }
+    case 'press_key': {
+      const ref = checkRef()
+      if (!ref) return { ok: false, error: `"ref" is missing or not one of this turn's valid refs`, raw }
+      if (!isNonEmptyString(obj.key)) return { ok: false, error: '"key" is missing for a press_key action', raw }
+      return { ok: true, action: { action: 'press_key', ref, key: obj.key, reason } }
+    }
+    case 'upload': {
+      const ref = checkRef()
+      if (!ref) return { ok: false, error: `"ref" is missing or not one of this turn's valid refs`, raw }
+      if (!isNonEmptyString(obj.filePath)) return { ok: false, error: '"filePath" is missing for an upload action', raw }
+      return { ok: true, action: { action: 'upload', ref, filePath: obj.filePath, reason } }
     }
     case 'assert_visible': {
       const ref = checkRef()
@@ -689,11 +872,36 @@ export function parseAgentAction(
       }
       return { ok: true, action: { action: 'assert_text', ref, expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
+    case 'assert_value': {
+      const ref = checkRef()
+      if (!ref) return { ok: false, error: `"ref" is missing or not one of this turn's valid refs`, raw }
+      if (!isNonEmptyString(obj.expectedValue)) {
+        return { ok: false, error: '"expectedValue" is missing for an assert_value action', raw }
+      }
+      const target = outline.elements.find((el) => el.ref === ref)
+      if (target && isImplausibleFillTarget(target.role)) {
+        const attempted: AgentAction = { action: 'assert_value', ref, expectedValue: obj.expectedValue, reason, ...clauseIndexField(obj.clauseIndex) }
+        return {
+          ok: false,
+          error: `"${target.name}" is a ${target.role}, not a real form field — it has no "value" to check. Use assert_visible/assert_text instead, or target the actual textbox/combobox/searchbox.`,
+          raw,
+          recoverable: true,
+          attemptedAction: attempted,
+        }
+      }
+      return { ok: true, action: { action: 'assert_value', ref, expectedValue: obj.expectedValue, reason, ...clauseIndexField(obj.clauseIndex) } }
+    }
     case 'assert_page_text': {
       if (!isNonEmptyString(obj.expectedText)) {
         return { ok: false, error: '"expectedText" is missing for an assert_page_text action', raw }
       }
       return { ok: true, action: { action: 'assert_page_text', expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } }
+    }
+    case 'assert_page_text_absent': {
+      if (!isNonEmptyString(obj.expectedText)) {
+        return { ok: false, error: '"expectedText" is missing for an assert_page_text_absent action', raw }
+      }
+      return { ok: true, action: { action: 'assert_page_text_absent', expectedText: obj.expectedText, reason, ...clauseIndexField(obj.clauseIndex) } }
     }
     case 'scroll': {
       const direction = obj.direction === 'up' || obj.direction === 'down' ? obj.direction : undefined

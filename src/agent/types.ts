@@ -13,6 +13,31 @@ export interface OutlineElement {
    * computed once at snapshot time in `browser.ts` — never reconstructed
    * from the LLM's own guess. */
   selector: string
+  /** Present only when this element lives inside one or more nested
+   * `<iframe>`/`<frame>` elements — an ordered list of CSS selectors, one
+   * per frame boundary crossed, from the outermost iframe down to the one
+   * directly containing this element (see `browser.ts`'s `snapshot()` and
+   * `frameChainSelectors()`). Absent/undefined for a main-page element,
+   * never an empty array, so `!el.frameChain` is a safe main-page check
+   * everywhere this is read. Resolving the real element at action time
+   * means chaining `page.frameLocator(chain[0]).frameLocator(chain[1])...`
+   * before the final `.locator(selector)` call — the same chain
+   * `generateSpec.ts` renders into the exported spec, so the live run and
+   * the file it produces stay in lockstep. Found via a real, live gap: a
+   * TinyMCE editor and a classic `<frameset>` demo both left the agent's
+   * fill/assert actions silently targeting the main document only, since
+   * `snapshot()` used to call `page.evaluate()` (main frame only) and
+   * `executeAction()` used to call `page.locator()` (main frame only)
+   * unconditionally. */
+  frameChain?: string[]
+  /** True only for a real `<input type="file">` — a hint so the model
+   * knows to use the `upload` action (never `fill`, which can't set a
+   * file input's value) on this specific ref. Found via a real, live gap:
+   * a file-upload goal reached for `fill` (the only text-entry action that
+   * existed at the time) since nothing in the outline distinguished a file
+   * input from an ordinary textbox, and Playwright's `fill()` silently
+   * no-ops on a file input rather than throwing. */
+  isFileInput?: boolean
 }
 
 /** The result of one `snapshot()` call. `truncated` discloses capping
@@ -61,8 +86,64 @@ export type RunOutcome = 'goal-reached' | 'goal-unreachable' | 'stuck-repeating'
 export type AgentAction =
   | { action: 'click'; ref: string; reason: string }
   | { action: 'fill'; ref: string; value: string; submit?: boolean; reason: string }
+  /** Hovers the pointer over an element without clicking — for UI that
+   * only reveals content (a tooltip, a hidden overlay link, a dropdown
+   * menu) on `:hover`, never on click. Found via a real, live gap
+   * (the-internet.herokuapp.com's own hover demo): with no hover action at
+   * all, the model's only options were `click` (doesn't trigger `:hover`
+   * styling) or a page-text assertion for content that, structurally,
+   * cannot appear without a real pointer-over event first. */
+  | { action: 'hover'; ref: string; reason: string }
+  /** Double-clicks an element — for UI that only enters an edit/expanded
+   * state on a real `dblclick` event, never a single `click` (a table
+   * cell's own inline-edit mode, a text label that becomes an input).
+   * Found via `src/eval/`'s own regression corpus (see its own doc
+   * comment): a goal needing this had no honest action to express at all
+   * — `click` fires a genuinely different DOM event, not a weaker version
+   * of the same one — and the run correctly, honestly declared the goal
+   * unreachable rather than guessing. */
+  | { action: 'dblclick'; ref: string; reason: string }
+  /** Drags one element onto another — real-to-real Playwright `dragTo()`,
+   * never a synthetic HTML5 `dragstart`/`dragover`/`drop` sequence forced
+   * by hand: `dragTo()` performs genuine mouse actions (hover, down, move
+   * in steps, up), which is what actually drives both native HTML5
+   * `draggable` elements AND the more common real-world case, a JS
+   * library's own mouse-event-based custom drag (SortableJS/dnd-kit/
+   * react-beautiful-dnd-style sortable lists, confirmed live against
+   * exactly that shape — see `src/eval/`'s own regression corpus). `ref`
+   * is the element being dragged, `targetRef` is where it's dropped. */
+  | { action: 'drag'; ref: string; targetRef: string; reason: string }
+  /** Dispatches one real keyboard key press at an element — `key` is a
+   * Playwright `Keyboard.press()`-compatible key name (e.g. "Escape",
+   * "Enter", "Tab", "ArrowDown"). Distinct from `fill`'s own `submit`
+   * (which only ever presses Enter, as part of a fill): a page that
+   * listens for a specific non-Enter key (found via a real, live gap
+   * against the-internet.herokuapp.com's key-presses demo, whose own
+   * `keydown` handler never fires from `fill()` setting an input's value
+   * directly rather than dispatching real key events) had no way to be
+   * driven at all before this. */
+  | { action: 'press_key'; ref: string; key: string; reason: string }
+  /** Sets a file input's selected file(s) to a single real, local path —
+   * the only correct way to drive `<input type="file">` in Playwright
+   * (`setInputFiles`); `fill` silently no-ops on this element type. Found
+   * via a real, live gap (the-internet.herokuapp.com's own upload demo):
+   * the model's only tool was `fill`, which never actually attached
+   * anything, so the goal failed with zero real progress. `filePath` must
+   * be a path the model was told about (via the goal text itself, or a
+   * project's configured fixture) — this action never invents a path on
+   * its own. */
+  | { action: 'upload'; ref: string; filePath: string; reason: string }
   | { action: 'assert_visible'; ref: string; reason: string; clauseIndex?: number }
   | { action: 'assert_text'; ref: string; expectedText: string; reason: string; clauseIndex?: number }
+  /** Checks an `<input>`/`<textarea>`/`<select>`'s current *value* — real,
+   * live-found gap (`src/eval/`'s own double-click-to-edit regression
+   * probe): a form field's value is a real DOM property, never part of
+   * `innerText()`/`textContent`, so `assert_text`/`assert_page_text` can
+   * never see it no matter what it's set to — confirmed live that
+   * `body.innerText()` genuinely never includes an input's value string.
+   * Uses Playwright's own `inputValue()`, substring match (not exact),
+   * same convention `assert_text` already uses. */
+  | { action: 'assert_value'; ref: string; expectedValue: string; reason: string; clauseIndex?: number }
   /** Checks the *whole rendered page*'s visible text for a substring — no
    * `ref`, unlike every other assertion. Added alongside `wait` after the
    * same real, live gap: `snapshot()`'s outline only ever includes
@@ -78,6 +159,26 @@ export type AgentAction =
    * to be one of the interactive elements the outline was built to list
    * for *acting on*, not for *reading*. */
   | { action: 'assert_page_text'; expectedText: string; reason: string; clauseIndex?: number }
+  /** The inverse of `assert_page_text` — confirms a substring is genuinely
+   * gone from the *whole rendered page*'s visible text (main + frames), not
+   * present-but-unnoticed. No `ref`, same reasoning as `assert_page_text`
+   * itself, but for an even stronger reason here: the thing being confirmed
+   * absent frequently isn't just role-less, it's gone from the DOM
+   * entirely, so no *current* snapshot could ever hand back a `ref` to it
+   * in the first place — a ref-based design would be structurally unable
+   * to express this action at all. Found via a real, live gap: a goal
+   * asking to confirm a completed todo no longer appears under an "Active"
+   * filter (TodoMVC removes the filtered-out `<li>` from the DOM entirely,
+   * confirmed directly — not merely CSS-hidden) had no honest way to be
+   * expressed by any existing action; the model, faced with a goal it
+   * structurally couldn't confirm, looped instead (re-adding the item,
+   * re-toggling filters) rather than failing cleanly. Polls the same way
+   * `assert_text`/`assert_page_text` do, just with the pass condition
+   * inverted: passes immediately once the text is absent (a transient
+   * "still fading out" case doesn't have to wait out the full budget to
+   * succeed), fails only if it's still present at the end of the same
+   * `ASSERT_WAIT_MS` window. */
+  | { action: 'assert_page_text_absent'; expectedText: string; reason: string; clauseIndex?: number }
   /** Scrolls the whole page (`window`) by one viewport height — never a
    * specific nested scroll container (a modal's internal `overflow:auto`
    * region, say). No `ref`: unlike every other action, this doesn't target
@@ -119,15 +220,38 @@ export interface PlannedStepTarget {
 export type PlannedStep =
   | { action: 'click'; target: PlannedStepTarget; reason: string }
   | { action: 'fill'; target: PlannedStepTarget; value: string; submit?: boolean; reason: string }
+  | { action: 'hover'; target: PlannedStepTarget; reason: string }
+  | { action: 'dblclick'; target: PlannedStepTarget; reason: string }
+  | { action: 'drag'; target: PlannedStepTarget; destinationTarget: PlannedStepTarget; reason: string }
+  | { action: 'press_key'; target: PlannedStepTarget; key: string; reason: string }
+  | { action: 'upload'; target: PlannedStepTarget; filePath: string; reason: string }
   | { action: 'assert_visible'; target: PlannedStepTarget; reason: string; clauseIndex?: number }
   | { action: 'assert_text'; target: PlannedStepTarget; expectedText: string; reason: string; clauseIndex?: number }
+  | { action: 'assert_value'; target: PlannedStepTarget; expectedValue: string; reason: string; clauseIndex?: number }
   | { action: 'assert_page_text'; expectedText: string; reason: string; clauseIndex?: number }
+  | { action: 'assert_page_text_absent'; expectedText: string; reason: string; clauseIndex?: number }
   | { action: 'scroll'; direction: 'up' | 'down'; reason: string }
   | { action: 'wait'; reason: string }
   | { action: 'done'; outcome: 'goal-reached' | 'goal-unreachable'; reason: string }
 
 export interface AgentPlan {
   steps: PlannedStep[]
+}
+
+/** One caller-authored hint in an MCP `steps` list (`five46_test`/
+ * `five46_api`'s `steps` param) — plain language, exactly what a calling
+ * coding agent already knows from reading the app's own source (e.g. "click
+ * 'Add to cart'", not a role/selector). Never executed directly: it's fed
+ * into the upfront plan call (`buildPlanPrompt`/`buildApiPlanPrompt`) so the
+ * model decomposes the goal around what the caller already knows instead of
+ * inventing its own sequence — that call still produces an ordinary
+ * `PlannedStep`/`ApiAction` for each one, resolved against a live snapshot
+ * exactly as when the model invents steps itself. `type` is advisory only
+ * (distinguishes an "action" from an "assertion" for the model's own
+ * framing); it has no effect on parsing or execution. */
+export interface CallerPlanStep {
+  type: 'action' | 'assertion'
+  description: string
 }
 
 /** Whether login credentials are configured — *presence only*, never the
@@ -194,6 +318,28 @@ export interface ExecutedStep {
    * path — never used for anything during the live run itself, which
    * always already used the guaranteed-correct selector regardless. */
   verifiedRoleLocator?: { role: string; name: string }
+  /** Copied from the acted-on element's `OutlineElement.frameChain` at the
+   * moment this step ran — `generateSpec.ts` needs this alongside
+   * `selector`/`resolvedSelector` to render the matching
+   * `page.frameLocator(...)` chain into the exported spec, since a healed
+   * step's `outline` is the pre-heal snapshot and a ref only resolves
+   * within the snapshot it came from (same reasoning as `resolvedSelector`
+   * itself). Absent for a main-page element/action with no ref. */
+  frameChain?: string[]
+  /** Which browser tab this step ran against — `0` for the original tab
+   * `runAgent()` opened (the overwhelming majority case, kept absent, not
+   * `0`, so this field's mere presence already signals "a tab switch
+   * happened somewhere in this run" — see `generateSpec.ts`'s `hasPopups`
+   * check), `1` for the first tab opened after it (via a `target="_blank"`
+   * link or `window.open()`), `2` for the next, and so on — assigned in
+   * the order `browser.ts`'s `context.on('page', ...)` handler observed
+   * them. `generateSpec.ts` needs this to know when to emit a
+   * `context.waitForEvent('page')` capture and switch which page variable
+   * subsequent rendered steps target; the live run itself needs no
+   * equivalent tracking, since `AgentBrowser.page` is already a live
+   * getter that transparently returns whichever tab is currently active
+   * (see its own doc comment). */
+  pageIndex?: number
 }
 
 /** The full record of one `runAgent()` call — the single source of truth

@@ -41,3 +41,13 @@ export function startFixtureServer(): Promise<{ url: string; close: () => Promis
 export function startScrollFixtureServer(): Promise<{ url: string; close: () => Promise<void> }> {
   return startStaticFixtureServer('scroll.html')
 }
+
+/** Serves `fixtures/widgets.html` — used by `src/eval/`'s regression
+ * corpus (see its own doc comment) to probe interaction patterns not
+ * covered by any existing fixture: a native `<select>`, a mouse-based
+ * custom drag-reorder list, a double-click-to-edit field, and a list of
+ * buttons sharing the exact same accessible name (the real,
+ * live-found TodoMVC-shaped ambiguity risk). */
+export function startWidgetsFixtureServer(): Promise<{ url: string; close: () => Promise<void> }> {
+  return startStaticFixtureServer('widgets.html')
+}

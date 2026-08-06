@@ -219,6 +219,23 @@ test('buildApiPlanPrompt warns against declaring goal-unreachable from assumptio
   assert.ok(prompt.includes('a guess made now'))
 })
 
+test('buildApiPlanPrompt grounds the plan in caller-supplied steps when given, instead of asking the model to invent its own sequence', () => {
+  const prompt = buildApiPlanPrompt('goal', READ_ONLY, undefined, [
+    { type: 'action', description: 'POST /users with a valid body' },
+    { type: 'assertion', description: 'The response status is 201' },
+  ])
+  assert.ok(prompt.includes('caller has already worked out the steps below'))
+  assert.ok(prompt.includes('1. [action] POST /users with a valid body'))
+  assert.ok(prompt.includes('2. [assertion] The response status is 201'))
+  assert.ok(prompt.includes('"steps"'))
+})
+
+test('buildApiPlanPrompt asks the model to invent its own sequence when no caller steps are given, same as before this option existed', () => {
+  const prompt = buildApiPlanPrompt('goal', READ_ONLY)
+  assert.ok(prompt.includes('plan out the whole sequence of steps needed'))
+  assert.ok(!prompt.includes('caller has already worked out'))
+})
+
 test('parseApiPlan strictly parses a real, well-formed plan response, including a forward {{var}} reference', () => {
   // A later step referencing a value an EARLIER step in the same plan will
   // save is legitimate at plan-parse time — only unresolved at the point a

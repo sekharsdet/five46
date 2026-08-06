@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Five46 Eval Widgets Fixture</title></head>
+<body>
+  <h1>Widgets</h1>
+
+  <label for="color-select">Favorite color</label>
+  <select id="color-select">
+    <option value="">Choose...</option>
+    <option value="red">Red</option>
+    <option value="green">Green</option>
+    <option value="blue">Blue</option>
+  </select>
+  <p id="color-result" role="status"></p>
+
+  <div id="notes-editor" contenteditable="true" aria-label="Notes"></div>
+  <button id="save-notes-btn">Save notes</button>
+  <p id="notes-result" role="status"></p>
+
+  <!-- Mouse-based custom drag, not native HTML5 draggable/dragstart —
+       deliberately matches the pattern real sortable-list libraries
+       (SortableJS, dnd-kit, react-beautiful-dnd) actually use, not the
+       native browser drag-and-drop protocol (which needs real OS-level
+       drag gestures Playwright's synthesized events don't reliably
+       trigger). -->
+  <ul id="sortable-list">
+    <li id="item-a" data-name="Item A">Item A</li>
+    <li id="item-b" data-name="Item B">Item B</li>
+    <li id="item-c" data-name="Item C">Item C</li>
+  </ul>
+  <p id="order-result" role="status">Order: Item A, Item B, Item C</p>
+
+  <div id="editable-label" aria-label="Double-click to edit">Double-click to edit</div>
+  <input id="editable-input" style="display:none" />
+
+  <!-- Three buttons sharing the exact same accessible name — the real,
+       live-found TodoMVC-shaped ambiguity risk: a ref/selector resolved
+       for "the Delete button" must resolve to the RIGHT one, not just any
+       one that matches by name. -->
+  <ul id="task-list">
+    <li>Task 1 <button class="delete-btn" data-id="1">Delete</button></li>
+    <li>Task 2 <button class="delete-btn" data-id="2">Delete</button></li>
+    <li>Task 3 <button class="delete-btn" data-id="3">Delete</button></li>
+  </ul>
+  <p id="delete-result" role="status"></p>
+
+  <script>
+    document.getElementById('color-select').addEventListener('change', (e) => {
+      document.getElementById('color-result').textContent = 'Selected: ' + e.target.value;
+    });
+
+    document.getElementById('save-notes-btn').addEventListener('click', () => {
+      document.getElementById('notes-result').textContent = 'Saved: ' + document.getElementById('notes-editor').innerText;
+    });
+
+    let dragging = null;
+    document.querySelectorAll('#sortable-list li').forEach((li) => {
+      li.addEventListener('mousedown', () => { dragging = li; });
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const items = Array.from(document.querySelectorAll('#sortable-list li'));
+      for (const item of items) {
+        if (item === dragging) continue;
+        const rect = item.getBoundingClientRect();
+        if (e.clientY > rect.top && e.clientY < rect.bottom) {
+          item.parentNode.insertBefore(dragging, item);
+          break;
+        }
+      }
+    });
+    document.addEventListener('mouseup', () => {
+      if (dragging) {
+        const order = Array.from(document.querySelectorAll('#sortable-list li')).map((el) => el.dataset.name).join(', ');
+        document.getElementById('order-result').textContent = 'Order: ' + order;
+      }
+      dragging = null;
+    });
+
+    document.getElementById('editable-label').addEventListener('dblclick', () => {
+      document.getElementById('editable-label').style.display = 'none';
+      const input = document.getElementById('editable-input');
+      input.style.display = 'inline';
+      input.value = 'Edited!';
+      input.focus();
+    });
+
+    document.querySelectorAll('.delete-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.getElementById('delete-result').textContent = 'Deleted task ' + btn.dataset.id;
+      });
+    });
+  </script>
+</body>
+</html>
