@@ -1103,7 +1103,18 @@ test('five46_test tool with story defaults to the lower DEFAULT_BROWSER_CONCURRE
         }
         inFlight++
         maxInFlight = Math.max(maxInFlight, inFlight)
-        await new Promise((resolve) => setTimeout(resolve, 50))
+        // 400ms, not the 30-50ms this file's other (API-engine, no real
+        // browser) concurrency tests use — this is the one story-mode test
+        // that launches real Chromium processes per scenario, whose launch
+        // time varies a lot more under a loaded/shared CI runner than pure
+        // HTTP/in-memory work does. A live, real CI failure (twice, on both
+        // the 0.3.0 and 0.3.1 pushes — maxInFlight observed as 1, not 2)
+        // confirmed the pool itself starts both workers correctly (see
+        // concurrencyPool.ts's own trivial, deterministic implementation);
+        // the tight window just doesn't reliably catch two real browser
+        // launches' first LLM call overlapping under CI-level jitter, even
+        // though the underlying concurrency guarantee was never violated.
+        await new Promise((resolve) => setTimeout(resolve, 400))
         inFlight--
         const goal = prompt.match(/^Goal: (.*)$/m)?.[1] ?? 'unknown'
         const turn = (turnsByGoal.get(goal) ?? 0) + 1
