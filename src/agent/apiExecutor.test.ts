@@ -50,7 +50,7 @@ test('CookieJar round-trips a real Set-Cookie response and scopes it per origin'
 })
 
 function safetyMode(overrides: Partial<SafetyMode> = {}): SafetyMode {
-  return { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set(), ...overrides }
+  return { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set(), baseUrl: 'http://localhost:1', ...overrides }
 }
 
 test('executeApiAction performs a real request and returns the real response', async () => {

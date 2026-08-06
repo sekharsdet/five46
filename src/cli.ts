@@ -985,7 +985,7 @@ async function runApiTestCommand(
   const secrets = [...(authHeaders ? Object.values(authHeaders) : []), llmApiKey]
 
   const targetOrigin = new URL(baseUrl).origin
-  const safety: SafetyMode = { allowWrites, allowDeletes, targetOrigin, allowedHosts: new Set(allowHosts) }
+  const safety: SafetyMode = { allowWrites, allowDeletes, targetOrigin, allowedHosts: new Set(allowHosts), baseUrl }
   const allowedMethods = ['GET', 'HEAD', 'OPTIONS', ...(allowWrites ? ['POST', 'PUT', 'PATCH'] : []), ...(allowDeletes ? ['DELETE'] : [])]
 
   console.log(`\nfive46 api: driving real HTTP requests toward: "${goal}"`)
@@ -1042,7 +1042,7 @@ async function runRepeatedApiTestCommand(
   const secrets = [...(authHeaders ? Object.values(authHeaders) : []), llmApiKey]
 
   const targetOrigin = new URL(baseUrl).origin
-  const safety: SafetyMode = { allowWrites, allowDeletes, targetOrigin, allowedHosts: new Set(allowHosts) }
+  const safety: SafetyMode = { allowWrites, allowDeletes, targetOrigin, allowedHosts: new Set(allowHosts), baseUrl }
   const allowedMethods = ['GET', 'HEAD', 'OPTIONS', ...(allowWrites ? ['POST', 'PUT', 'PATCH'] : []), ...(allowDeletes ? ['DELETE'] : [])]
 
   const effectiveRepeat = Math.min(repeat, HARD_MAX_REPEAT)
@@ -1136,7 +1136,7 @@ async function runApiStoryScenarios(
   const secrets = [...(authHeaders ? Object.values(authHeaders) : []), llmApiKey]
 
   const targetOrigin = new URL(baseUrl).origin
-  const safety: SafetyMode = { allowWrites, allowDeletes, targetOrigin, allowedHosts: new Set(allowHosts) }
+  const safety: SafetyMode = { allowWrites, allowDeletes, targetOrigin, allowedHosts: new Set(allowHosts), baseUrl }
   const allowedMethods = ['GET', 'HEAD', 'OPTIONS', ...(allowWrites ? ['POST', 'PUT', 'PATCH'] : []), ...(allowDeletes ? ['DELETE'] : [])]
 
   console.log(`\nfive46 api: splitting the user story at ${storyPath} into independent goals (one extra LLM call)...`)

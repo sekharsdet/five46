@@ -469,7 +469,7 @@ export async function runApiTool(params: ApiToolParams, context: McpToolContext)
     } catch {
       return errorResult(`"${params.baseUrl}" isn't a valid URL — needs a live http(s) URL.`)
     }
-    const safety: SafetyMode = { allowWrites: context.allowWrites, allowDeletes: context.allowDeletes, targetOrigin, allowedHosts: new Set() }
+    const safety: SafetyMode = { allowWrites: context.allowWrites, allowDeletes: context.allowDeletes, targetOrigin, allowedHosts: new Set(), baseUrl: params.baseUrl }
 
     if (params.story) {
       const { goals, clamped } = await splitUserStory(params.story, provider, llmApiKey)

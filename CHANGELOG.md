@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.3.1
+
+### Fixed
+- `five46 api <base-url>` silently dropped any path on `<base-url>` (e.g.
+  the `/api` in `http://host/api`) everywhere — the model was only ever
+  told the bare origin (`describeSafetyMode`'s only disclosure of where
+  requests could go), never the actual base it was invoked with, so it had
+  no way to know a path prefix mattered and guessed requests against the
+  bare origin instead. A real, live-found bug: found by installing the
+  freshly-published `0.3.0` from the real npm registry and running it
+  against a real public repo's example API (Express's own
+  `examples/web-service`, which is mounted under `/api`) — confirmed
+  precisely by reproducing it, then showing the identical goal succeeds
+  once the full path is spelled out in the goal text, isolating the defect
+  to disclosure rather than model reasoning. Fixed by adding `baseUrl` to
+  `SafetyMode` and disclosing the full base (path included) in both the
+  live per-step prompt and the upfront structured-plan prompt — the
+  model's own request-construction logic was already fully correct once
+  given the real base, live-reverified. No change to the origin/hostname
+  security boundary (`isHostAllowed`), which was never the broken part.
+
 ## 0.3.0
 
 ### Added

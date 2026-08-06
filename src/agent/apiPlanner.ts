@@ -46,10 +46,10 @@ function describeSafetyMode(safety: SafetyMode): string {
   if (safety.allowWrites) methods.push('POST', 'PUT', 'PATCH')
   if (safety.allowDeletes) methods.push('DELETE')
   const hosts = [safety.targetOrigin, ...safety.allowedHosts].join(', ')
-  return `Allowed methods this run: ${methods.join(', ')}. Allowed host(s): ${hosts}. Any other method or host will be rejected — don't attempt one.`
+  return `Base URL for this run: ${safety.baseUrl}. Build every request's "url" as this base plus the appropriate path (e.g. "${safety.baseUrl}/users"), not just the origin. Allowed methods this run: ${methods.join(', ')}. Allowed host(s): ${hosts}. Any other method or host will be rejected — don't attempt one.`
 }
 
-const ACTION_SCHEMA_EXAMPLE = `{"action":"request","method":"POST","url":"/users","headers":{"Content-Type":"application/json"},"body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user to test with"}`
+const ACTION_SCHEMA_EXAMPLE = `{"action":"request","method":"POST","url":"<baseUrl>/users","headers":{"Content-Type":"application/json"},"body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user to test with"}`
 
 /** Builds the "what's the next single action" prompt for API testing —
  * same single-shot-JSON-per-step shape as `planner.ts`'s
@@ -147,7 +147,7 @@ function clauseIndexField(v: unknown): { clauseIndex: number } | Record<string, 
   return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? { clauseIndex: v } : {}
 }
 
-const API_PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"request","method":"POST","url":"/users","body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user"},{"action":"request","method":"GET","url":"/users/{{userId}}","reason":"fetch it back"},{"action":"assert_json_path_equals","path":"name","expected":"Ada","reason":"confirm the name matches"},{"action":"done","outcome":"goal-reached","reason":"confirmed"}]}`
+const API_PLAN_SCHEMA_EXAMPLE = `{"steps":[{"action":"request","method":"POST","url":"<baseUrl>/users","body":"{\\"name\\":\\"Ada\\"}","saveAs":{"name":"userId","path":"id"},"reason":"create a user"},{"action":"request","method":"GET","url":"<baseUrl>/users/{{userId}}","reason":"fetch it back"},{"action":"assert_json_path_equals","path":"name","expected":"Ada","reason":"confirm the name matches"},{"action":"done","outcome":"goal-reached","reason":"confirmed"}]}`
 
 /** Builds the upfront "plan the whole goal" prompt for the API engine —
  * the same second-`complete()`-call pattern `planner.ts`'s `buildPlanPrompt`

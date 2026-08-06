@@ -3,9 +3,9 @@ import assert from 'node:assert/strict'
 import { isMethodAllowed, isHostAllowed, effectiveMethod } from './apiTypes'
 import type { SafetyMode } from './apiTypes'
 
-const READ_ONLY: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set() }
-const WRITES_ONLY: SafetyMode = { allowWrites: true, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set() }
-const WRITES_AND_DELETES: SafetyMode = { allowWrites: true, allowDeletes: true, targetOrigin: 'http://localhost:1', allowedHosts: new Set() }
+const READ_ONLY: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set(), baseUrl: 'http://localhost:1' }
+const WRITES_ONLY: SafetyMode = { allowWrites: true, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set(), baseUrl: 'http://localhost:1' }
+const WRITES_AND_DELETES: SafetyMode = { allowWrites: true, allowDeletes: true, targetOrigin: 'http://localhost:1', allowedHosts: new Set(), baseUrl: 'http://localhost:1' }
 
 test('isMethodAllowed always allows GET/HEAD/OPTIONS regardless of safety mode', () => {
   for (const mode of [READ_ONLY, WRITES_ONLY, WRITES_AND_DELETES]) {

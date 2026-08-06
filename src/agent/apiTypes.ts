@@ -17,6 +17,16 @@ export interface SafetyMode {
   allowDeletes: boolean
   targetOrigin: string
   allowedHosts: ReadonlySet<string>
+  /** The full `<base-url>` CLI/MCP argument the run was invoked with,
+   * including any path (e.g. `http://host/api`) — unlike `targetOrigin`
+   * (protocol+host+port only, the actual security boundary `isHostAllowed`
+   * checks), this is purely informational, disclosed to the model via
+   * `apiPlanner.ts`'s `describeSafetyMode` so it knows to build request
+   * URLs under this base instead of guessing against the bare origin. A
+   * real, live-found bug: without this, a base URL with a path prefix
+   * (`/api`, `/v1`, ...) was silently discarded everywhere, and the model
+   * had no way to know a prefix mattered at all. */
+  baseUrl: string
 }
 
 /** Co-located with `SafetyMode` (not duplicated in both `apiPlanner.ts` and

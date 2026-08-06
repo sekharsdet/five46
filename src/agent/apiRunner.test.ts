@@ -7,7 +7,7 @@ import type { LlmProvider } from '../llm/types'
 import { API_ACTION_MAX_OUTPUT_TOKENS, PLAN_MAX_OUTPUT_TOKENS } from './runLoop'
 
 function safetyMode(baseUrl: string, overrides: Partial<SafetyMode> = {}): SafetyMode {
-  return { allowWrites: false, allowDeletes: false, targetOrigin: new URL(baseUrl).origin, allowedHosts: new Set(), ...overrides }
+  return { allowWrites: false, allowDeletes: false, targetOrigin: new URL(baseUrl).origin, allowedHosts: new Set(), baseUrl, ...overrides }
 }
 
 /** Repeats the final scripted response forever once the script runs out —

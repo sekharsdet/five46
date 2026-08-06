@@ -776,7 +776,7 @@ test('performOneApiRun returns the "errored" sentinel (never throws) when writin
         return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
       },
     }
-    const safety: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: new URL(server.url).origin, allowedHosts: new Set() }
+    const safety: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: new URL(server.url).origin, allowedHosts: new Set(), baseUrl: server.url }
 
     const result = await performOneApiRun(
       server.url,

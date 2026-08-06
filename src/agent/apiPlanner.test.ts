@@ -3,8 +3,12 @@ import assert from 'node:assert/strict'
 import { buildApiActionPrompt, parseApiAction, buildApiPlanPrompt, parseApiPlan, checkVarReferences } from './apiPlanner'
 import type { SafetyMode } from './apiTypes'
 
-const READ_ONLY: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set() }
-const WRITES_AND_DELETES: SafetyMode = { allowWrites: true, allowDeletes: true, targetOrigin: 'http://localhost:1', allowedHosts: new Set() }
+// baseUrl deliberately carries a path distinct from targetOrigin (which is
+// origin-only, the real security boundary — see apiTypes.ts) so a test
+// against these constants can actually prove the full base (path and all)
+// reaches the prompt, not just the origin.
+const READ_ONLY: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: 'http://localhost:1', allowedHosts: new Set(), baseUrl: 'http://localhost:1/api' }
+const WRITES_AND_DELETES: SafetyMode = { allowWrites: true, allowDeletes: true, targetOrigin: 'http://localhost:1', allowedHosts: new Set(), baseUrl: 'http://localhost:1/api' }
 
 test('buildApiActionPrompt discloses the allowed methods/hosts up front, not just after a rejection', () => {
   // "POST" legitimately appears elsewhere in every prompt regardless of
@@ -12,13 +16,25 @@ test('buildApiActionPrompt discloses the allowed methods/hosts up front, not jus
   // currently allowed) — check the actual disclosure line specifically,
   // not the whole prompt text.
   const readOnlyPrompt = buildApiActionPrompt('goal', [], new Set(), READ_ONLY)
-  const readOnlyLine = readOnlyPrompt.split('\n').find((l) => l.startsWith('Allowed methods this run:'))
-  assert.equal(readOnlyLine, 'Allowed methods this run: GET, HEAD, OPTIONS. Allowed host(s): http://localhost:1. Any other method or host will be rejected — don\'t attempt one.')
+  const readOnlyLine = readOnlyPrompt.split('\n').find((l) => l.startsWith('Base URL for this run:'))
+  assert.equal(
+    readOnlyLine,
+    'Base URL for this run: http://localhost:1/api. Build every request\'s "url" as this base plus the appropriate path (e.g. "http://localhost:1/api/users"), not just the origin. Allowed methods this run: GET, HEAD, OPTIONS. Allowed host(s): http://localhost:1. Any other method or host will be rejected — don\'t attempt one.'
+  )
 
   const fullPrompt = buildApiActionPrompt('goal', [], new Set(), WRITES_AND_DELETES)
-  const fullLine = fullPrompt.split('\n').find((l) => l.startsWith('Allowed methods this run:'))
+  const fullLine = fullPrompt.split('\n').find((l) => l.startsWith('Base URL for this run:'))
   assert.ok(fullLine?.includes('POST, PUT, PATCH'))
   assert.ok(fullLine?.includes('DELETE'))
+})
+
+test('buildApiActionPrompt/buildApiPlanPrompt disclose the full base URL, path included — a real, live-found bug: the path used to be silently dropped, leaving the model no way to know a prefix like "/api" mattered', () => {
+  const actionPrompt = buildApiActionPrompt('goal', [], new Set(), READ_ONLY)
+  assert.ok(actionPrompt.includes('Base URL for this run: http://localhost:1/api.'))
+  assert.ok(actionPrompt.includes('"http://localhost:1/api/users"'))
+
+  const planPrompt = buildApiPlanPrompt('goal', READ_ONLY)
+  assert.ok(planPrompt.includes('Base URL for this run: http://localhost:1/api.'))
 })
 
 // Regression guard for the actual property this ordering exists for — same
