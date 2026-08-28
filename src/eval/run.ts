@@ -1,11 +1,26 @@
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { getLlmProvider } from '../llm/registry'
 import { resolveCredentials } from '../config/resolve'
 import { runAgent } from '../agent/runner'
+import { generateAgentSpec } from '../agent/generateSpec'
+import { runGeneratedBrowserSpec } from '../agent/specExecutor'
+import type { LoginCredentials } from '../agent/browser'
 import { EVAL_CASES } from './cases'
 import type { EvalCase } from './cases'
+
+/** Maps a case's fixture credentials onto the env vars a generated spec's
+ * credential placeholders read from (`generateSpec.ts`'s
+ * `renderCredentialAwareExpression`) — the only thing `runGeneratedBrowserSpec`
+ * needs beyond the spec file itself to run a login-flow case standalone. */
+export function credentialEnvFor(credentials: LoginCredentials | undefined): Record<string, string> | undefined {
+  if (!credentials) return undefined
+  const env: Record<string, string> = {}
+  if (credentials.username) env.FIVE46_LOGIN_USERNAME = credentials.username
+  if (credentials.password) env.FIVE46_LOGIN_PASSWORD = credentials.password
+  return env
+}
 
 /** The standing answer to "we keep discovering the same category of gap on
  * every new site, one live-testing session at a time" — a persistent,
@@ -30,7 +45,7 @@ async function main(): Promise<void> {
     console.log(`  (transient error, retrying attempt ${info.attempt + 1}/${info.maxAttempts} in ${info.delayMs}ms)`)
   )
 
-  const results: { name: string; ok: boolean; outcome: string; detail?: string }[] = []
+  const results: { name: string; ok: boolean; outcome: string; detail?: string; specSurvived?: boolean }[] = []
 
   for (const evalCase of EVAL_CASES) {
     process.stdout.write(`${evalCase.name} ... `)
@@ -58,7 +73,21 @@ async function main(): Promise<void> {
       const expected = evalCase.expectedOutcome ?? 'goal-reached'
       const ok = run.outcome === expected
       console.log(ok ? 'PASS' : `FAIL (${run.outcome}, expected ${expected})`)
-      results.push({ name: evalCase.name, ok, outcome: run.outcome })
+
+      // Only meaningful when the goal was actually supposed to (and did)
+      // succeed — nothing to "survive a clean rerun" for a case whose whole
+      // point is proving goal-unreachable is the honest outcome.
+      let specSurvived: boolean | undefined
+      if (ok && expected === 'goal-reached') {
+        const specPath = join(artifactDir, 'generated.spec.ts')
+        writeFileSync(specPath, generateAgentSpec(run), 'utf8')
+        process.stdout.write('  verifying the generated spec survives a clean rerun ... ')
+        const verifyResult = await runGeneratedBrowserSpec(specPath, { extraEnv: credentialEnvFor(evalCase.credentials) })
+        specSurvived = verifyResult.passed
+        console.log(specSurvived ? 'PASS' : 'FAIL')
+      }
+
+      results.push({ name: evalCase.name, ok, outcome: run.outcome, specSurvived })
     } catch (err) {
       console.log('ERROR')
       results.push({ name: evalCase.name, ok: false, outcome: 'threw', detail: err instanceof Error ? err.message : String(err) })
@@ -70,10 +99,24 @@ async function main(): Promise<void> {
 
   const passed = results.filter((r) => r.ok).length
   console.log(`\n${passed}/${results.length} passed`)
+
+  const eligibleForSurvival = results.filter((r) => r.specSurvived !== undefined)
+  const survived = eligibleForSurvival.filter((r) => r.specSurvived).length
+  if (eligibleForSurvival.length > 0) {
+    console.log(`${survived}/${eligibleForSurvival.length} generated specs verified to actually pass when re-run standalone`)
+  }
+
   const failed = results.filter((r) => !r.ok)
   if (failed.length > 0) {
     console.log('\nFailures:')
     for (const f of failed) console.log(`  - ${f.name}: ${f.outcome}${f.detail ? ` (${f.detail})` : ''}`)
+    process.exitCode = 1
+  }
+
+  const nonSurviving = eligibleForSurvival.filter((r) => !r.specSurvived)
+  if (nonSurviving.length > 0) {
+    console.log('\nGenerated specs that did NOT survive a clean rerun:')
+    for (const f of nonSurviving) console.log(`  - ${f.name}`)
     process.exitCode = 1
   }
 }
