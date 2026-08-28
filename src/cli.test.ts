@@ -98,6 +98,11 @@ test('parseAgentArgs recognizes --verify-clean-session, leaving it undefined whe
   assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).verifyCleanSession, undefined)
 })
 
+test('parseAgentArgs recognizes --verify, leaving it undefined when not passed', () => {
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g', '--verify']).verify, true)
+  assert.equal(parseAgentArgs(['http://localhost:3000', '--goal', 'g']).verify, undefined)
+})
+
 test('parseListArgs takes a positional dir and a --project filter, in either order', () => {
   assert.deepEqual(parseListArgs(['./tests', '--project', 'checkout']), { dir: './tests', project: 'checkout' })
   assert.deepEqual(parseListArgs(['--project', 'checkout', './tests']), { dir: './tests', project: 'checkout' })
@@ -187,6 +192,11 @@ test('parseApiArgs recognizes --story and --concurrency, leaving them undefined 
 test('parseApiArgs recognizes --verify-clean-session, leaving it undefined when not passed', () => {
   assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g', '--verify-clean-session']).verifyCleanSession, true)
   assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).verifyCleanSession, undefined)
+})
+
+test('parseApiArgs recognizes --verify, leaving it undefined when not passed', () => {
+  assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g', '--verify']).verify, true)
+  assert.equal(parseApiArgs(['http://localhost:3000', '--goal', 'g']).verify, undefined)
 })
 
 test('resolveStructuredPlan defaults to true when --no-structured-plan was not passed', () => {
@@ -803,6 +813,7 @@ test('performOneApiRun returns the "errored" sentinel (never throws) when writin
       [],
       undefined,
       false,
+      undefined,
       undefined
     )
 
@@ -844,13 +855,59 @@ test('performOneApiRun with verifyCleanSession re-executes the just-written spec
       [],
       undefined,
       false,
-      true
+      true,
+      undefined
     )
 
     assert.notEqual(result, 'errored')
     if (result === 'errored') throw new Error('unreachable')
     assert.equal(result.outcome, 'goal-reached')
     assert.equal(result.cleanSessionVerified, true)
+  } finally {
+    await server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('performOneApiRun with verify mutates the run\'s load-bearing assertion and confirms the mutated spec fails', async () => {
+  const server = await startApiTestServer()
+  const dir = mkdtempSync(join(tmpdir(), 'five46-cli-test-'))
+  try {
+    let turn = 0
+    const provider: LlmProvider = {
+      id: 'fake',
+      async complete() {
+        turn++
+        if (turn === 1) return JSON.stringify({ action: 'request', method: 'GET', url: server.url + '/items', reason: 'list items' })
+        if (turn === 2) return JSON.stringify({ action: 'assert_status', expected: 200, reason: 'confirm reachable' })
+        return JSON.stringify({ action: 'done', outcome: 'goal-reached', reason: 'done' })
+      },
+    }
+    const safety: SafetyMode = { allowWrites: false, allowDeletes: false, targetOrigin: new URL(server.url).origin, allowedHosts: new Set(), baseUrl: server.url }
+
+    const result = await performOneApiRun(
+      server.url,
+      'list items',
+      undefined,
+      join(dir, 'out.test.mjs'),
+      undefined,
+      safety,
+      undefined,
+      true,
+      false,
+      provider,
+      'fake-key',
+      [],
+      undefined,
+      false,
+      undefined,
+      true
+    )
+
+    assert.notEqual(result, 'errored')
+    if (result === 'errored') throw new Error('unreachable')
+    assert.equal(result.outcome, 'goal-reached')
+    assert.equal(result.mutationVerified, true)
   } finally {
     await server.close()
     rmSync(dir, { recursive: true, force: true })

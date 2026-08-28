@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { writeFileSync, readFileSync, readdirSync, statSync } from 'fs'
+import { writeFileSync, readFileSync, readdirSync, statSync, mkdtempSync, rmSync } from 'fs'
 import { join, basename } from 'path'
+import { tmpdir } from 'os'
 import { getLlmProvider, supportedLlmProviderIds } from './llm/registry'
 import { loadConfigFile, saveConfigFile, configFilePath } from './config/store'
 import { resolveCredentials } from './config/resolve'
@@ -23,6 +24,7 @@ import { generateApiRootCauseHypothesis } from './agent/apiRootCause'
 import { diffSpecFiles, formatDiff } from './agent/diffSpecs'
 import { summarizeApiAssertionQuality, summarizeAgentAssertionQuality, formatAssertionQualityWarning } from './agent/assertionQuality'
 import { runGeneratedApiSpec, runGeneratedBrowserSpec } from './agent/specExecutor'
+import { buildMutatedApiSteps, buildMutatedAgentSteps } from './agent/mutateAssertions'
 import { classifyRepeatResults } from './agent/flaky'
 import type { RepeatIterationResult } from './agent/flaky'
 import { HARD_MAX_REPEAT, HARD_MAX_SCENARIOS, DEFAULT_CONCURRENCY, DEFAULT_BROWSER_CONCURRENCY, HARD_MAX_CONCURRENCY } from './agent/runLoop'
@@ -110,6 +112,13 @@ export interface ParsedAgentArgs {
    * ambient session state into the written file, this is a real check of
    * whether the artifact holds up on its own, not a simulated one. */
   verifyCleanSession?: boolean
+  /** `test`/`api` only — see `mutateAssertions.ts`. After a `goal-reached`
+   * run, deliberately flips every mutable assertion's expected value in a
+   * scratch copy of the generated spec and requires that copy to fail when
+   * re-executed — a real negative control proving the run's own assertions
+   * are load-bearing, not just present. Never written to the user's real
+   * `--out` path. */
+  verify?: boolean
 }
 
 export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
@@ -160,6 +169,8 @@ export function parseAgentArgs(argv: string[]): ParsedAgentArgs {
       result.actionCache = true
     } else if (argv[i] === '--verify-clean-session') {
       result.verifyCleanSession = true
+    } else if (argv[i] === '--verify') {
+      result.verify = true
     } else if (!result.url) {
       result.url = argv[i]
     }
@@ -213,6 +224,9 @@ export interface ParsedApiArgs {
   /** See `ParsedAgentArgs.verifyCleanSession`'s doc comment — identical
    * meaning for the API engine. */
   verifyCleanSession?: boolean
+  /** See `ParsedAgentArgs.verify`'s doc comment — identical meaning for the
+   * API engine. */
+  verify?: boolean
 }
 
 export function parseApiArgs(argv: string[]): ParsedApiArgs {
@@ -253,6 +267,8 @@ export function parseApiArgs(argv: string[]): ParsedApiArgs {
       if (Number.isFinite(n)) result.concurrency = n
     } else if (argv[i] === '--verify-clean-session') {
       result.verifyCleanSession = true
+    } else if (argv[i] === '--verify') {
+      result.verify = true
     } else if (!result.baseUrl) {
       result.baseUrl = argv[i]
     }
@@ -414,8 +430,9 @@ export async function performOneE2eRun(
    * one fewer future fast-path opportunity), just a known, accepted,
    * disclosed race window rather than a correctness bug. */
   actionCacheEnabled: boolean | undefined,
-  verifyCleanSession: boolean | undefined
-): Promise<{ outcome: RunOutcome; specBody: string; cleanSessionVerified?: boolean } | 'errored'> {
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
+): Promise<{ outcome: RunOutcome; specBody: string; cleanSessionVerified?: boolean; mutationVerified?: boolean } | 'errored'> {
   const cacheScope = projectName ?? process.cwd()
   const cacheKey = actionCacheEnabled ? actionCacheKey(cacheScope, goal, url) : undefined
   const cachedEntry = cacheKey ? loadActionCache().entries[cacheKey] : undefined
@@ -482,6 +499,30 @@ export async function performOneE2eRun(
       )
     }
 
+    let mutationVerified: boolean | undefined
+    if (verify && run.outcome === 'goal-reached') {
+      const mutatedSteps = buildMutatedAgentSteps(run.steps)
+      if (!mutatedSteps) {
+        console.log('\nNo mutation-testable assertions in this run (all were presence-only) — skipping the negative-control check.')
+      } else {
+        console.log("\nMutating this run's assertions and re-executing to confirm they actually fail when they should (one extra spec execution)...")
+        const scratchDir = mkdtempSync(join(tmpdir(), 'five46-verify-'))
+        try {
+          const mutatedSpecPath = join(scratchDir, 'mutated.spec.ts')
+          writeFileSync(mutatedSpecPath, redactSecrets(generateAgentSpec({ ...run, steps: mutatedSteps }), secrets), 'utf8')
+          const mutationResult = await runGeneratedBrowserSpec(mutatedSpecPath)
+          mutationVerified = !mutationResult.passed
+          console.log(
+            mutationVerified
+              ? 'Negative-control verification: PASSED — the mutated assertions correctly failed.'
+              : `Negative-control verification: FAILED — the mutated spec still passed, meaning its assertions may not be load-bearing:\n${redactSecrets(mutationResult.output, secrets)}`
+          )
+        } finally {
+          rmSync(scratchDir, { recursive: true, force: true })
+        }
+      }
+    }
+
     // Only ever written from a real, verified goal-reached outcome —
     // strictly downstream of the (per-clause-strengthened) confirmation
     // gate in runner.ts, so an unverified success can never poison the
@@ -502,7 +543,7 @@ export async function performOneE2eRun(
       }
     }
 
-    return { outcome: run.outcome, specBody, cleanSessionVerified }
+    return { outcome: run.outcome, specBody, cleanSessionVerified, mutationVerified }
   } catch (err) {
     // Same redaction discipline as the runAgent-call catch above, extended
     // to cover the reporting/write path too — a run that reached a real
@@ -555,7 +596,8 @@ async function runE2eTest(
   projectName: string | undefined,
   fastSteps: boolean | undefined,
   actionCache: boolean | undefined,
-  verifyCleanSession: boolean | undefined
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -599,6 +641,7 @@ async function runE2eTest(
   if (structuredPlan) console.log('One extra LLM call will plan the whole goal upfront; most steps then execute without a further live decision.')
   if (actionCache) console.log('Action cache enabled: a previously-successful plan for this exact goal/target may be reused, skipping the upfront plan call entirely on a match.')
   if (verifyCleanSession) console.log('After a successful run, the generated spec will be re-executed standalone (no reused storage-state/cookies) to confirm it actually passes on its own.')
+  if (verify) console.log("After a successful run, its assertions will be deliberately mutated and re-executed to confirm they actually fail when they should (one extra spec execution).")
 
   const result = await performOneE2eRun(
     url,
@@ -619,9 +662,10 @@ async function runE2eTest(
     projectName,
     fastSteps,
     actionCache,
-    verifyCleanSession
+    verifyCleanSession,
+    verify
   )
-  return result !== 'errored' && result.outcome === 'goal-reached' && result.cleanSessionVerified !== false
+  return result !== 'errored' && result.outcome === 'goal-reached' && result.cleanSessionVerified !== false && result.mutationVerified !== false
 }
 
 /** `five46 test <url> --goal "..." --repeat N` — runs the identical goal
@@ -663,7 +707,8 @@ async function runRepeatedE2eTest(
    * defeating the flakiness check it exists to run rather than passing
    * it honestly. Disclosed below when requested, not silently ignored. */
   actionCache: boolean | undefined,
-  verifyCleanSession: boolean | undefined
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -707,10 +752,12 @@ async function runRepeatedE2eTest(
     console.log('Note: --action-cache has no effect during --repeat — flakiness detection needs a genuinely fresh live decision on every repeat, so caching is disabled for this run.')
   }
   if (verifyCleanSession) console.log('After each successful repeat, its generated spec will be re-executed standalone (no reused storage-state/cookies) to confirm it actually passes on its own.')
+  if (verify) console.log("After each successful repeat, its assertions will be deliberately mutated and re-executed to confirm they actually fail when they should.")
 
   const batchId = Date.now().toString(36)
   const results: RepeatIterationResult[] = []
   let allCleanSessionVerified = true
+  let allMutationVerified = true
   for (let i = 1; i <= effectiveRepeat; i++) {
     console.log(`\n=== Repeat ${i}/${effectiveRepeat} ===`)
     const artifactDir = join(process.cwd(), `five46-agent-${batchId}-${i}`)
@@ -736,7 +783,8 @@ async function runRepeatedE2eTest(
       // Always false here regardless of the caller's own `actionCache` —
       // see this function's own parameter doc comment for why.
       false,
-      verifyCleanSession
+      verifyCleanSession,
+      verify
     )
     if (result === 'errored') {
       // Don't spend the remaining repeats' BYOK budget once one iteration
@@ -746,6 +794,7 @@ async function runRepeatedE2eTest(
       return false
     }
     if (result.cleanSessionVerified === false) allCleanSessionVerified = false
+    if (result.mutationVerified === false) allMutationVerified = false
     results.push({ iteration: i, outcome: result.outcome, specBody: result.specBody })
   }
 
@@ -765,7 +814,7 @@ async function runRepeatedE2eTest(
       ? `\nFLAKY: this goal did not produce the same outcome/behavior across all ${effectiveRepeat} repeats.`
       : `\nSTABLE: all ${effectiveRepeat} repeats reached goal-reached with identical generated output.`
   )
-  return !classification.flaky && allCleanSessionVerified
+  return !classification.flaky && allCleanSessionVerified && allMutationVerified
 }
 
 /** `five46 test <url> --story <path> [--concurrency N]` — splits a raw,
@@ -802,7 +851,8 @@ async function runStoryScenarios(
   projectName: string | undefined,
   fastSteps: boolean | undefined,
   actionCache: boolean | undefined,
-  verifyCleanSession: boolean | undefined
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -847,6 +897,7 @@ async function runStoryScenarios(
   }
   if (actionCache) console.log('Action cache enabled: a previously-successful plan for a scenario\'s exact goal/target may be reused, skipping its upfront plan call entirely on a match.')
   if (verifyCleanSession) console.log('After each scenario that succeeds, its generated spec will be re-executed standalone (no reused storage-state/cookies) to confirm it actually passes on its own.')
+  if (verify) console.log("After each scenario that succeeds, its assertions will be deliberately mutated and re-executed to confirm they actually fail when they should.")
 
   const batchId = Date.now().toString(36)
   const tasks = goals.map((goal, i) => async () => {
@@ -872,7 +923,8 @@ async function runStoryScenarios(
       projectName,
       fastSteps,
       actionCache,
-      verifyCleanSession
+      verifyCleanSession,
+      verify
     )
     return { goal, result }
   })
@@ -888,7 +940,7 @@ async function runStoryScenarios(
       allPassed = false
       return
     }
-    const passed = result.outcome === 'goal-reached' && result.cleanSessionVerified !== false
+    const passed = result.outcome === 'goal-reached' && result.cleanSessionVerified !== false && result.mutationVerified !== false
     if (passed) passedCount++
     else allPassed = false
     console.log(`AC${i + 1}: ${passed ? 'PASS' : `FAIL (${result.outcome})`} — ${goal}`)
@@ -917,8 +969,9 @@ export async function performOneApiRun(
   secrets: (string | undefined)[],
   projectName: string | undefined,
   fastSteps: boolean | undefined,
-  verifyCleanSession: boolean | undefined
-): Promise<{ outcome: RunOutcome; specBody: string; cleanSessionVerified?: boolean } | 'errored'> {
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
+): Promise<{ outcome: RunOutcome; specBody: string; cleanSessionVerified?: boolean; mutationVerified?: boolean } | 'errored'> {
   let run
   try {
     run = await runApiTest({
@@ -983,7 +1036,31 @@ export async function performOneApiRun(
       )
     }
 
-    return { outcome: run.outcome, specBody, cleanSessionVerified }
+    let mutationVerified: boolean | undefined
+    if (verify && run.outcome === 'goal-reached') {
+      const mutatedSteps = buildMutatedApiSteps(run.steps)
+      if (!mutatedSteps) {
+        console.log('\nNo mutation-testable assertions in this run (all were presence-only) — skipping the negative-control check.')
+      } else {
+        console.log("\nMutating this run's assertions and re-executing to confirm they actually fail when they should (one extra spec execution)...")
+        const scratchDir = mkdtempSync(join(tmpdir(), 'five46-verify-'))
+        try {
+          const mutatedSpecPath = join(scratchDir, 'mutated.test.mjs')
+          writeFileSync(mutatedSpecPath, redactSecrets(generateApiSpec({ ...run, steps: mutatedSteps }), secrets), 'utf8')
+          const mutationResult = await runGeneratedApiSpec(mutatedSpecPath)
+          mutationVerified = !mutationResult.passed
+          console.log(
+            mutationVerified
+              ? 'Negative-control verification: PASSED — the mutated assertions correctly failed.'
+              : `Negative-control verification: FAILED — the mutated spec still passed, meaning its assertions may not be load-bearing:\n${redactSecrets(mutationResult.output, secrets)}`
+          )
+        } finally {
+          rmSync(scratchDir, { recursive: true, force: true })
+        }
+      }
+    }
+
+    return { outcome: run.outcome, specBody, cleanSessionVerified, mutationVerified }
   } catch (err) {
     // Same reasoning as performOneE2eRun's identical fix — see its own
     // doc comment for the full "why this matters more for --story" story.
@@ -1019,7 +1096,8 @@ async function runApiTestCommand(
   structuredPlan: boolean | undefined,
   projectName: string | undefined,
   fastSteps: boolean | undefined,
-  verifyCleanSession: boolean | undefined
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -1054,9 +1132,10 @@ async function runApiTestCommand(
   if (authHeaders) console.log('An API auth header is configured — attached to every request, never sent to the LLM.')
   if (structuredPlan) console.log('One extra LLM call will plan the whole goal upfront; most steps then execute without a further live decision.')
   if (verifyCleanSession) console.log('After a successful run, the generated spec will be re-executed standalone (no reused storage-state/auth headers) to confirm it actually passes on its own.')
+  if (verify) console.log("After a successful run, its assertions will be deliberately mutated and re-executed to confirm they actually fail when they should (one extra spec execution).")
 
-  const result = await performOneApiRun(baseUrl, goal, maxSteps, outArg, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName, fastSteps, verifyCleanSession)
-  return result !== 'errored' && result.outcome === 'goal-reached' && result.cleanSessionVerified !== false
+  const result = await performOneApiRun(baseUrl, goal, maxSteps, outArg, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName, fastSteps, verifyCleanSession, verify)
+  return result !== 'errored' && result.outcome === 'goal-reached' && result.cleanSessionVerified !== false && result.mutationVerified !== false
 }
 
 /** `five46 api <base-url> --goal "..." --repeat N` — the API-engine mirror
@@ -1079,7 +1158,8 @@ async function runRepeatedApiTestCommand(
   repeat: number,
   projectName: string | undefined,
   fastSteps: boolean | undefined,
-  verifyCleanSession: boolean | undefined
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -1119,18 +1199,21 @@ async function runRepeatedApiTestCommand(
   console.log('Each repeat writes its own generated script; the run-id header line is ignored when comparing them for flakiness.')
   if (structuredPlan) console.log('Each repeat plans the whole goal upfront with one extra LLM call; most steps then execute without a further live decision.')
   if (verifyCleanSession) console.log('After each successful repeat, its generated spec will be re-executed standalone (no reused storage-state/auth headers) to confirm it actually passes on its own.')
+  if (verify) console.log("After each successful repeat, its assertions will be deliberately mutated and re-executed to confirm they actually fail when they should.")
 
   const results: RepeatIterationResult[] = []
   let allCleanSessionVerified = true
+  let allMutationVerified = true
   for (let i = 1; i <= effectiveRepeat; i++) {
     console.log(`\n=== Repeat ${i}/${effectiveRepeat} ===`)
     const iterationOut = outArg ? insertIterationSuffix(outArg, i) : undefined
-    const result = await performOneApiRun(baseUrl, goal, maxSteps, iterationOut, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName, fastSteps, verifyCleanSession)
+    const result = await performOneApiRun(baseUrl, goal, maxSteps, iterationOut, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName, fastSteps, verifyCleanSession, verify)
     if (result === 'errored') {
       console.error(`\nRepeat ${i}/${effectiveRepeat} hit a tooling error — stopping early rather than running the rest.`)
       return false
     }
     if (result.cleanSessionVerified === false) allCleanSessionVerified = false
+    if (result.mutationVerified === false) allMutationVerified = false
     results.push({ iteration: i, outcome: result.outcome, specBody: result.specBody })
   }
 
@@ -1150,7 +1233,7 @@ async function runRepeatedApiTestCommand(
       ? `\nFLAKY: this goal did not produce the same outcome/behavior across all ${effectiveRepeat} repeats.`
       : `\nSTABLE: all ${effectiveRepeat} repeats reached goal-reached with identical generated output.`
   )
-  return !classification.flaky && allCleanSessionVerified
+  return !classification.flaky && allCleanSessionVerified && allMutationVerified
 }
 
 /** `five46 api <base-url> --story <path> [--concurrency N]` — the API-engine
@@ -1174,7 +1257,8 @@ async function runApiStoryScenarios(
   concurrency: number | undefined,
   projectName: string | undefined,
   fastSteps: boolean | undefined,
-  verifyCleanSession: boolean | undefined
+  verifyCleanSession: boolean | undefined,
+  verify: boolean | undefined
 ): Promise<boolean> {
   const { llmProvider, llmApiKey } = resolveCredentials()
   if (!llmApiKey) {
@@ -1221,11 +1305,12 @@ async function runApiStoryScenarios(
   if (storageState) console.log(`Starting each scenario already authenticated, using the session at ${storageStatePath}.`)
   if (authHeaders) console.log('An API auth header is configured — attached to every request, never sent to the LLM.')
   if (verifyCleanSession) console.log('After each scenario that succeeds, its generated spec will be re-executed standalone (no reused storage-state/auth headers) to confirm it actually passes on its own.')
+  if (verify) console.log("After each scenario that succeeds, its assertions will be deliberately mutated and re-executed to confirm they actually fail when they should.")
 
   const tasks = goals.map((goal, i) => async () => {
     console.log(`\n=== AC${i + 1}/${goals.length}: ${goal} ===`)
     const scenarioOut = outArg ? insertScenarioSuffix(outArg, i + 1) : undefined
-    const result = await performOneApiRun(baseUrl, goal, maxSteps, scenarioOut, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName, fastSteps, verifyCleanSession)
+    const result = await performOneApiRun(baseUrl, goal, maxSteps, scenarioOut, storageState, safety, authHeaders, noRootCause, structuredPlan, provider, llmApiKey, secrets, projectName, fastSteps, verifyCleanSession, verify)
     return { goal, result }
   })
 
@@ -1240,7 +1325,7 @@ async function runApiStoryScenarios(
       allPassed = false
       return
     }
-    const passed = result.outcome === 'goal-reached' && result.cleanSessionVerified !== false
+    const passed = result.outcome === 'goal-reached' && result.cleanSessionVerified !== false && result.mutationVerified !== false
     if (passed) passedCount++
     else allPassed = false
     console.log(`AC${i + 1}: ${passed ? 'PASS' : `FAIL (${result.outcome})`} — ${goal}`)
@@ -1566,9 +1651,9 @@ function listGeneratedRuns(dir: string, projectFilter?: string): boolean {
 }
 
 const USAGE = [
-  'Usage: five46 test <url> (--goal "text" | --story <path>) [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--record-video] [--no-structured-plan] [--fast-steps] [--action-cache] [--verify-clean-session]',
+  'Usage: five46 test <url> (--goal "text" | --story <path>) [--max-steps N] [--headed] [--out path] [--storage-state path] [--allow-deletes] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--record-video] [--no-structured-plan] [--fast-steps] [--action-cache] [--verify-clean-session] [--verify]',
   '       five46 login <url> --goal "text" --out <path> [--max-steps N] [--headed] [--record-video]',
-  '       five46 api <base-url> (--goal "text" | --story <path>) [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--no-structured-plan] [--fast-steps] [--verify-clean-session]',
+  '       five46 api <base-url> (--goal "text" | --story <path>) [--allow-writes] [--allow-deletes] [--allow-host <host>]... [--storage-state path] [--max-steps N] [--out path] [--no-root-cause] [--repeat N] [--concurrency N] [--project name] [--no-structured-plan] [--fast-steps] [--verify-clean-session] [--verify]',
   '       five46 mcp   (starts an MCP server on stdio, exposing five46_test/five46_api to an IDE-embedded AI assistant)',
   '       five46 list [dir] [--project name]   (lists previously generated runs, default: current directory)',
   '       five46 diff <fileA> <fileB>   (line diff between two generated run files, ignoring the run-id header line)',
@@ -1679,7 +1764,7 @@ async function main() {
   }
 
   if (argv[0] === 'api') {
-    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project, noStructuredPlan, fastSteps, story, concurrency, verifyCleanSession } =
+    const { baseUrl, goal, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, repeat, project, noStructuredPlan, fastSteps, story, concurrency, verifyCleanSession, verify } =
       resolveProjectForApi(parseApiArgs(argv.slice(1)))
     const structuredPlan = resolveStructuredPlan({ noStructuredPlan })
     if (!baseUrl || (!goal && !story)) {
@@ -1697,10 +1782,10 @@ async function main() {
       // a legitimate if pointless value; only >= 2 actually engages the
       // repeated/flaky-detection path.
       const succeeded = story
-        ? await runApiStoryScenarios(baseUrl, story, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, concurrency, project, fastSteps, verifyCleanSession)
+        ? await runApiStoryScenarios(baseUrl, story, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, concurrency, project, fastSteps, verifyCleanSession, verify)
         : repeat !== undefined && repeat >= 2
-          ? await runRepeatedApiTestCommand(baseUrl, goal!, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, repeat, project, fastSteps, verifyCleanSession)
-          : await runApiTestCommand(baseUrl, goal!, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, project, fastSteps, verifyCleanSession)
+          ? await runRepeatedApiTestCommand(baseUrl, goal!, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, repeat, project, fastSteps, verifyCleanSession, verify)
+          : await runApiTestCommand(baseUrl, goal!, maxSteps, out, storageState, allowWrites, allowDeletes, allowHosts, noRootCause, structuredPlan, project, fastSteps, verifyCleanSession, verify)
       if (!succeeded) process.exit(1)
     } catch (err) {
       console.error(`\nfive46 api failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -1714,7 +1799,7 @@ async function main() {
     process.exit(1)
   }
 
-  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, noStructuredPlan, fastSteps, story, concurrency, actionCache, verifyCleanSession } =
+  const { url, goal, maxSteps, headed, out, storageState, allowDeletes, noRootCause, repeat, project, recordVideo, noStructuredPlan, fastSteps, story, concurrency, actionCache, verifyCleanSession, verify } =
     resolveProjectForTest(parseAgentArgs(argv.slice(1)))
   const structuredPlan = resolveStructuredPlan({ noStructuredPlan })
   const useActionCache = resolveActionCache({ actionCache }, structuredPlan)
@@ -1738,10 +1823,10 @@ async function main() {
 
   try {
     const succeeded = story
-      ? await runStoryScenarios(url, story, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, concurrency, project, fastSteps, useActionCache, verifyCleanSession)
+      ? await runStoryScenarios(url, story, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, concurrency, project, fastSteps, useActionCache, verifyCleanSession, verify)
       : repeat !== undefined && repeat >= 2
-        ? await runRepeatedE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, repeat, project, fastSteps, useActionCache, verifyCleanSession)
-        : await runE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, project, fastSteps, useActionCache, verifyCleanSession)
+        ? await runRepeatedE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, repeat, project, fastSteps, useActionCache, verifyCleanSession, verify)
+        : await runE2eTest(url, goal!, maxSteps, headed, out, storageState, allowDeletes, noRootCause, recordVideo, structuredPlan, project, fastSteps, useActionCache, verifyCleanSession, verify)
     if (!succeeded) process.exit(1)
   } catch (err) {
     console.error(`\nfive46 test failed: ${err instanceof Error ? err.message : String(err)}`)
