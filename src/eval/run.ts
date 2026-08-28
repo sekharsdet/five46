@@ -6,6 +6,7 @@ import { resolveCredentials } from '../config/resolve'
 import { runAgent } from '../agent/runner'
 import { generateAgentSpec } from '../agent/generateSpec'
 import { runGeneratedBrowserSpec } from '../agent/specExecutor'
+import { AgentBrowserUnavailableError } from '../agent/browser'
 import type { LoginCredentials } from '../agent/browser'
 import { EVAL_CASES } from './cases'
 import type { EvalCase } from './cases'
@@ -79,12 +80,20 @@ async function main(): Promise<void> {
       // point is proving goal-unreachable is the honest outcome.
       let specSurvived: boolean | undefined
       if (ok && expected === 'goal-reached') {
-        const specPath = join(artifactDir, 'generated.spec.ts')
-        writeFileSync(specPath, generateAgentSpec(run), 'utf8')
-        process.stdout.write('  verifying the generated spec survives a clean rerun ... ')
-        const verifyResult = await runGeneratedBrowserSpec(specPath, { extraEnv: credentialEnvFor(evalCase.credentials) })
-        specSurvived = verifyResult.passed
-        console.log(specSurvived ? 'PASS' : 'FAIL')
+        try {
+          // runGeneratedBrowserSpec makes its own project-rooted scratch
+          // copy internally, so writing this into artifactDir (an OS temp
+          // dir) is fine — see its own doc comment.
+          const specPath = join(artifactDir, 'generated.spec.ts')
+          writeFileSync(specPath, generateAgentSpec(run), 'utf8')
+          process.stdout.write('  verifying the generated spec survives a clean rerun ... ')
+          const verifyResult = await runGeneratedBrowserSpec(specPath, { extraEnv: credentialEnvFor(evalCase.credentials) })
+          specSurvived = verifyResult.passed
+          console.log(specSurvived ? 'PASS' : 'FAIL')
+        } catch (err) {
+          if (!(err instanceof AgentBrowserUnavailableError)) throw err
+          console.log(`SKIP (${err.message})`)
+        }
       }
 
       results.push({ name: evalCase.name, ok, outcome: run.outcome, specSurvived })

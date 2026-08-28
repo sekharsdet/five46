@@ -487,40 +487,55 @@ export async function performOneE2eRun(
     const assertionQualityWarning = formatAssertionQualityWarning(summarizeAgentAssertionQuality(run.steps), 'browser')
     if (assertionQualityWarning) console.log(redactSecrets(assertionQualityWarning, secrets))
 
+    // Both verify checks below shell out to the real Playwright test
+    // runner, which throws AgentBrowserUnavailableError (never anything
+    // else) when the optional @playwright/test dependency isn't installed.
+    // Caught here, specifically — not by the generic catch below — so a
+    // missing optional dep degrades to "verification skipped, here's how
+    // to install it" rather than discarding this already-successful run's
+    // outcome/specBody as the generic 'errored' sentinel.
     let cleanSessionVerified: boolean | undefined
-    if (verifyCleanSession && run.outcome === 'goal-reached') {
-      console.log('\nRe-running the generated spec standalone (no reused storage-state/cookies) to confirm it actually passes on its own...')
-      const verifyResult = await runGeneratedBrowserSpec(outPath)
-      cleanSessionVerified = verifyResult.passed
-      console.log(
-        cleanSessionVerified
-          ? 'Clean-session verification: PASSED — the spec holds up with no reused session state.'
-          : `Clean-session verification: FAILED — the spec did not pass standalone:\n${redactSecrets(verifyResult.output, secrets)}`
-      )
-    }
-
     let mutationVerified: boolean | undefined
-    if (verify && run.outcome === 'goal-reached') {
-      const mutatedSteps = buildMutatedAgentSteps(run.steps)
-      if (!mutatedSteps) {
-        console.log('\nNo mutation-testable assertions in this run (all were presence-only) — skipping the negative-control check.')
-      } else {
-        console.log("\nMutating this run's assertions and re-executing to confirm they actually fail when they should (one extra spec execution)...")
-        const scratchDir = mkdtempSync(join(tmpdir(), 'five46-verify-'))
-        try {
-          const mutatedSpecPath = join(scratchDir, 'mutated.spec.ts')
-          writeFileSync(mutatedSpecPath, redactSecrets(generateAgentSpec({ ...run, steps: mutatedSteps }), secrets), 'utf8')
-          const mutationResult = await runGeneratedBrowserSpec(mutatedSpecPath)
-          mutationVerified = !mutationResult.passed
-          console.log(
-            mutationVerified
-              ? 'Negative-control verification: PASSED — the mutated assertions correctly failed.'
-              : `Negative-control verification: FAILED — the mutated spec still passed, meaning its assertions may not be load-bearing:\n${redactSecrets(mutationResult.output, secrets)}`
-          )
-        } finally {
-          rmSync(scratchDir, { recursive: true, force: true })
+    try {
+      if (verifyCleanSession && run.outcome === 'goal-reached') {
+        console.log('\nRe-running the generated spec standalone (no reused storage-state/cookies) to confirm it actually passes on its own...')
+        const verifyResult = await runGeneratedBrowserSpec(outPath)
+        cleanSessionVerified = verifyResult.passed
+        console.log(
+          cleanSessionVerified
+            ? 'Clean-session verification: PASSED — the spec holds up with no reused session state.'
+            : `Clean-session verification: FAILED — the spec did not pass standalone:\n${redactSecrets(verifyResult.output, secrets)}`
+        )
+      }
+
+      if (verify && run.outcome === 'goal-reached') {
+        const mutatedSteps = buildMutatedAgentSteps(run.steps)
+        if (!mutatedSteps) {
+          console.log('\nNo mutation-testable assertions in this run (all were presence-only) — skipping the negative-control check.')
+        } else {
+          console.log("\nMutating this run's assertions and re-executing to confirm they actually fail when they should (one extra spec execution)...")
+          const scratchDir = mkdtempSync(join(tmpdir(), 'five46-verify-'))
+          try {
+            const mutatedSpecPath = join(scratchDir, 'mutated.spec.ts')
+            writeFileSync(mutatedSpecPath, redactSecrets(generateAgentSpec({ ...run, steps: mutatedSteps }), secrets), 'utf8')
+            // runGeneratedBrowserSpec makes its own project-rooted scratch
+            // copy internally, so mutatedSpecPath living under os.tmpdir()
+            // here is fine — see its own doc comment.
+            const mutationResult = await runGeneratedBrowserSpec(mutatedSpecPath)
+            mutationVerified = !mutationResult.passed
+            console.log(
+              mutationVerified
+                ? 'Negative-control verification: PASSED — the mutated assertions correctly failed.'
+                : `Negative-control verification: FAILED — the mutated spec still passed, meaning its assertions may not be load-bearing:\n${redactSecrets(mutationResult.output, secrets)}`
+            )
+          } finally {
+            rmSync(scratchDir, { recursive: true, force: true })
+          }
         }
       }
+    } catch (err) {
+      if (!(err instanceof AgentBrowserUnavailableError)) throw err
+      console.log(`\n${err.message}`)
     }
 
     // Only ever written from a real, verified goal-reached outcome —
@@ -814,6 +829,14 @@ async function runRepeatedE2eTest(
       ? `\nFLAKY: this goal did not produce the same outcome/behavior across all ${effectiveRepeat} repeats.`
       : `\nSTABLE: all ${effectiveRepeat} repeats reached goal-reached with identical generated output.`
   )
+  // Printed even when the line above says STABLE — that line is purely
+  // about outcome/behavior consistency across repeats, and must not be
+  // read as an overall pass when a verification flag the caller explicitly
+  // requested actually failed on one or more repeats (both flags already
+  // gate the returned boolean below; this keeps the last printed line
+  // consistent with it).
+  if (!allCleanSessionVerified) console.log('Clean-session verification FAILED on at least one repeat — see above.')
+  if (!allMutationVerified) console.log('Negative-control (mutation) verification FAILED on at least one repeat — see above.')
   return !classification.flaky && allCleanSessionVerified && allMutationVerified
 }
 
@@ -1233,6 +1256,14 @@ async function runRepeatedApiTestCommand(
       ? `\nFLAKY: this goal did not produce the same outcome/behavior across all ${effectiveRepeat} repeats.`
       : `\nSTABLE: all ${effectiveRepeat} repeats reached goal-reached with identical generated output.`
   )
+  // Printed even when the line above says STABLE — that line is purely
+  // about outcome/behavior consistency across repeats, and must not be
+  // read as an overall pass when a verification flag the caller explicitly
+  // requested actually failed on one or more repeats (both flags already
+  // gate the returned boolean below; this keeps the last printed line
+  // consistent with it).
+  if (!allCleanSessionVerified) console.log('Clean-session verification FAILED on at least one repeat — see above.')
+  if (!allMutationVerified) console.log('Negative-control (mutation) verification FAILED on at least one repeat — see above.')
   return !classification.flaky && allCleanSessionVerified && allMutationVerified
 }
 
