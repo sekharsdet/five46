@@ -21,6 +21,7 @@ import type { SafetyMode } from './agent/apiTypes'
 import { generateRootCauseHypothesis } from './agent/rootCause'
 import { generateApiRootCauseHypothesis } from './agent/apiRootCause'
 import { diffSpecFiles, formatDiff } from './agent/diffSpecs'
+import { summarizeApiAssertionQuality, summarizeAgentAssertionQuality, formatAssertionQualityWarning } from './agent/assertionQuality'
 import { classifyRepeatResults } from './agent/flaky'
 import type { RepeatIterationResult } from './agent/flaky'
 import { HARD_MAX_REPEAT, HARD_MAX_SCENARIOS, DEFAULT_CONCURRENCY, DEFAULT_BROWSER_CONCURRENCY, HARD_MAX_CONCURRENCY } from './agent/runLoop'
@@ -450,6 +451,8 @@ export async function performOneE2eRun(
     if (projectName) specBody = withProjectHeaderLine(specBody, projectName)
     writeFileSync(outPath, specBody, 'utf8')
     console.log(`\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
+    const assertionQualityWarning = formatAssertionQualityWarning(summarizeAgentAssertionQuality(run.steps), 'browser')
+    if (assertionQualityWarning) console.log(redactSecrets(assertionQualityWarning, secrets))
 
     // Only ever written from a real, verified goal-reached outcome —
     // strictly downstream of the (per-clause-strengthened) confirmation
@@ -925,6 +928,8 @@ export async function performOneApiRun(
     if (projectName) specBody = withProjectHeaderLine(specBody, projectName)
     writeFileSync(outPath, specBody, 'utf8')
     console.log(`\nWrote ${run.steps.filter((s) => s.ok).length} confirmed-working step(s) to ${outPath}`)
+    const assertionQualityWarning = formatAssertionQualityWarning(summarizeApiAssertionQuality(run.steps), 'api')
+    if (assertionQualityWarning) console.log(redactSecrets(assertionQualityWarning, secrets))
     return { outcome: run.outcome, specBody }
   } catch (err) {
     // Same reasoning as performOneE2eRun's identical fix — see its own
