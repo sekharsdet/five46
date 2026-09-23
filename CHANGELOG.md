@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.4.2
+
+No functional/code changes. A publish attempt at 0.4.1 got stuck as a
+staged-but-uncommitted version on the npm registry (interrupted before it
+could finalize), which blocks ever publishing 0.4.1 for real — this
+version exists only to move past that.
+
 ## 0.4.1
 
 No functional/code changes — docs and repo infrastructure only.
