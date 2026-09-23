@@ -2,6 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/five46.svg)](https://www.npmjs.com/package/five46)
 [![npm downloads](https://img.shields.io/npm/dm/five46.svg)](https://www.npmjs.com/package/five46)
+[![CI](https://github.com/sekharsdet/five46/actions/workflows/ci.yml/badge.svg)](https://github.com/sekharsdet/five46/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![node](https://img.shields.io/node/v/five46.svg)](https://www.npmjs.com/package/five46)
 
@@ -74,6 +75,18 @@ It's also not a black box: every run ends with a real `.spec.ts`/`.test.mjs` fil
   planning LLM call on a repeat run of the same goal by reusing a
   previously-saved plan, falling back to a fresh plan automatically if the
   page has changed. See "Cross-run action cache" below.
+
+## five46 vs. `npx playwright codegen`
+
+Codegen records: you click through the flow yourself, and it turns your
+own clicks into a script — it has no opinion on whether the flow actually
+worked, because it never saw a goal, only your input. five46 works from a
+goal instead: you describe the outcome in plain English, and the LLM
+decides the steps, picks the right elements, and makes the pass/fail call
+itself — including a root-cause hypothesis when it fails. The two aren't
+mutually exclusive; codegen is still the faster tool for "I already know
+the exact flow, I just want it typed out." five46 is for the more common
+case of not having the flow (or the test) written yet at all.
 
 ## five46 vs. cloud AI testing platforms
 

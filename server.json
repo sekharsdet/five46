@@ -8,13 +8,13 @@
     "url": "https://github.com/sekharsdet/five46",
     "source": "github"
   },
-  "version": "0.2.3",
+  "version": "0.4.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "five46",
-      "version": "0.2.3",
+      "version": "0.4.0",
       "transport": {
         "type": "stdio"
       },

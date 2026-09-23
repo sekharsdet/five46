@@ -3,6 +3,50 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.4.0
+
+### Added
+- `--verify-clean-session` (`five46 test`/`five46 api`) — after a
+  successful run, re-executes the just-written generated spec standalone
+  (no reused `--storage-state`/cookies/auth headers) and fails the run if
+  it doesn't hold up on its own. Neither generator ever baked session
+  state into the written file, so this is a real check of whether the
+  artifact actually works cold, not a simulated one.
+- `--verify` (`five46 test`/`five46 api`) — a mutation-testing-style
+  negative control: deliberately flips every value-specific assertion's
+  expected value in a scratch copy of a successful run, re-executes it,
+  and requires that copy to fail. Proves the run's assertions are actually
+  load-bearing, not just present. Presence-only assertions
+  (`assert_visible`/`assert_json_path_exists`) and `assert_page_text_absent`
+  aren't mutable and are skipped, with a clear "nothing to verify" message.
+- Weak-assertion detection — a generated spec whose passing assertions are
+  mostly or entirely presence-only (confirming something loaded, not that
+  it has the right value) now prints a warning right after the spec is
+  written, on every run, no flag required.
+- `npm run eval` now tracks spec survival rate: for each case that reaches
+  `goal-reached`, the generated spec is re-executed standalone, and the
+  fraction that actually survive is reported alongside the existing
+  pass/fail count — a build-quality metric, not just a functional one.
+
+### Fixed
+- `--verify-clean-session`/`--verify`/the eval survival check above were
+  all silently broken for the browser engine at first release: Playwright's
+  own test discovery and module resolution both fail for a spec placed
+  outside a project's directory tree, and (on Windows specifically) an
+  absolute path passed as a CLI argument was misread as a broken regex —
+  three separate ways to get a plausible-looking but wrong pass/fail.
+  `runGeneratedBrowserSpec` now always executes from a short-lived,
+  correctly-rooted scratch copy, regardless of where the original spec
+  file lives. Verified against real Playwright execution and a live,
+  Gemini-backed run.
+- A missing optional `@playwright/test` dependency during a verify check
+  no longer discards an already-successful run as a generic tooling error
+  — it now degrades to a printed install hint instead.
+- `--repeat`'s STABLE/FLAKY summary line now reflects a failed
+  `--verify-clean-session`/`--verify` check instead of only describing
+  outcome/behavior consistency, which could previously read as a clean
+  pass while the run still failed.
+
 ## 0.3.1
 
 ### Fixed
