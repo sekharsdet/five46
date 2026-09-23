@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/).
 
+## 0.4.1
+
+No functional/code changes — docs and repo infrastructure only.
+
+### Docs
+- Fixed `server.json` (MCP registry manifest) still being pinned at
+  `0.2.3` two releases after npm — the version is now kept in sync with
+  every publish going forward via the release workflow below.
+- Added a CI status badge and a `playwright codegen` comparison to the
+  README.
+- Added `CONTRIBUTING.md`, `SECURITY.md`, issue templates, and a PR
+  template for external contributors.
+- Backfilled git tags and GitHub Releases for every prior version
+  (0.1.0–0.4.0) — previously only `v0.1.1` had one.
+
+### Added
+- A manual-trigger-only GitHub Actions workflow (`publish.yml`) for
+  `npm publish`, so a release no longer depends on remembering to run it
+  by hand on a machine with a working POSIX shell.
+
 ## 0.4.0
 
 ### Added
